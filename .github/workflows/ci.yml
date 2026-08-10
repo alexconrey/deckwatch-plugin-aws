@@ -28,7 +28,9 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run unit tests
-        run: cargo test --target $(rustc -vV | sed -n 's/host: //p')
+        run: |
+          HOST=$(rustc -vV | grep "^host:" | cut -d' ' -f2)
+          cargo test --target "$HOST"
 
   build-wasm:
     name: Build WASM artifact
@@ -54,8 +56,7 @@ jobs:
         run: cargo build --release --target wasm32-unknown-unknown
 
       - name: Report artifact size
-        run: |
-          ls -lh target/wasm32-unknown-unknown/release/deckwatch_plugin_aws.wasm
+        run: ls -lh target/wasm32-unknown-unknown/release/deckwatch_plugin_aws.wasm
 
   clippy:
     name: Clippy lint (host target)
@@ -78,7 +79,9 @@ jobs:
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Clippy
-        run: cargo clippy --target $(rustc -vV | sed -n 's/host: //p') -- -D warnings
+        run: |
+          HOST=$(rustc -vV | grep "^host:" | cut -d' ' -f2)
+          cargo clippy --target "$HOST" -- -D warnings
 
   fmt:
     name: Rustfmt check
