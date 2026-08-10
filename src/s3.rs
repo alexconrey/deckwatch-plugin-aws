@@ -22,28 +22,43 @@ pub fn ensure_bucket(
 ) -> Result<(), String> {
     match head_bucket(full_bucket, &cfg.region, creds)? {
         true => {
-            log!(LogLevel::Info, "deckwatch-plugin-aws: S3 bucket {full_bucket} already exists");
+            log!(
+                LogLevel::Info,
+                "deckwatch-plugin-aws: S3 bucket {full_bucket} already exists"
+            );
             Ok(())
         }
         false => {
             create_bucket(full_bucket, &cfg.region, creds)?;
-            log!(LogLevel::Info, "deckwatch-plugin-aws: S3 bucket {full_bucket} created");
+            log!(
+                LogLevel::Info,
+                "deckwatch-plugin-aws: S3 bucket {full_bucket} created"
+            );
 
             if cfg.versioning {
                 if let Err(e) = put_bucket_versioning(full_bucket, &cfg.region, creds) {
-                    log!(LogLevel::Warn, "deckwatch-plugin-aws: put_bucket_versioning: {e}");
+                    log!(
+                        LogLevel::Warn,
+                        "deckwatch-plugin-aws: put_bucket_versioning: {e}"
+                    );
                 }
             }
 
             if cfg.public_access_block {
                 if let Err(e) = put_public_access_block(full_bucket, &cfg.region, creds) {
-                    log!(LogLevel::Warn, "deckwatch-plugin-aws: put_public_access_block: {e}");
+                    log!(
+                        LogLevel::Warn,
+                        "deckwatch-plugin-aws: put_public_access_block: {e}"
+                    );
                 }
             }
 
             if let Some(days) = cfg.lifecycle_days {
                 if let Err(e) = put_bucket_lifecycle(full_bucket, &cfg.region, days, creds) {
-                    log!(LogLevel::Warn, "deckwatch-plugin-aws: put_bucket_lifecycle: {e}");
+                    log!(
+                        LogLevel::Warn,
+                        "deckwatch-plugin-aws: put_bucket_lifecycle: {e}"
+                    );
                 }
             }
 
@@ -143,8 +158,8 @@ fn create_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(
         req = req.with_header("X-Amz-Security-Token", tok);
     }
 
-    let resp = http::request(&req, Some(body))
-        .map_err(|e| format!("S3 CreateBucket HTTP error: {e}"))?;
+    let resp =
+        http::request(&req, Some(body)).map_err(|e| format!("S3 CreateBucket HTTP error: {e}"))?;
 
     let status = resp.status_code();
     if status >= 400 {
@@ -158,12 +173,30 @@ fn create_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(
 
 fn put_bucket_versioning(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(), String> {
     let body = r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#;
-    s3_put(bucket, region, "versioning", body, creds, "PutBucketVersioning")
+    s3_put(
+        bucket,
+        region,
+        "versioning",
+        body,
+        creds,
+        "PutBucketVersioning",
+    )
 }
 
-fn put_public_access_block(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(), String> {
+fn put_public_access_block(
+    bucket: &str,
+    region: &str,
+    creds: &AwsCredentials,
+) -> Result<(), String> {
     let body = r#"<PublicAccessBlockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>"#;
-    s3_put(bucket, region, "publicAccessBlock", body, creds, "PutPublicAccessBlock")
+    s3_put(
+        bucket,
+        region,
+        "publicAccessBlock",
+        body,
+        creds,
+        "PutPublicAccessBlock",
+    )
 }
 
 fn put_bucket_lifecycle(
@@ -175,7 +208,14 @@ fn put_bucket_lifecycle(
     let body = format!(
         r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>deckwatch-expire</ID><Status>Enabled</Status><Filter></Filter><Expiration><Days>{days}</Days></Expiration></Rule></LifecycleConfiguration>"#
     );
-    s3_put(bucket, region, "lifecycle", &body, creds, "PutBucketLifecycleConfiguration")
+    s3_put(
+        bucket,
+        region,
+        "lifecycle",
+        &body,
+        creds,
+        "PutBucketLifecycleConfiguration",
+    )
 }
 
 fn s3_put(

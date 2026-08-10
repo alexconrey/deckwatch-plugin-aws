@@ -46,9 +46,10 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8>
 /// - `datetime`      — `YYYYMMDDTHHmmSSZ` — must match `X-Amz-Date` header
 /// - `region` / `service` — e.g. `"us-east-1"` / `"s3"`
 /// - `access_key` / `secret_key` / `session_token`
-/// - `content_type`  — `Some("application/xml")` or `Some("application/x-www-form-urlencoded")`
-///                     for requests with a body; `None` to omit the `Content-Type` header from
-///                     the signed headers (appropriate for HEAD requests).
+/// - `content_type` — `Some("application/xml")` or `Some("application/x-www-form-urlencoded")`
+///   for requests with a body; `None` to omit the `Content-Type` header from
+///   the signed headers (appropriate for HEAD requests).
+#[allow(clippy::too_many_arguments)]
 pub fn authorization_header(
     method: &str,
     host: &str,
@@ -87,9 +88,8 @@ pub fn authorization_header(
         canonical_headers.push_str(&format!("x-amz-security-token:{tok}\n"));
     }
 
-    let canonical_request = format!(
-        "{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    );
+    let canonical_request =
+        format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
     // ── String to sign ────────────────────────────────────────────────────────
     let credential_scope = format!("{date}/{region}/{service}/aws4_request");

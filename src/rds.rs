@@ -52,9 +52,8 @@ fn describe_db_instance(
     identifier: &str,
     creds: &AwsCredentials,
 ) -> Result<Option<DbInstanceInfo>, String> {
-    let body = format!(
-        "Action=DescribeDBInstances&Version=2014-10-31&DBInstanceIdentifier={identifier}"
-    );
+    let body =
+        format!("Action=DescribeDBInstances&Version=2014-10-31&DBInstanceIdentifier={identifier}");
     let xml = rds_query(&body, creds)?;
 
     if xml.contains("DBInstanceNotFound") {

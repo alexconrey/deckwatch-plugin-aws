@@ -37,7 +37,10 @@ const IAM_HOST: &str = "iam.amazonaws.com";
 pub fn ensure_role(role_name: &str, creds: &AwsCredentials) -> Result<String, String> {
     // Check if the role already exists.
     if let Some(arn) = get_role(role_name, creds)? {
-        log!(LogLevel::Info, "deckwatch-plugin-aws: IAM role {role_name} already exists");
+        log!(
+            LogLevel::Info,
+            "deckwatch-plugin-aws: IAM role {role_name} already exists"
+        );
         return Ok(arn);
     }
 
@@ -98,8 +101,10 @@ pub fn attach_s3_policy(
 
 /// Call `GetRole` and return the ARN if found, `None` if the role does not exist.
 fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<String>, String> {
-    let body =
-        format!("Action=GetRole&Version=2010-05-08&RoleName={}", url_encode(role_name));
+    let body = format!(
+        "Action=GetRole&Version=2010-05-08&RoleName={}",
+        url_encode(role_name)
+    );
     let xml = iam_query(&body, creds)?;
 
     if xml.contains("NoSuchEntity") {

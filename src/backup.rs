@@ -46,11 +46,7 @@ pub fn configure_backup(
 ) -> Result<(), String> {
     // Derive account ID from the backup role ARN (field 4 in the colon-split).
     // arn:aws:iam::<account-id>:role/<name>
-    let account_id = backup_role_arn
-        .split(':')
-        .nth(4)
-        .unwrap_or("*")
-        .to_string();
+    let account_id = backup_role_arn.split(':').nth(4).unwrap_or("*").to_string();
 
     let plan_name = format!("{rds_identifier}-backup");
     let retention = retention_days.max(1);
@@ -67,8 +63,7 @@ pub fn configure_backup(
         .ok_or_else(|| format!("configure_backup: could not parse BackupPlanId from response"))?;
 
     // ── 2. CreateBackupSelection ──────────────────────────────────────────────
-    let rds_arn =
-        format!("arn:aws:rds:{region}:{account_id}:db:{rds_identifier}");
+    let rds_arn = format!("arn:aws:rds:{region}:{account_id}:db:{rds_identifier}");
     let selection_name = format!("{rds_identifier}-selection");
     let selection_body = format!(
         r#"{{"BackupSelection":{{"SelectionName":"{selection_name}","IamRoleArn":"{backup_role_arn}","Resources":["{rds_arn}"]}}}}"#

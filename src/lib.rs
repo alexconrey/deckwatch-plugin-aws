@@ -22,9 +22,9 @@ mod rds;
 #[cfg(target_arch = "wasm32")]
 mod s3;
 
-use deckwatch_plugin_sdk::{EnvVarSpec, PluginContext, PluginResult};
 #[cfg(target_arch = "wasm32")]
 use deckwatch_plugin_sdk::PluginMetadata;
+use deckwatch_plugin_sdk::{EnvVarSpec, PluginContext, PluginResult};
 #[cfg(target_arch = "wasm32")]
 use extism_pdk::*;
 
@@ -78,7 +78,12 @@ impl AwsCredentials {
             .flatten()
             .or_else(|| config::get("AWS_DEFAULT_REGION").ok().flatten())
             .unwrap_or_else(|| "us-east-1".to_string());
-        Ok(Self { access_key, secret_key, session_token, region })
+        Ok(Self {
+            access_key,
+            secret_key,
+            session_token,
+            region,
+        })
     }
 }
 
@@ -147,9 +152,19 @@ fn default_rds_identifier(namespace: &str, deployment: &str) -> String {
     let raw = format!("{namespace}-{deployment}-db");
     let sanitised: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
-    if sanitised.len() > 63 { sanitised[..63].to_string() } else { sanitised }
+    if sanitised.len() > 63 {
+        sanitised[..63].to_string()
+    } else {
+        sanitised
+    }
 }
 
 fn workload_sa_name(deployment: &str) -> String {
@@ -194,24 +209,44 @@ impl AwsConfig {
                 },
                 engine: {
                     let raw = ann_str(ctx, "rds.deckwatch.io/engine");
-                    if raw.is_empty() { "postgres".to_string() } else { raw }
+                    if raw.is_empty() {
+                        "postgres".to_string()
+                    } else {
+                        raw
+                    }
                 },
                 instance_class: {
                     let raw = ann_str(ctx, "rds.deckwatch.io/instance-class");
-                    if raw.is_empty() { "db.t3.micro".to_string() } else { raw }
+                    if raw.is_empty() {
+                        "db.t3.micro".to_string()
+                    } else {
+                        raw
+                    }
                 },
                 allocated_storage: {
                     let raw = ann_str(ctx, "rds.deckwatch.io/allocated-storage");
-                    if raw.is_empty() { "20".to_string() } else { raw }
+                    if raw.is_empty() {
+                        "20".to_string()
+                    } else {
+                        raw
+                    }
                 },
                 db_name: {
                     let raw = ann_str(ctx, "rds.deckwatch.io/db-name");
-                    if raw.is_empty() { "app".to_string() } else { raw }
+                    if raw.is_empty() {
+                        "app".to_string()
+                    } else {
+                        raw
+                    }
                 },
                 multi_az: ann_bool(ctx, "rds.deckwatch.io/multi-az", false),
                 subnet_group: {
                     let raw = ann_str(ctx, "rds.deckwatch.io/subnet-group");
-                    if raw.is_empty() { None } else { Some(raw) }
+                    if raw.is_empty() {
+                        None
+                    } else {
+                        Some(raw)
+                    }
                 },
                 security_groups: {
                     let raw = ann_str(ctx, "rds.deckwatch.io/security-groups");
@@ -224,7 +259,11 @@ impl AwsConfig {
                 iam_auth: ann_bool(ctx, "rds.deckwatch.io/iam-auth", false),
                 snapshot_schedule: {
                     let raw = ann_str(ctx, "rds.deckwatch.io/snapshot-schedule");
-                    if raw.is_empty() { None } else { Some(raw) }
+                    if raw.is_empty() {
+                        None
+                    } else {
+                        Some(raw)
+                    }
                 },
                 snapshot_retention: ann_str(ctx, "rds.deckwatch.io/snapshot-retention")
                     .parse::<i64>()
@@ -232,7 +271,11 @@ impl AwsConfig {
                 backup_role_arn: ann_str(ctx, "rds.deckwatch.io/backup-role-arn"),
                 region: {
                     let raw = ann_str(ctx, "rds.deckwatch.io/region");
-                    if raw.is_empty() { "us-east-1".to_string() } else { raw }
+                    if raw.is_empty() {
+                        "us-east-1".to_string()
+                    } else {
+                        raw
+                    }
                 },
             })
         } else {
@@ -244,7 +287,11 @@ impl AwsConfig {
                 bucket_name: ann_str(ctx, "s3.deckwatch.io/bucket-name"),
                 region: {
                     let raw = ann_str(ctx, "s3.deckwatch.io/region");
-                    if raw.is_empty() { "us-east-1".to_string() } else { raw }
+                    if raw.is_empty() {
+                        "us-east-1".to_string()
+                    } else {
+                        raw
+                    }
                 },
                 versioning: ann_bool(ctx, "s3.deckwatch.io/versioning", false),
                 public_access_block: ann_bool(ctx, "s3.deckwatch.io/public-access-block", true),
@@ -257,7 +304,12 @@ impl AwsConfig {
             None
         };
 
-        AwsConfig { enabled: aws_enabled, role_name, rds, s3 }
+        AwsConfig {
+            enabled: aws_enabled,
+            role_name,
+            rds,
+            s3,
+        }
     }
 }
 
@@ -308,26 +360,42 @@ pub fn apply_inner(ctx: &PluginContext, bucket_prefix: &str) -> PluginResult {
     // ── ServiceAccount ────────────────────────────────────────────────────────
     // The role ARN is unknown statically; the WASM path overwrites this SA with
     // the real ARN after ensure_role() returns.
-    result.kubernetes_resources.push(service_account_yaml(&sa, "", &ctx.namespace));
+    result
+        .kubernetes_resources
+        .push(service_account_yaml(&sa, "", &ctx.namespace));
     result.service_account_name = Some(sa.clone());
 
     // ── RDS env vars ──────────────────────────────────────────────────────────
     if let Some(ref rds) = cfg.rds {
         let port = engine_port(&rds.engine);
-        result.env_vars.push(EnvVarSpec::value("DB_ENGINE", &rds.engine));
-        result.env_vars.push(EnvVarSpec::value("DB_PORT", port.to_string()));
-        result.env_vars.push(EnvVarSpec::value("DB_NAME", &rds.db_name));
+        result
+            .env_vars
+            .push(EnvVarSpec::value("DB_ENGINE", &rds.engine));
+        result
+            .env_vars
+            .push(EnvVarSpec::value("DB_PORT", port.to_string()));
+        result
+            .env_vars
+            .push(EnvVarSpec::value("DB_NAME", &rds.db_name));
         if rds.iam_auth {
-            result.env_vars.push(EnvVarSpec::value("DB_IAM_AUTH", "true"));
+            result
+                .env_vars
+                .push(EnvVarSpec::value("DB_IAM_AUTH", "true"));
         }
     }
 
     // ── S3 env vars ───────────────────────────────────────────────────────────
     if let Some(ref s3) = cfg.s3 {
         let full_bucket = format!("{}{}", bucket_prefix, s3.bucket_name);
-        result.env_vars.push(EnvVarSpec::value("S3_BUCKET", &full_bucket));
-        result.env_vars.push(EnvVarSpec::value("S3_REGION", &s3.region));
-        result.env_vars.push(EnvVarSpec::value("AWS_REGION", &s3.region));
+        result
+            .env_vars
+            .push(EnvVarSpec::value("S3_BUCKET", &full_bucket));
+        result
+            .env_vars
+            .push(EnvVarSpec::value("S3_REGION", &s3.region));
+        result
+            .env_vars
+            .push(EnvVarSpec::value("AWS_REGION", &s3.region));
     }
 
     // ── Plugin outputs ────────────────────────────────────────────────────────
@@ -344,7 +412,11 @@ pub fn apply_inner(ctx: &PluginContext, bucket_prefix: &str) -> PluginResult {
 /// Full apply: create/verify IAM role, provision RDS/S3, configure AWS Backup,
 /// then return the augmented result.
 #[cfg(target_arch = "wasm32")]
-fn apply_with_aws(ctx: &PluginContext, creds: &AwsCredentials, bucket_prefix: &str) -> PluginResult {
+fn apply_with_aws(
+    ctx: &PluginContext,
+    creds: &AwsCredentials,
+    bucket_prefix: &str,
+) -> PluginResult {
     let cfg = AwsConfig::from_context(ctx);
     if !cfg.enabled {
         return PluginResult::default();
@@ -354,7 +426,10 @@ fn apply_with_aws(ctx: &PluginContext, creds: &AwsCredentials, bucket_prefix: &s
     let role_arn = match iam::ensure_role(&cfg.role_name, creds) {
         Ok(arn) => arn,
         Err(e) => {
-            log!(LogLevel::Error, "deckwatch-plugin-aws: ensure_role failed: {e}");
+            log!(
+                LogLevel::Error,
+                "deckwatch-plugin-aws: ensure_role failed: {e}"
+            );
             // Fall back to static result so the deployment isn't blocked.
             return apply_inner(ctx, bucket_prefix);
         }
@@ -364,10 +439,16 @@ fn apply_with_aws(ctx: &PluginContext, creds: &AwsCredentials, bucket_prefix: &s
     let rds_endpoint = if let Some(ref rds_cfg) = cfg.rds {
         match rds::ensure_instance(rds_cfg, creds) {
             Ok(endpoint) => {
-                if let Err(e) =
-                    iam::attach_rds_policy(&cfg.role_name, &rds_cfg.identifier, &creds.region, creds)
-                {
-                    log!(LogLevel::Warn, "deckwatch-plugin-aws: attach_rds_policy: {e}");
+                if let Err(e) = iam::attach_rds_policy(
+                    &cfg.role_name,
+                    &rds_cfg.identifier,
+                    &creds.region,
+                    creds,
+                ) {
+                    log!(
+                        LogLevel::Warn,
+                        "deckwatch-plugin-aws: attach_rds_policy: {e}"
+                    );
                 }
                 if let Some(ref schedule) = rds_cfg.snapshot_schedule {
                     if let Err(e) = backup::configure_backup(
@@ -378,13 +459,19 @@ fn apply_with_aws(ctx: &PluginContext, creds: &AwsCredentials, bucket_prefix: &s
                         &rds_cfg.backup_role_arn,
                         creds,
                     ) {
-                        log!(LogLevel::Warn, "deckwatch-plugin-aws: configure_backup: {e}");
+                        log!(
+                            LogLevel::Warn,
+                            "deckwatch-plugin-aws: configure_backup: {e}"
+                        );
                     }
                 }
                 endpoint
             }
             Err(e) => {
-                log!(LogLevel::Error, "deckwatch-plugin-aws: ensure_instance: {e}");
+                log!(
+                    LogLevel::Error,
+                    "deckwatch-plugin-aws: ensure_instance: {e}"
+                );
                 String::new()
             }
         }
@@ -398,7 +485,10 @@ fn apply_with_aws(ctx: &PluginContext, creds: &AwsCredentials, bucket_prefix: &s
         match s3::ensure_bucket(s3_cfg, &full_bucket, creds) {
             Ok(()) => {
                 if let Err(e) = iam::attach_s3_policy(&cfg.role_name, &full_bucket, creds) {
-                    log!(LogLevel::Warn, "deckwatch-plugin-aws: attach_s3_policy: {e}");
+                    log!(
+                        LogLevel::Warn,
+                        "deckwatch-plugin-aws: attach_s3_policy: {e}"
+                    );
                 }
             }
             Err(e) => {
@@ -416,14 +506,18 @@ fn apply_with_aws(ctx: &PluginContext, creds: &AwsCredentials, bucket_prefix: &s
 
     // Replace the placeholder SA with the real role ARN.
     result.kubernetes_resources.clear();
-    result.kubernetes_resources.push(service_account_yaml(&sa, &role_arn, &ctx.namespace));
+    result
+        .kubernetes_resources
+        .push(service_account_yaml(&sa, &role_arn, &ctx.namespace));
 
     // Overwrite placeholder with real role ARN.
     result.outputs.insert("role_arn".into(), role_arn);
     result.outputs.insert("service_account_name".into(), sa);
 
     if !rds_endpoint.is_empty() {
-        result.env_vars.push(EnvVarSpec::value("DB_HOST", &rds_endpoint));
+        result
+            .env_vars
+            .push(EnvVarSpec::value("DB_HOST", &rds_endpoint));
         result.outputs.insert("rds_endpoint".into(), rds_endpoint);
     }
     if !s3_bucket.is_empty() {
@@ -464,12 +558,18 @@ pub fn apply(Json(ctx): Json<PluginContext>) -> FnResult<Json<PluginResult>> {
     let creds = match AwsCredentials::from_config() {
         Ok(c) => c,
         Err(e) => {
-            log!(LogLevel::Error, "deckwatch-plugin-aws: credentials error: {e}");
+            log!(
+                LogLevel::Error,
+                "deckwatch-plugin-aws: credentials error: {e}"
+            );
             return Ok(Json(apply_inner(&ctx, "")));
         }
     };
 
-    let bucket_prefix = config::get("BUCKET_PREFIX").ok().flatten().unwrap_or_default();
+    let bucket_prefix = config::get("BUCKET_PREFIX")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let result = apply_with_aws(&ctx, &creds, &bucket_prefix);
     Ok(Json(result))
 }
@@ -495,7 +595,11 @@ mod tests {
     }
 
     fn find_env<'a>(result: &'a PluginResult, name: &str) -> Option<&'a str> {
-        result.env_vars.iter().find(|e| e.name == name).map(|e| e.value.as_str())
+        result
+            .env_vars
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.value.as_str())
     }
 
     // 1. All annotations absent — plugin must return an empty result.
@@ -511,10 +615,19 @@ mod tests {
     #[test]
     fn aws_enabled_alone_no_rds_no_s3() {
         let result = apply_inner(&ctx(&[("aws.deckwatch.io/enabled", "true")]), "");
-        assert!(find_env(&result, "DB_PORT").is_none(), "no DB env vars expected");
-        assert!(find_env(&result, "S3_BUCKET").is_none(), "no S3 env vars expected");
+        assert!(
+            find_env(&result, "DB_PORT").is_none(),
+            "no DB env vars expected"
+        );
+        assert!(
+            find_env(&result, "S3_BUCKET").is_none(),
+            "no S3 env vars expected"
+        );
         assert!(result.service_account_name.is_some(), "SA must be created");
-        assert!(!result.kubernetes_resources.is_empty(), "SA resource must be emitted");
+        assert!(
+            !result.kubernetes_resources.is_empty(),
+            "SA resource must be emitted"
+        );
     }
 
     // 3. RDS enabled → static DB env vars injected.
@@ -577,7 +690,10 @@ mod tests {
             "",
         );
         assert_eq!(find_env(&result, "DB_IAM_AUTH"), Some("true"));
-        assert!(find_env(&result, "DB_PASSWORD").is_none(), "DB_PASSWORD must not be injected with IAM auth");
+        assert!(
+            find_env(&result, "DB_PASSWORD").is_none(),
+            "DB_PASSWORD must not be injected with IAM auth"
+        );
     }
 
     // 7. BUCKET_PREFIX is applied to the bucket name.
@@ -618,23 +734,39 @@ mod tests {
             ("rds.deckwatch.io/enabled", "true"),
             ("rds.deckwatch.io/snapshot-schedule", "cron(0 3 * * ? *)"),
             ("rds.deckwatch.io/snapshot-retention", "14"),
-            ("rds.deckwatch.io/backup-role-arn", "arn:aws:iam::123456789012:role/backup-role"),
+            (
+                "rds.deckwatch.io/backup-role-arn",
+                "arn:aws:iam::123456789012:role/backup-role",
+            ),
         ]);
         let cfg = AwsConfig::from_context(&c);
         let rds = cfg.rds.unwrap();
         assert_eq!(rds.snapshot_schedule.as_deref(), Some("cron(0 3 * * ? *)"));
         assert_eq!(rds.snapshot_retention, 14);
-        assert_eq!(rds.backup_role_arn, "arn:aws:iam::123456789012:role/backup-role");
+        assert_eq!(
+            rds.backup_role_arn,
+            "arn:aws:iam::123456789012:role/backup-role"
+        );
     }
 
     // 11. When any AWS resource is enabled, a ServiceAccount is in kubernetes_resources.
     #[test]
     fn service_account_in_kubernetes_resources() {
         let result = apply_inner(&ctx(&[("aws.deckwatch.io/enabled", "true")]), "");
-        assert!(!result.kubernetes_resources.is_empty(), "kubernetes_resources must be non-empty");
+        assert!(
+            !result.kubernetes_resources.is_empty(),
+            "kubernetes_resources must be non-empty"
+        );
         let sa = &result.kubernetes_resources[0];
-        assert_eq!(sa["kind"].as_str(), Some("ServiceAccount"), "first resource must be ServiceAccount");
-        assert!(result.service_account_name.is_some(), "service_account_name must be set");
+        assert_eq!(
+            sa["kind"].as_str(),
+            Some("ServiceAccount"),
+            "first resource must be ServiceAccount"
+        );
+        assert!(
+            result.service_account_name.is_some(),
+            "service_account_name must be set"
+        );
     }
 
     // 12. MySQL engine → DB_PORT=3306.
