@@ -21,16 +21,12 @@ use crate::AwsCredentials;
 /// Returns `None` if the token or role ARN are absent (fall through to static
 /// credentials). Returns `Err` if the exchange fails unexpectedly.
 pub fn try_assume_role_with_web_identity(region: &str) -> Result<Option<AwsCredentials>, String> {
-    let token = match config::get("AWS_IDENTITY_TOKEN")
-        .map_err(|e| format!("config error: {e}"))?
-    {
+    let token = match config::get("AWS_IDENTITY_TOKEN").map_err(|e| format!("config error: {e}"))? {
         Some(t) if !t.is_empty() => t,
         _ => return Ok(None), // no token — caller falls back to static creds
     };
 
-    let role_arn = match config::get("AWS_ROLE_ARN")
-        .map_err(|e| format!("config error: {e}"))?
-    {
+    let role_arn = match config::get("AWS_ROLE_ARN").map_err(|e| format!("config error: {e}"))? {
         Some(r) if !r.is_empty() => r,
         _ => return Ok(None),
     };
@@ -63,16 +59,15 @@ fn call_sts(token: &str, role_arn: &str, region: &str) -> Result<AwsCredentials,
         .with_header("Content-Type", "application/x-www-form-urlencoded")
         .with_header("Host", &host);
 
-    let resp = http::request::<String>(&req, Some(body))
-        .map_err(|e| format!("STS HTTP error: {e}"))?;
+    let resp =
+        http::request::<String>(&req, Some(body)).map_err(|e| format!("STS HTTP error: {e}"))?;
 
     let status = resp.status_code();
     let body_bytes = resp.body();
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     if status >= 400 {
-        let msg = extract_xml_tag(&body_str, "Message")
-            .unwrap_or_else(|| body_str.to_string());
+        let msg = extract_xml_tag(&body_str, "Message").unwrap_or_else(|| body_str.to_string());
         return Err(format!("STS error {status}: {msg}"));
     }
 
@@ -80,10 +75,10 @@ fn call_sts(token: &str, role_arn: &str, region: &str) -> Result<AwsCredentials,
 }
 
 fn parse_credentials(xml: &str, region: &str) -> Result<AwsCredentials, String> {
-    let access_key = extract_xml_tag(xml, "AccessKeyId")
-        .ok_or("STS response missing AccessKeyId")?;
-    let secret_key = extract_xml_tag(xml, "SecretAccessKey")
-        .ok_or("STS response missing SecretAccessKey")?;
+    let access_key =
+        extract_xml_tag(xml, "AccessKeyId").ok_or("STS response missing AccessKeyId")?;
+    let secret_key =
+        extract_xml_tag(xml, "SecretAccessKey").ok_or("STS response missing SecretAccessKey")?;
     let session_token = extract_xml_tag(xml, "SessionToken");
 
     Ok(AwsCredentials {
