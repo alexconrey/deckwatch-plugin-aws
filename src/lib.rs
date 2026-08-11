@@ -21,6 +21,8 @@ mod iam;
 mod rds;
 #[cfg(target_arch = "wasm32")]
 mod s3;
+#[cfg(target_arch = "wasm32")]
+mod sts;
 
 #[cfg(target_arch = "wasm32")]
 use deckwatch_plugin_sdk::PluginMetadata;
@@ -60,12 +62,35 @@ pub struct AwsCredentials {
 
 #[cfg(target_arch = "wasm32")]
 impl AwsCredentials {
-    /// Read credentials from the extism config namespace. Returns an error if
-    /// `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` are not set.
+    /// Resolve credentials from the extism config namespace.
+    ///
+    /// Resolution order:
+    /// 1. If `AWS_IDENTITY_TOKEN` + `AWS_ROLE_ARN` are present, call STS
+    ///    `AssumeRoleWithWebIdentity` (unsigned) to obtain temporary credentials.
+    ///    Deckwatch injects `AWS_IDENTITY_TOKEN` by reading the file at
+    ///    `$AWS_WEB_IDENTITY_TOKEN_FILE` — the plugin never touches the filesystem.
+    /// 2. Fall back to static `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
     pub fn from_config() -> Result<Self, String> {
+        // Determine region first — needed for the STS regional endpoint.
+        let region = config::get("AWS_REGION")
+            .ok()
+            .flatten()
+            .or_else(|| config::get("AWS_DEFAULT_REGION").ok().flatten())
+            .unwrap_or_else(|| "us-east-1".to_string());
+
+        // Try workload identity exchange first (IRSA / OIDC federation).
+        if let Some(creds) = sts::try_assume_role_with_web_identity(&region)? {
+            log!(
+                LogLevel::Info,
+                "deckwatch-plugin-aws: resolved credentials via AssumeRoleWithWebIdentity"
+            );
+            return Ok(creds);
+        }
+
+        // Fall back to static credentials.
         let access_key = config::get("AWS_ACCESS_KEY_ID")
             .map_err(|e| format!("AWS_ACCESS_KEY_ID not in plugin config: {e}"))?
-            .ok_or("AWS_ACCESS_KEY_ID not set in plugin config")?;
+            .ok_or("AWS_ACCESS_KEY_ID not set — provide static credentials or configure inherit_env_file_keys for workload identity")?;
         let secret_key = config::get("AWS_SECRET_ACCESS_KEY")
             .map_err(|e| format!("AWS_SECRET_ACCESS_KEY not in plugin config: {e}"))?
             .ok_or("AWS_SECRET_ACCESS_KEY not set in plugin config")?;
@@ -73,11 +98,6 @@ impl AwsCredentials {
             .ok()
             .flatten()
             .filter(|s| !s.is_empty());
-        let region = config::get("AWS_REGION")
-            .ok()
-            .flatten()
-            .or_else(|| config::get("AWS_DEFAULT_REGION").ok().flatten())
-            .unwrap_or_else(|| "us-east-1".to_string());
         Ok(Self {
             access_key,
             secret_key,
