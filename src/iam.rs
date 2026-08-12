@@ -30,12 +30,41 @@ use extism_pdk::*;
 use crate::{aws_sign, AwsCredentials};
 
 /// Returns `(iam_host, iam_signing_region)` for the given workload region.
-fn iam_endpoint(region: &str) -> (&'static str, &'static str) {
-    if region.starts_with("us-gov-") {
-        ("iam.us-gov.amazonaws.com", "us-gov-west-1")
-    } else {
-        ("iam.amazonaws.com", "us-east-1")
-    }
+///
+/// Checks plugin config keys first so operators can override for air-gapped,
+/// China, or other non-standard partitions:
+/// - `IAM_ENDPOINT`       — hostname only, e.g. `iam.us-gov.amazonaws.com`
+/// - `IAM_SIGNING_REGION` — Sig V4 region, e.g. `us-gov-west-1`
+///
+/// Falls back to partition-aware defaults derived from the workload region:
+/// - `us-gov-*` → `iam.us-gov.amazonaws.com` / `us-gov-west-1`
+/// - all others → `iam.amazonaws.com` / `us-east-1`
+fn iam_endpoint(region: &str) -> (String, String) {
+    let host = config::get("IAM_ENDPOINT")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if region.starts_with("us-gov-") {
+                "iam.us-gov.amazonaws.com".to_string()
+            } else {
+                "iam.amazonaws.com".to_string()
+            }
+        });
+
+    let signing_region = config::get("IAM_SIGNING_REGION")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if region.starts_with("us-gov-") {
+                "us-gov-west-1".to_string()
+            } else {
+                "us-east-1".to_string()
+            }
+        });
+
+    (host, signing_region)
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -138,12 +167,12 @@ fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
     let datetime = aws_sign::utc_now_iso8601(&creds.region);
     let auth = aws_sign::authorization_header(
         "POST",
-        iam_host,
+        &iam_host,
         "/",
         "",
         body,
         &datetime,
-        iam_region,
+        &iam_region,
         "iam",
         &creds.access_key,
         &creds.secret_key,
@@ -155,7 +184,7 @@ fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
     let mut req = HttpRequest::new(&url)
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")
-        .with_header("Host", iam_host)
+        .with_header("Host", &iam_host)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 
