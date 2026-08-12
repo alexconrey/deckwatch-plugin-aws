@@ -27,7 +27,9 @@ mod sts;
 // ConfigField, ConfigFieldType, and PluginResource are pure types — no WASM host
 // functions needed. Import unconditionally so resource helpers can be unit-tested
 // on the host target too.
-use deckwatch_plugin_sdk::{ConfigField, ConfigFieldType, EnvVarSpec, PluginContext, PluginResult, PluginResource};
+use deckwatch_plugin_sdk::{
+    ConfigField, ConfigFieldType, EnvVarSpec, PluginContext, PluginResource, PluginResult,
+};
 #[cfg(target_arch = "wasm32")]
 use deckwatch_plugin_sdk::{PluginMetadata, ResourceProvisionRequest, ResourceProvisionResult};
 #[cfg(target_arch = "wasm32")]
@@ -586,8 +588,10 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
 // ── Resource declarations ─────────────────────────────────────────────────────
 // No #[cfg(target_arch = "wasm32")] — these are pure struct constructors that
 // must be testable on the host target to catch metadata() regressions.
+// `pub` so the host compiler doesn't flag them as dead code (they're used by
+// `metadata()` which is wasm32-only, and by host-side unit tests).
 
-fn rds_resource() -> PluginResource {
+pub fn rds_resource() -> PluginResource {
     PluginResource {
         id: "rds".into(),
         label: "RDS Database".into(),
@@ -645,7 +649,7 @@ fn rds_resource() -> PluginResource {
     }
 }
 
-fn s3_resource() -> PluginResource {
+pub fn s3_resource() -> PluginResource {
     PluginResource {
         id: "s3".into(),
         label: "S3 Bucket".into(),
@@ -1047,9 +1051,18 @@ mod tests {
         let r = rds_resource();
         assert_eq!(r.id, "rds");
         assert!(r.singleton, "RDS must be singleton");
-        assert!(!r.fields.is_empty(), "RDS resource must declare form fields");
-        assert!(!r.output_keys.is_empty(), "RDS resource must declare output env var keys");
-        assert!(r.output_keys.iter().any(|k| k == "DB_HOST"), "DB_HOST must be in output_keys");
+        assert!(
+            !r.fields.is_empty(),
+            "RDS resource must declare form fields"
+        );
+        assert!(
+            !r.output_keys.is_empty(),
+            "RDS resource must declare output env var keys"
+        );
+        assert!(
+            r.output_keys.iter().any(|k| k == "DB_HOST"),
+            "DB_HOST must be in output_keys"
+        );
     }
 
     // 15. s3_resource() declares the expected fields.
@@ -1059,7 +1072,13 @@ mod tests {
         assert_eq!(r.id, "s3");
         assert!(r.singleton, "S3 must be singleton");
         assert!(!r.fields.is_empty(), "S3 resource must declare form fields");
-        assert!(!r.output_keys.is_empty(), "S3 resource must declare output env var keys");
-        assert!(r.output_keys.iter().any(|k| k == "S3_BUCKET"), "S3_BUCKET must be in output_keys");
+        assert!(
+            !r.output_keys.is_empty(),
+            "S3 resource must declare output env var keys"
+        );
+        assert!(
+            r.output_keys.iter().any(|k| k == "S3_BUCKET"),
+            "S3_BUCKET must be in output_keys"
+        );
     }
 }
