@@ -110,39 +110,59 @@ pub fn authorization_header(
 
 /// UTC datetime in the `YYYYMMDDTHHmmSSZ` format required by AWS Sig V4.
 ///
-/// Only compiled for WASM targets because it is called exclusively from the
-/// WASM-only API modules (iam, rds, s3, backup). Using the system clock on a
-/// WASM host is fine; the underlying `std::time::SystemTime` is available in
-/// `wasm32-unknown-unknown` via the extism runtime.
+/// `SystemTime::now()` panics in `wasm32-unknown-unknown` — extism does not
+/// expose a host clock to plugins. Instead, we fetch the current time from the
+/// `Date` response header of an unsigned HEAD request to the regional STS
+/// endpoint. STS is always reachable (it matches the `*.amazonaws.com`
+/// allowed-host glob) and every HTTP/1.1 response includes a `Date` header.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn utc_now_iso8601() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+pub(crate) fn utc_now_iso8601(region: &str) -> String {
+    use extism_pdk::{http, HttpRequest};
 
-    let days = secs / 86400;
-    let time = secs % 86400;
-    let h = time / 3600;
-    let m = (time % 3600) / 60;
-    let s = time % 60;
+    let host = format!("sts.{region}.amazonaws.com");
+    let url = format!("https://{host}/");
+    let req = HttpRequest::new(&url)
+        .with_method("HEAD")
+        .with_header("Host", &host);
 
-    let (y, mo, d) = civil_from_days(days as i64);
-    format!("{y:04}{mo:02}{d:02}T{h:02}{m:02}{s:02}Z")
+    if let Ok(resp) = http::request::<String>(&req, None::<String>) {
+        // extism normalizes response header names to lowercase.
+        if let Some(date) = resp.header("date") {
+            if let Some(formatted) = parse_http_date(date) {
+                return formatted;
+            }
+        }
+    }
+
+    // Fallback: should never be reached. An obviously-wrong timestamp causes
+    // AWS to return RequestExpired, surfacing a clear error rather than a panic.
+    "19700101T000000Z".to_string()
 }
 
+/// Parse an RFC 7231 HTTP `Date` header into AWS Sig V4 datetime format.
+///
+/// Input:  `"Tue, 12 Aug 2026 13:47:12 GMT"`
+/// Output: `"20260812T134712Z"`
 #[cfg(target_arch = "wasm32")]
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+fn parse_http_date(date: &str) -> Option<String> {
+    let parts: Vec<&str> = date.split_whitespace().collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    let day: u32 = parts[1].parse().ok()?;
+    let month: u32 = match parts[2] {
+        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4,
+        "May" => 5, "Jun" => 6, "Jul" => 7, "Aug" => 8,
+        "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        _ => return None,
+    };
+    let year: u32 = parts[3].parse().ok()?;
+    let time: Vec<&str> = parts[4].split(':').collect();
+    if time.len() != 3 {
+        return None;
+    }
+    let h: u32 = time[0].parse().ok()?;
+    let m: u32 = time[1].parse().ok()?;
+    let s: u32 = time[2].parse().ok()?;
+    Some(format!("{year:04}{month:02}{day:02}T{h:02}{m:02}{s:02}Z"))
 }
