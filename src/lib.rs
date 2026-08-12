@@ -442,16 +442,18 @@ fn apply_with_aws(
         return PluginResult::default();
     }
 
+    let mut errors: Vec<String> = Vec::new();
+
     // ── 1. Ensure IAM role ────────────────────────────────────────────────────
     let role_arn = match iam::ensure_role(&cfg.role_name, creds) {
         Ok(arn) => arn,
         Err(e) => {
-            log!(
-                LogLevel::Error,
-                "deckwatch-plugin-aws: ensure_role failed: {e}"
-            );
-            // Fall back to static result so the deployment isn't blocked.
-            return apply_inner(ctx, bucket_prefix);
+            errors.push(format!("ensure_role failed: {e}"));
+            // Fall back to static result, but surface the error via result.errors
+            // so deckwatch can log it — extism log!() is unreachable from the host.
+            let mut result = apply_inner(ctx, bucket_prefix);
+            result.errors = errors;
+            return result;
         }
     };
 
@@ -465,10 +467,7 @@ fn apply_with_aws(
                     &creds.region,
                     creds,
                 ) {
-                    log!(
-                        LogLevel::Warn,
-                        "deckwatch-plugin-aws: attach_rds_policy: {e}"
-                    );
+                    errors.push(format!("attach_rds_policy: {e}"));
                 }
                 if let Some(ref schedule) = rds_cfg.snapshot_schedule {
                     if let Err(e) = backup::configure_backup(
@@ -479,19 +478,13 @@ fn apply_with_aws(
                         &rds_cfg.backup_role_arn,
                         creds,
                     ) {
-                        log!(
-                            LogLevel::Warn,
-                            "deckwatch-plugin-aws: configure_backup: {e}"
-                        );
+                        errors.push(format!("configure_backup: {e}"));
                     }
                 }
                 endpoint
             }
             Err(e) => {
-                log!(
-                    LogLevel::Error,
-                    "deckwatch-plugin-aws: ensure_instance: {e}"
-                );
+                errors.push(format!("ensure_instance: {e}"));
                 String::new()
             }
         }
@@ -505,14 +498,11 @@ fn apply_with_aws(
         match s3::ensure_bucket(s3_cfg, &full_bucket, creds) {
             Ok(()) => {
                 if let Err(e) = iam::attach_s3_policy(&cfg.role_name, &full_bucket, creds) {
-                    log!(
-                        LogLevel::Warn,
-                        "deckwatch-plugin-aws: attach_s3_policy: {e}"
-                    );
+                    errors.push(format!("attach_s3_policy: {e}"));
                 }
             }
             Err(e) => {
-                log!(LogLevel::Error, "deckwatch-plugin-aws: ensure_bucket: {e}");
+                errors.push(format!("ensure_bucket: {e}"));
             }
         }
         full_bucket
@@ -544,6 +534,7 @@ fn apply_with_aws(
         result.outputs.insert("s3_bucket".into(), s3_bucket);
     }
 
+    result.errors = errors;
     result
 }
 
@@ -578,11 +569,9 @@ pub fn apply(Json(ctx): Json<PluginContext>) -> FnResult<Json<PluginResult>> {
     let creds = match AwsCredentials::from_config() {
         Ok(c) => c,
         Err(e) => {
-            log!(
-                LogLevel::Error,
-                "deckwatch-plugin-aws: credentials error: {e}"
-            );
-            return Ok(Json(apply_inner(&ctx, "")));
+            let mut result = apply_inner(&ctx, "");
+            result.errors.push(format!("credentials error: {e}"));
+            return Ok(Json(result));
         }
     };
 
