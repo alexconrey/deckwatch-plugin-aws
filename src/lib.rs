@@ -25,7 +25,10 @@ mod s3;
 mod sts;
 
 #[cfg(target_arch = "wasm32")]
-use deckwatch_plugin_sdk::{ConfigField, ConfigFieldType, PluginMetadata, PluginResource, ResourceProvisionRequest, ResourceProvisionResult};
+use deckwatch_plugin_sdk::{
+    ConfigField, ConfigFieldType, PluginMetadata, PluginResource, ResourceProvisionRequest,
+    ResourceProvisionResult,
+};
 use deckwatch_plugin_sdk::{EnvVarSpec, PluginContext, PluginResult};
 #[cfg(target_arch = "wasm32")]
 use extism_pdk::*;
@@ -663,11 +666,7 @@ fn s3_resource() -> PluginResource {
                 env_source: None,
             },
         ],
-        output_keys: vec![
-            "S3_BUCKET".into(),
-            "S3_REGION".into(),
-            "AWS_REGION".into(),
-        ],
+        output_keys: vec!["S3_BUCKET".into(), "S3_REGION".into(), "AWS_REGION".into()],
     }
 }
 
@@ -681,7 +680,9 @@ fn s3_resource() -> PluginResource {
 /// reconcile cycle.
 #[cfg(target_arch = "wasm32")]
 #[plugin_fn]
-pub fn provision(Json(req): Json<ResourceProvisionRequest>) -> FnResult<Json<ResourceProvisionResult>> {
+pub fn provision(
+    Json(req): Json<ResourceProvisionRequest>,
+) -> FnResult<Json<ResourceProvisionResult>> {
     let mut result = ResourceProvisionResult::default();
 
     let creds = match AwsCredentials::from_config() {
@@ -699,9 +700,7 @@ pub fn provision(Json(req): Json<ResourceProvisionRequest>) -> FnResult<Json<Res
                 .get("identifier")
                 .filter(|s| !s.is_empty())
                 .cloned()
-                .unwrap_or_else(|| {
-                    default_rds_identifier(&req.namespace, &req.application_name)
-                });
+                .unwrap_or_else(|| default_rds_identifier(&req.namespace, &req.application_name));
             let engine = req
                 .fields
                 .get("engine")
@@ -785,9 +784,7 @@ pub fn provision(Json(req): Json<ResourceProvisionRequest>) -> FnResult<Json<Res
             }
         }
         other => {
-            result
-                .errors
-                .push(format!("unknown resource_id: {other}"));
+            result.errors.push(format!("unknown resource_id: {other}"));
         }
     }
 
