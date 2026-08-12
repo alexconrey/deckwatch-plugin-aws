@@ -1,6 +1,6 @@
 [package]
 name = "deckwatch-plugin-aws"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Deckwatch plugin — provisions AWS resources (IAM, RDS, S3) for Kubernetes workloads via direct AWS API calls"
 repository = "https://github.com/alexconrey/deckwatch-plugin-aws"
