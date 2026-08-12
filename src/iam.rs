@@ -1,44 +1,39 @@
 //! IAM role management via the AWS IAM Query API.
 //!
 //! IAM endpoint and Sig V4 signing region are partition-aware:
-//! - Commercial:  `iam.amazonaws.com`,     signing region `us-east-1`
+//! - Commercial:  `iam.amazonaws.com`,        signing region `us-east-1`
 //! - GovCloud:    `iam.us-gov.amazonaws.com`, signing region `us-gov-west-1`
-//!
-//! GovCloud credentials are rejected by the commercial endpoint with
-//! `InvalidClientTokenId`, so the partition must be derived from the
-//! workload region before making any IAM call.
 //!
 //! ## Trust policy
 //!
-//! The role is created with a wildcard EKS trust policy so it can be assumed
-//! immediately. Operators should tighten this by setting their OIDC provider ARN:
+//! When `OIDC_PROVIDER_ARN` is configured in the plugin config, `ensure_role`
+//! generates a proper IRSA trust policy scoped to the workload's service account:
 //!
 //! ```json
 //! {
 //!   "Version": "2012-10-17",
 //!   "Statement": [{
 //!     "Effect": "Allow",
-//!     "Principal": {"Federated": "arn:aws:iam::<account>:oidc-provider/<oidc-url>"},
+//!     "Principal": {"Federated": "arn:aws:iam::<account>:oidc-provider/<url>"},
 //!     "Action": "sts:AssumeRoleWithWebIdentity",
-//!     "Condition": {"StringEquals": {"<oidc-url>:sub": "system:serviceaccount:<ns>:<sa>"}}
+//!     "Condition": {
+//!       "StringEquals": {
+//!         "<oidc-url>:sub": "system:serviceaccount:<ns>:<sa>",
+//!         "<oidc-url>:aud": "sts.amazonaws.com"
+//!       }
+//!     }
 //!   }]
 //! }
 //! ```
+//!
+//! `UpdateAssumeRolePolicy` is called on every reconcile so that adding
+//! `OIDC_PROVIDER_ARN` after initial role creation takes effect automatically.
 
 use extism_pdk::*;
 
 use crate::{aws_sign, AwsCredentials};
 
 /// Returns `(iam_host, iam_signing_region)` for the given workload region.
-///
-/// Checks plugin config keys first so operators can override for air-gapped,
-/// China, or other non-standard partitions:
-/// - `IAM_ENDPOINT`       — hostname only, e.g. `iam.us-gov.amazonaws.com`
-/// - `IAM_SIGNING_REGION` — Sig V4 region, e.g. `us-gov-west-1`
-///
-/// Falls back to partition-aware defaults derived from the workload region:
-/// - `us-gov-*` → `iam.us-gov.amazonaws.com` / `us-gov-west-1`
-/// - all others → `iam.amazonaws.com` / `us-east-1`
 fn iam_endpoint(region: &str) -> (String, String) {
     let host = config::get("IAM_ENDPOINT")
         .ok()
@@ -67,27 +62,67 @@ fn iam_endpoint(region: &str) -> (String, String) {
     (host, signing_region)
 }
 
+// ── Trust policy builder ──────────────────────────────────────────────────────
+
+fn trust_policy_document(namespace: &str, sa_name: &str) -> String {
+    let oidc_arn = config::get("OIDC_PROVIDER_ARN")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+
+    match oidc_arn {
+        Some(arn) => {
+            // ARN format: arn:aws[-partition]:iam::<account>:oidc-provider/<url>
+            let oidc_url = arn
+                .split(':')
+                .last()
+                .unwrap_or("")
+                .trim_start_matches("oidc-provider/");
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"Federated":"{arn}"}},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{{"StringEquals":{{"{oidc_url}:sub":"system:serviceaccount:{namespace}:{sa_name}","{oidc_url}:aud":"sts.amazonaws.com"}}}}}}]}}"#
+            )
+        }
+        None => {
+            log!(
+                LogLevel::Warn,
+                "deckwatch-plugin-aws: OIDC_PROVIDER_ARN not configured — \
+                 workload IAM role will have no trust principals and IRSA will not work."
+            );
+            r#"{"Version":"2012-10-17","Statement":[]}"#.to_string()
+        }
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Ensure a role with the given name exists. Creates it if it does not.
+/// Ensure a role with the given name exists and has the correct trust policy.
+///
+/// Creates the role if it does not exist; calls `UpdateAssumeRolePolicy` on
+/// every reconcile so OIDC_PROVIDER_ARN changes take effect automatically.
 ///
 /// Returns the role ARN on success.
-pub fn ensure_role(role_name: &str, creds: &AwsCredentials) -> Result<String, String> {
-    // Check if the role already exists.
+pub fn ensure_role(
+    role_name: &str,
+    namespace: &str,
+    sa_name: &str,
+    creds: &AwsCredentials,
+) -> Result<String, String> {
+    let trust = trust_policy_document(namespace, sa_name);
+
     if let Some(arn) = get_role(role_name, creds)? {
         log!(
             LogLevel::Info,
             "deckwatch-plugin-aws: IAM role {role_name} already exists"
         );
+        if let Err(e) = update_assume_role_policy(role_name, &trust, creds) {
+            log!(
+                LogLevel::Warn,
+                "deckwatch-plugin-aws: UpdateAssumeRolePolicy for {role_name}: {e}"
+            );
+        }
         return Ok(arn);
     }
 
-    // Create with a broad EKS trust policy. Operators should narrow this.
-    let trust = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"eks.amazonaws.com"},"Action":"sts:AssumeRoleWithWebIdentity"}]}"#;
-
-    // Path scopes the role so the deckwatch IRSA policy can manage it.
-    // Configurable via the ROLE_PATH plugin config key (default: /deckwatch-plugin/).
-    // Must start and end with '/'. Operators set this to match their IAM policy resource.
     let role_path = config::get("ROLE_PATH")
         .ok()
         .flatten()
@@ -98,11 +133,12 @@ pub fn ensure_role(role_name: &str, creds: &AwsCredentials) -> Result<String, St
         "Action=CreateRole&Version=2010-05-08&Path={}&RoleName={}&AssumeRolePolicyDocument={}",
         url_encode(&role_path),
         url_encode(role_name),
-        url_encode(trust),
+        url_encode(&trust),
     );
     let xml = iam_query(&body, creds)?;
 
-    extract_tag(&xml, "Arn").ok_or_else(|| format!("CreateRole: could not parse ARN from response"))
+    extract_tag(&xml, "Arn")
+        .ok_or_else(|| "CreateRole: could not parse ARN from response".to_string())
 }
 
 /// Attach an inline policy granting `rds-db:connect` for the instance.
@@ -141,13 +177,82 @@ pub fn attach_s3_policy(
         url_encode(role_name),
         url_encode(&policy),
     );
-    let _xml = iam_query(&body, creds)?;
+    iam_query(&body, creds)?;
+    Ok(())
+}
+
+/// Attach an inline policy granting ECR image pull operations.
+pub fn attach_ecr_policy(role_name: &str, creds: &AwsCredentials) -> Result<(), String> {
+    let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},{"Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage"],"Resource":"*"}]}"#;
+    let body = format!(
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-ecr-pull&PolicyDocument={}",
+        url_encode(role_name),
+        url_encode(policy),
+    );
+    iam_query(&body, creds)?;
+    Ok(())
+}
+
+/// Attach an inline policy granting standard SQS producer/consumer operations.
+pub fn attach_sqs_policy(
+    role_name: &str,
+    queue_arn: &str,
+    creds: &AwsCredentials,
+) -> Result<(), String> {
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["sqs:SendMessage","sqs:ReceiveMessage","sqs:DeleteMessage","sqs:GetQueueUrl","sqs:GetQueueAttributes","sqs:ChangeMessageVisibility"],"Resource":"{queue_arn}"}}]}}"#
+    );
+    let body = format!(
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-sqs-access&PolicyDocument={}",
+        url_encode(role_name),
+        url_encode(&policy),
+    );
+    iam_query(&body, creds)?;
+    Ok(())
+}
+
+/// Attach an inline policy granting `secretsmanager:GetSecretValue` on the given secret ARNs.
+pub fn attach_secretsmanager_policy(
+    role_name: &str,
+    secret_arns: &[String],
+    creds: &AwsCredentials,
+) -> Result<(), String> {
+    if secret_arns.is_empty() {
+        return Ok(());
+    }
+    let arns_json: String = secret_arns
+        .iter()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["secretsmanager:GetSecretValue","secretsmanager:DescribeSecret"],"Resource":[{arns_json}]}}]}}"#
+    );
+    let body = format!(
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-secretsmanager-access&PolicyDocument={}",
+        url_encode(role_name),
+        url_encode(&policy),
+    );
+    iam_query(&body, creds)?;
     Ok(())
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Call `GetRole` and return the ARN if found, `None` if the role does not exist.
+fn update_assume_role_policy(
+    role_name: &str,
+    trust: &str,
+    creds: &AwsCredentials,
+) -> Result<(), String> {
+    let body = format!(
+        "Action=UpdateAssumeRolePolicy&Version=2010-05-08&RoleName={}&PolicyDocument={}",
+        url_encode(role_name),
+        url_encode(trust),
+    );
+    iam_query(&body, creds)?;
+    Ok(())
+}
+
 fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<String>, String> {
     let body = format!(
         "Action=GetRole&Version=2010-05-08&RoleName={}",
@@ -165,7 +270,7 @@ fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<String>, S
 fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
     let (iam_host, iam_region) = iam_endpoint(&creds.region);
     let datetime = aws_sign::utc_now_iso8601(&creds.region);
-    let auth = aws_sign::authorization_header(
+    let (auth, payload_hash) = aws_sign::authorization_header(
         "POST",
         &iam_host,
         "/",
@@ -185,6 +290,7 @@ fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")
         .with_header("Host", &iam_host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 

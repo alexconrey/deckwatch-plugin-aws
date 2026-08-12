@@ -49,6 +49,9 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8>
 /// - `content_type` — `Some("application/xml")` or `Some("application/x-www-form-urlencoded")`
 ///   for requests with a body; `None` to omit the `Content-Type` header from
 ///   the signed headers (appropriate for HEAD requests).
+/// Returns `(authorization_header, payload_hash)`.
+/// `payload_hash` is the hex SHA256 of `body` — S3 requires it in the
+/// `x-amz-content-sha256` request header. Other services (IAM, RDS) can ignore it.
 #[allow(clippy::too_many_arguments)]
 pub fn authorization_header(
     method: &str,
@@ -63,13 +66,13 @@ pub fn authorization_header(
     secret_key: &str,
     session_token: Option<&str>,
     content_type: Option<&str>,
-) -> String {
+) -> (String, String) {
     let date = &datetime[..8]; // YYYYMMDD
 
     // ── Canonical request ─────────────────────────────────────────────────────
     let payload_hash = sha256_hex(body);
 
-    let mut signed_headers_list = vec!["host", "x-amz-date"];
+    let mut signed_headers_list = vec!["host", "x-amz-content-sha256", "x-amz-date"];
     if content_type.is_some() {
         signed_headers_list.push("content-type");
     }
@@ -83,7 +86,9 @@ pub fn authorization_header(
     if let Some(ct) = content_type {
         canonical_headers.push_str(&format!("content-type:{ct}\n"));
     }
-    canonical_headers.push_str(&format!("host:{host}\nx-amz-date:{datetime}\n"));
+    canonical_headers.push_str(&format!(
+        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{datetime}\n"
+    ));
     if let Some(tok) = session_token {
         canonical_headers.push_str(&format!("x-amz-security-token:{tok}\n"));
     }
@@ -102,9 +107,12 @@ pub fn authorization_header(
     let key = signing_key(secret_key, date, region, service);
     let signature = hex(&hmac_sha256(&key, &string_to_sign));
 
-    format!(
-        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, \
-         SignedHeaders={signed_headers}, Signature={signature}"
+    (
+        format!(
+            "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, \
+             SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+        payload_hash,
     )
 }
 
@@ -120,11 +128,16 @@ pub fn authorization_header(
 /// used — the host clock is region-agnostic.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn utc_now_iso8601(_region: &str) -> String {
-    #[link(wasm_import_module = "extism:host/user")]
-    unsafe extern "C" {
-        fn now() -> i64;
-    }
-    let secs = unsafe { now() } as u64;
+    use extism_pdk::config;
+
+    // Primary: read the timestamp injected by deckwatch at call time.
+    // Deckwatch inserts CURRENT_TIMESTAMP (Unix seconds) into the extism
+    // config so plugins never need a system clock or a network round-trip.
+    let secs: u64 = config::get("CURRENT_TIMESTAMP")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let h = time_of_day / 3600;

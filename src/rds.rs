@@ -127,7 +127,7 @@ fn create_db_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<(), Str
 fn rds_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
     let host = format!("rds.{}.amazonaws.com", creds.region);
     let datetime = aws_sign::utc_now_iso8601(&creds.region);
-    let auth = aws_sign::authorization_header(
+    let (auth, payload_hash) = aws_sign::authorization_header(
         "POST",
         &host,
         "/",
@@ -147,6 +147,7 @@ fn rds_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")
         .with_header("Host", &host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 

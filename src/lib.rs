@@ -22,6 +22,10 @@ mod rds;
 #[cfg(target_arch = "wasm32")]
 mod s3;
 #[cfg(target_arch = "wasm32")]
+mod secretsmanager;
+#[cfg(target_arch = "wasm32")]
+mod sqs;
+#[cfg(target_arch = "wasm32")]
 mod sts;
 
 // ConfigField, ConfigFieldType, and PluginResource are pure types — no WASM host
@@ -114,17 +118,14 @@ impl AwsCredentials {
 
 // ── Config structs ────────────────────────────────────────────────────────────
 
-/// Top-level parsed configuration for the plugin.
 pub struct AwsConfig {
-    /// True when at least one AWS resource is requested (master opt-in, or any
-    /// sub-namespace annotation implies `aws.deckwatch.io/enabled`).
     pub enabled: bool,
-    /// IAM role name to create. Defaults to `<namespace>-<deployment>-role`.
     pub role_name: String,
-    /// RDS instance configuration, present when `rds.deckwatch.io/enabled=true`.
     pub rds: Option<RdsConfig>,
-    /// S3 bucket configuration, present when `s3.deckwatch.io/enabled=true`.
     pub s3: Option<S3Config>,
+    pub sqs: Option<SqsConfig>,
+    pub ecr_enabled: bool,
+    pub secretsmanager: Option<SecretsMgrConfig>,
 }
 
 /// Parsed RDS configuration from `rds.deckwatch.io/*` annotations.
@@ -153,17 +154,27 @@ pub struct RdsConfig {
     pub region: String,
 }
 
-/// Parsed S3 configuration from `s3.deckwatch.io/*` annotations.
 pub struct S3Config {
-    /// Bucket name suffix. The full name is `{BUCKET_PREFIX}{bucket_name}`.
     pub bucket_name: String,
-    /// AWS region for the bucket. Defaults to `"us-east-1"`.
     pub region: String,
     pub versioning: bool,
-    /// Block all public access (default: true).
     pub public_access_block: bool,
-    /// Expire objects after N days. `None` means no lifecycle rule.
     pub lifecycle_days: Option<u32>,
+}
+
+pub struct SqsConfig {
+    pub queue_name: String,
+    pub fifo: bool,
+    pub visibility_timeout: u32,
+    pub retention_days: u32,
+}
+
+pub struct SecretsMgrConfig {
+    /// ARNs of pre-existing secrets to grant `GetSecretValue` access to.
+    pub secret_arns: Vec<String>,
+    /// When true, create a managed (empty) secret for this workload.
+    pub create_secret: bool,
+    pub secret_name: String,
 }
 
 // ── Name-generation helpers ───────────────────────────────────────────────────
@@ -192,6 +203,14 @@ fn default_rds_identifier(namespace: &str, deployment: &str) -> String {
     }
 }
 
+fn default_sqs_queue_name(namespace: &str, deployment: &str) -> String {
+    format!("{namespace}-{deployment}-queue")
+}
+
+fn default_secret_name(namespace: &str, deployment: &str) -> String {
+    format!("{namespace}/{deployment}")
+}
+
 fn workload_sa_name(deployment: &str) -> String {
     format!("{deployment}-aws-sa")
 }
@@ -209,9 +228,18 @@ impl AwsConfig {
     pub fn from_context(ctx: &PluginContext) -> Self {
         let rds_enabled = ann_bool(ctx, "rds.deckwatch.io/enabled", false);
         let s3_enabled = ann_bool(ctx, "s3.deckwatch.io/enabled", false);
-        // Any sub-namespace annotation implies the plugin is enabled.
-        let aws_enabled =
-            ann_bool(ctx, "aws.deckwatch.io/enabled", false) || rds_enabled || s3_enabled;
+        let sqs_enabled = ann_bool(ctx, "sqs.deckwatch.io/enabled", false);
+        let ecr_enabled = ann_bool(ctx, "ecr.deckwatch.io/enabled", false);
+        let sm_arns_raw = ann_str(ctx, "secretsmanager.deckwatch.io/secret-arns");
+        let sm_create = ann_bool(ctx, "secretsmanager.deckwatch.io/enabled", false);
+        let sm_enabled = sm_create || !sm_arns_raw.is_empty();
+
+        let aws_enabled = ann_bool(ctx, "aws.deckwatch.io/enabled", false)
+            || rds_enabled
+            || s3_enabled
+            || sqs_enabled
+            || ecr_enabled
+            || sm_enabled;
 
         let role_name = {
             let raw = ann_str(ctx, "aws.deckwatch.io/role-name");
@@ -329,11 +357,61 @@ impl AwsConfig {
             None
         };
 
+        let sqs = if sqs_enabled {
+            Some(SqsConfig {
+                queue_name: {
+                    let raw = ann_str(ctx, "sqs.deckwatch.io/queue-name");
+                    if raw.is_empty() {
+                        default_sqs_queue_name(&ctx.namespace, &ctx.deployment_name)
+                    } else {
+                        raw
+                    }
+                },
+                fifo: ann_bool(ctx, "sqs.deckwatch.io/fifo", false),
+                visibility_timeout: ann_str(ctx, "sqs.deckwatch.io/visibility-timeout")
+                    .parse::<u32>()
+                    .unwrap_or(30),
+                retention_days: ann_str(ctx, "sqs.deckwatch.io/retention-days")
+                    .parse::<u32>()
+                    .unwrap_or(4),
+            })
+        } else {
+            None
+        };
+
+        let secretsmanager = if sm_enabled {
+            Some(SecretsMgrConfig {
+                secret_arns: if sm_arns_raw.is_empty() {
+                    vec![]
+                } else {
+                    sm_arns_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                },
+                create_secret: sm_create,
+                secret_name: {
+                    let raw = ann_str(ctx, "secretsmanager.deckwatch.io/secret-name");
+                    if raw.is_empty() {
+                        default_secret_name(&ctx.namespace, &ctx.deployment_name)
+                    } else {
+                        raw
+                    }
+                },
+            })
+        } else {
+            None
+        };
+
         AwsConfig {
             enabled: aws_enabled,
             role_name,
             rds,
             s3,
+            sqs,
+            ecr_enabled,
+            secretsmanager,
         }
     }
 }
@@ -423,9 +501,26 @@ pub fn apply_inner(ctx: &PluginContext, bucket_prefix: &str) -> PluginResult {
             .push(EnvVarSpec::value("AWS_REGION", &s3.region));
     }
 
+    // ── SQS (queue name known statically) ─────────────────────────────────────
+    if let Some(ref sqs) = cfg.sqs {
+        let name = if sqs.fifo && !sqs.queue_name.ends_with(".fifo") {
+            format!("{}.fifo", sqs.queue_name)
+        } else {
+            sqs.queue_name.clone()
+        };
+        result.env_vars.push(EnvVarSpec::value("QUEUE_NAME", &name));
+    }
+
+    // ── Secrets Manager (secret name known statically when creating) ───────────
+    if let Some(ref sm) = cfg.secretsmanager {
+        if sm.create_secret {
+            result
+                .env_vars
+                .push(EnvVarSpec::value("SM_SECRET_NAME", &sm.secret_name));
+        }
+    }
+
     // ── Plugin outputs ────────────────────────────────────────────────────────
-    // role_arn is populated by the WASM path; set an empty placeholder so that
-    // downstream plugins can detect whether this plugin ran.
     result.outputs.insert("role_arn".into(), String::new());
     result.outputs.insert("service_account_name".into(), sa);
 
@@ -447,8 +542,10 @@ fn apply_with_aws(
         return PluginResult::default();
     }
 
-    // ── 1. Ensure IAM role ────────────────────────────────────────────────────
-    let role_arn = match iam::ensure_role(&cfg.role_name, creds) {
+    let sa = workload_sa_name(&ctx.deployment_name);
+
+    // ── 1. Ensure IAM role (OIDC-scoped trust policy) ─────────────────────────
+    let role_arn = match iam::ensure_role(&cfg.role_name, &ctx.namespace, &sa, creds) {
         Ok(arn) => arn,
         Err(e) => {
             log!(
@@ -504,16 +601,13 @@ fn apply_with_aws(
         String::new()
     };
 
-    // ── 3. S3 ────────────────────────────────────────────────────────────────
+    // ── 3. S3 ─────────────────────────────────────────────────────────────────
     let s3_bucket = if let Some(ref s3_cfg) = cfg.s3 {
         let full_bucket = format!("{}{}", bucket_prefix, s3_cfg.bucket_name);
         match s3::ensure_bucket(s3_cfg, &full_bucket, creds) {
             Ok(()) => {
                 if let Err(e) = iam::attach_s3_policy(&cfg.role_name, &full_bucket, creds) {
-                    log!(
-                        LogLevel::Warn,
-                        "deckwatch-plugin-aws: attach_s3_policy: {e}"
-                    );
+                    log!(LogLevel::Warn, "deckwatch-plugin-aws: attach_s3_policy: {e}");
                 }
             }
             Err(e) => {
@@ -525,28 +619,102 @@ fn apply_with_aws(
         String::new()
     };
 
-    // ── 4. Build result ───────────────────────────────────────────────────────
-    let sa = workload_sa_name(&ctx.deployment_name);
+    // ── 4. SQS ────────────────────────────────────────────────────────────────
+    let queue_url = if let Some(ref sqs_cfg) = cfg.sqs {
+        match sqs::ensure_queue(sqs_cfg, creds) {
+            Ok(info) => {
+                if let Err(e) = iam::attach_sqs_policy(&cfg.role_name, &info.queue_arn, creds) {
+                    log!(LogLevel::Warn, "deckwatch-plugin-aws: attach_sqs_policy: {e}");
+                }
+                info.queue_url
+            }
+            Err(e) => {
+                log!(LogLevel::Error, "deckwatch-plugin-aws: ensure_queue: {e}");
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    // ── 5. ECR ────────────────────────────────────────────────────────────────
+    if cfg.ecr_enabled {
+        if let Err(e) = iam::attach_ecr_policy(&cfg.role_name, creds) {
+            log!(LogLevel::Warn, "deckwatch-plugin-aws: attach_ecr_policy: {e}");
+        }
+    }
+
+    // ── 6. Secrets Manager ────────────────────────────────────────────────────
+    let sm_secret_arn = if let Some(ref sm_cfg) = cfg.secretsmanager {
+        let mut all_arns = sm_cfg.secret_arns.clone();
+
+        let created_arn = if sm_cfg.create_secret {
+            let desc =
+                format!("Managed by deckwatch for {}/{}", ctx.namespace, ctx.deployment_name);
+            match secretsmanager::ensure_secret(&sm_cfg.secret_name, &desc, creds) {
+                Ok(arn) => {
+                    all_arns.push(arn.clone());
+                    arn
+                }
+                Err(e) => {
+                    log!(LogLevel::Error, "deckwatch-plugin-aws: ensure_secret: {e}");
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+
+        if !all_arns.is_empty() {
+            if let Err(e) =
+                iam::attach_secretsmanager_policy(&cfg.role_name, &all_arns, creds)
+            {
+                log!(
+                    LogLevel::Warn,
+                    "deckwatch-plugin-aws: attach_secretsmanager_policy: {e}"
+                );
+            }
+        }
+
+        created_arn
+    } else {
+        String::new()
+    };
+
+    // ── 7. Build result ───────────────────────────────────────────────────────
     let mut result = apply_inner(ctx, bucket_prefix);
 
-    // Replace the placeholder SA with the real role ARN.
     result.kubernetes_resources.clear();
     result
         .kubernetes_resources
         .push(service_account_yaml(&sa, &role_arn, &ctx.namespace));
 
-    // Overwrite placeholder with real role ARN.
     result.outputs.insert("role_arn".into(), role_arn);
     result.outputs.insert("service_account_name".into(), sa);
 
-    if !rds_endpoint.is_empty() {
-        result
-            .env_vars
-            .push(EnvVarSpec::value("DB_HOST", &rds_endpoint));
-        result.outputs.insert("rds_endpoint".into(), rds_endpoint);
+    // RDS: emit DB_HOST when available; DB_STATUS signals provisioning state.
+    if cfg.rds.is_some() {
+        if rds_endpoint.is_empty() {
+            result.env_vars.push(EnvVarSpec::value("DB_STATUS", "provisioning"));
+            result.outputs.insert("db_status".into(), "provisioning".into());
+        } else {
+            result.env_vars.push(EnvVarSpec::value("DB_HOST", &rds_endpoint));
+            result.env_vars.push(EnvVarSpec::value("DB_STATUS", "available"));
+            result.outputs.insert("rds_endpoint".into(), rds_endpoint);
+            result.outputs.insert("db_status".into(), "available".into());
+        }
     }
+
     if !s3_bucket.is_empty() {
         result.outputs.insert("s3_bucket".into(), s3_bucket);
+    }
+    if !queue_url.is_empty() {
+        result.env_vars.push(EnvVarSpec::value("QUEUE_URL", &queue_url));
+        result.outputs.insert("queue_url".into(), queue_url);
+    }
+    if !sm_secret_arn.is_empty() {
+        result.env_vars.push(EnvVarSpec::value("SM_SECRET_ARN", &sm_secret_arn));
+        result.outputs.insert("sm_secret_arn".into(), sm_secret_arn);
     }
 
     result
@@ -562,26 +730,30 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
     Ok(Json(PluginMetadata {
         name: "aws".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        description: "Provisions AWS resources (IAM, RDS, S3) with a unified per-workload IAM role"
-            .into(),
+        description: "Provisions AWS resources (IAM, RDS, S3, SQS, Secrets Manager) with a unified per-workload IAM role".into(),
         provides: vec![
             "aws:iam-role".into(),
             "aws:service-account".into(),
             "aws:rds-connection".into(),
             "aws:s3-bucket".into(),
+            "aws:sqs-queue".into(),
+            "aws:secret-access".into(),
+            "aws:ecr-pull".into(),
         ],
         depends_on: vec![],
         optional_depends_on: vec![],
         config_schema: vec![
-            ConfigField { key: "AWS_REGION".into(), label: "AWS Region".into(), description: "Region for provisioned resources. Typically inherited from the pod environment via inherit_env_keys.".into(), field_type: ConfigFieldType::String, default: Some("us-east-1".into()), required: true, options: vec![], env_source: Some("AWS_REGION".into()) },
-            ConfigField { key: "IAM_ENDPOINT".into(), label: "IAM Endpoint".into(), description: "Override IAM hostname. Auto-detected from region (iam.us-gov.amazonaws.com for GovCloud).".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
+            ConfigField { key: "AWS_REGION".into(), label: "AWS Region".into(), description: "Region for provisioned resources.".into(), field_type: ConfigFieldType::String, default: Some("us-east-1".into()), required: true, options: vec![], env_source: Some("AWS_REGION".into()) },
+            ConfigField { key: "OIDC_PROVIDER_ARN".into(), label: "OIDC Provider ARN".into(), description: "ARN of the EKS OIDC provider (arn:aws:iam::<account>:oidc-provider/<url>). Required for IRSA.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
+            ConfigField { key: "IAM_ENDPOINT".into(), label: "IAM Endpoint".into(), description: "Override IAM hostname. Auto-detected (iam.us-gov.amazonaws.com for GovCloud).".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "IAM_SIGNING_REGION".into(), label: "IAM Signing Region".into(), description: "Override Sig V4 region for IAM. Auto-detected from region.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
-            ConfigField { key: "ROLE_PATH".into(), label: "IAM Role Path".into(), description: "Path prefix for created roles. Must start and end with /. Must match your IAM policy resource.".into(), field_type: ConfigFieldType::String, default: Some("/deckwatch-plugin/".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "ROLE_PATH".into(), label: "IAM Role Path".into(), description: "Path prefix for created roles. Must start and end with /.".into(), field_type: ConfigFieldType::String, default: Some("/deckwatch-plugin/".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "BUCKET_PREFIX".into(), label: "S3 Bucket Prefix".into(), description: "Prepended to all S3 bucket names (e.g. myorg-).".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "AWS_ACCESS_KEY_ID".into(), label: "Access Key ID".into(), description: "Static AWS access key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_ACCESS_KEY_ID".into()) },
             ConfigField { key: "AWS_SECRET_ACCESS_KEY".into(), label: "Secret Access Key".into(), description: "Static AWS secret key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SECRET_ACCESS_KEY".into()) },
+            ConfigField { key: "AWS_SESSION_TOKEN".into(), label: "Session Token".into(), description: "Temporary session token for assumed-role or SSO credentials. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SESSION_TOKEN".into()) },
         ],
-        resources: vec![rds_resource(), s3_resource()],
+        resources: vec![rds_resource(), s3_resource(), sqs_resource(), secretsmanager_resource()],
     }))
 }
 
@@ -682,6 +854,80 @@ pub fn s3_resource() -> PluginResource {
     }
 }
 
+pub fn sqs_resource() -> PluginResource {
+    PluginResource {
+        id: "sqs".into(),
+        label: "SQS Queue".into(),
+        icon: "mdi-message-queue".into(),
+        description: "Provision an Amazon SQS queue for this application.".into(),
+        singleton: true,
+        fields: vec![
+            ConfigField {
+                key: "queue_name".into(),
+                label: "Queue Name".into(),
+                description: "SQS queue name (default: {namespace}-{app_name}-queue)".into(),
+                field_type: ConfigFieldType::String,
+                default: None,
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
+            ConfigField {
+                key: "fifo".into(),
+                label: "FIFO Queue".into(),
+                description: "Enable FIFO ordering and exactly-once processing".into(),
+                field_type: ConfigFieldType::Bool,
+                default: Some("false".into()),
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
+            ConfigField {
+                key: "visibility_timeout".into(),
+                label: "Visibility Timeout (s)".into(),
+                description: "Seconds a received message is hidden from other consumers".into(),
+                field_type: ConfigFieldType::String,
+                default: Some("30".into()),
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
+            ConfigField {
+                key: "retention_days".into(),
+                label: "Retention (days)".into(),
+                description: "Days to retain undelivered messages (max 14)".into(),
+                field_type: ConfigFieldType::String,
+                default: Some("4".into()),
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
+        ],
+        output_keys: vec!["QUEUE_URL".into(), "QUEUE_NAME".into()],
+    }
+}
+
+pub fn secretsmanager_resource() -> PluginResource {
+    PluginResource {
+        id: "secretsmanager".into(),
+        label: "Secrets Manager".into(),
+        icon: "mdi-key-variant".into(),
+        description: "Create an empty AWS Secrets Manager secret for this application. Populate the value manually or via CI.".into(),
+        singleton: true,
+        fields: vec![ConfigField {
+            key: "secret_name".into(),
+            label: "Secret Name".into(),
+            description: "Secret name or path (default: {namespace}/{app_name})".into(),
+            field_type: ConfigFieldType::String,
+            default: None,
+            required: false,
+            options: vec![],
+            env_source: None,
+        }],
+        output_keys: vec!["SM_SECRET_ARN".into(), "SM_SECRET_NAME".into()],
+    }
+}
+
 // ── WASM entry point: provision ───────────────────────────────────────────────
 
 /// Provision a single infrastructure resource on behalf of an application.
@@ -751,7 +997,12 @@ pub fn provision(
             match rds::ensure_instance(&cfg, &creds) {
                 Ok(endpoint) => {
                     let port = engine_port(&engine).to_string();
-                    result.state.insert("DB_HOST".into(), endpoint);
+                    if endpoint.is_empty() {
+                        result.state.insert("DB_STATUS".into(), "provisioning".into());
+                    } else {
+                        result.state.insert("DB_HOST".into(), endpoint);
+                        result.state.insert("DB_STATUS".into(), "available".into());
+                    }
                     result.state.insert("DB_PORT".into(), port);
                     result.state.insert("DB_ENGINE".into(), engine);
                     result.state.insert("DB_NAME".into(), db_name);
@@ -792,6 +1043,69 @@ pub fn provision(
                 }
                 Err(e) => {
                     result.errors.push(format!("S3 provisioning error: {e}"));
+                }
+            }
+        }
+        "sqs" => {
+            let queue_name = req
+                .fields
+                .get("queue_name")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    default_sqs_queue_name(&req.namespace, &req.application_name)
+                });
+            let fifo = req
+                .fields
+                .get("fifo")
+                .map(|v| matches!(v.as_str(), "true" | "yes" | "1"))
+                .unwrap_or(false);
+            let visibility_timeout = req
+                .fields
+                .get("visibility_timeout")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(30);
+            let retention_days = req
+                .fields
+                .get("retention_days")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(4);
+
+            let cfg = SqsConfig { queue_name, fifo, visibility_timeout, retention_days };
+
+            match sqs::ensure_queue(&cfg, &creds) {
+                Ok(info) => {
+                    let name = info.queue_arn.split(':').last().unwrap_or("").to_string();
+                    result.state.insert("QUEUE_URL".into(), info.queue_url);
+                    result.state.insert("QUEUE_NAME".into(), name);
+                }
+                Err(e) => {
+                    result.errors.push(format!("SQS provisioning error: {e}"));
+                }
+            }
+        }
+        "secretsmanager" => {
+            let secret_name = req
+                .fields
+                .get("secret_name")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    default_secret_name(&req.namespace, &req.application_name)
+                });
+            let desc = format!(
+                "Managed by deckwatch for {}/{}",
+                req.namespace, req.application_name
+            );
+            match secretsmanager::ensure_secret(&secret_name, &desc, &creds) {
+                Ok(arn) => {
+                    result.state.insert("SM_SECRET_ARN".into(), arn);
+                    result.state.insert("SM_SECRET_NAME".into(), secret_name);
+                }
+                Err(e) => {
+                    result
+                        .errors
+                        .push(format!("Secrets Manager provisioning error: {e}"));
                 }
             }
         }
@@ -1080,5 +1394,94 @@ mod tests {
             r.output_keys.iter().any(|k| k == "S3_BUCKET"),
             "S3_BUCKET must be in output_keys"
         );
+    }
+
+    // ── New: SQS ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sqs_enabled_sets_queue_name_env_var() {
+        let result = apply_inner(
+            &ctx(&[
+                ("sqs.deckwatch.io/enabled", "true"),
+                ("sqs.deckwatch.io/queue-name", "my-jobs"),
+            ]),
+            "",
+        );
+        assert_eq!(find_env(&result, "QUEUE_NAME"), Some("my-jobs"));
+        assert!(result.service_account_name.is_some());
+    }
+
+    #[test]
+    fn sqs_fifo_adds_suffix_to_queue_name() {
+        let result = apply_inner(
+            &ctx(&[
+                ("sqs.deckwatch.io/enabled", "true"),
+                ("sqs.deckwatch.io/queue-name", "my-jobs"),
+                ("sqs.deckwatch.io/fifo", "true"),
+            ]),
+            "",
+        );
+        assert_eq!(find_env(&result, "QUEUE_NAME"), Some("my-jobs.fifo"));
+    }
+
+    #[test]
+    fn sqs_defaults_queue_name() {
+        let c = ctx(&[("sqs.deckwatch.io/enabled", "true")]);
+        let cfg = AwsConfig::from_context(&c);
+        let sqs = cfg.sqs.unwrap();
+        assert_eq!(sqs.queue_name, "production-my-app-queue");
+    }
+
+    #[test]
+    fn sqs_resource_has_required_fields() {
+        let r = sqs_resource();
+        assert_eq!(r.id, "sqs");
+        assert!(r.singleton);
+        assert!(r.output_keys.iter().any(|k| k == "QUEUE_URL"));
+        assert!(r.output_keys.iter().any(|k| k == "QUEUE_NAME"));
+    }
+
+    // ── New: ECR ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ecr_annotation_sets_enabled_flag() {
+        let c = ctx(&[("ecr.deckwatch.io/enabled", "true")]);
+        let cfg = AwsConfig::from_context(&c);
+        assert!(cfg.ecr_enabled);
+        assert!(cfg.enabled, "aws must be enabled when ecr is enabled");
+    }
+
+    // ── New: Secrets Manager ──────────────────────────────────────────────────
+
+    #[test]
+    fn secretsmanager_arns_parsed() {
+        let c = ctx(&[(
+            "secretsmanager.deckwatch.io/secret-arns",
+            "arn:aws:secretsmanager:us-east-1:123:secret:a,arn:aws:secretsmanager:us-east-1:123:secret:b",
+        )]);
+        let cfg = AwsConfig::from_context(&c);
+        let sm = cfg.secretsmanager.unwrap();
+        assert_eq!(sm.secret_arns.len(), 2);
+        assert!(!sm.create_secret);
+    }
+
+    #[test]
+    fn secretsmanager_create_sets_sm_secret_name_env() {
+        let result = apply_inner(
+            &ctx(&[
+                ("secretsmanager.deckwatch.io/enabled", "true"),
+                ("secretsmanager.deckwatch.io/secret-name", "my-secret"),
+            ]),
+            "",
+        );
+        assert_eq!(find_env(&result, "SM_SECRET_NAME"), Some("my-secret"));
+    }
+
+    #[test]
+    fn secretsmanager_resource_has_required_fields() {
+        let r = secretsmanager_resource();
+        assert_eq!(r.id, "secretsmanager");
+        assert!(r.singleton);
+        assert!(r.output_keys.iter().any(|k| k == "SM_SECRET_ARN"));
     }
 }
