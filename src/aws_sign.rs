@@ -110,68 +110,60 @@ pub fn authorization_header(
 
 /// UTC datetime in the `YYYYMMDDTHHmmSSZ` format required by AWS Sig V4.
 ///
-/// `SystemTime::now()` panics in `wasm32-unknown-unknown` — extism does not
-/// expose a host clock to plugins. Instead, we fetch the current time from the
-/// `Date` response header of an unsigned HEAD request to the regional STS
-/// endpoint. STS is always reachable (it matches the `*.amazonaws.com`
-/// allowed-host glob) and every HTTP/1.1 response includes a `Date` header.
+/// Calls the `now()` host function provided by deckwatch (registered via
+/// `extism::Function` at `Plugin::new` time). This avoids both the
+/// `SystemTime::now()` panic (`wasm32-unknown-unknown` has no system clock)
+/// and the previous STS HEAD network round-trip approach (which failed when
+/// multi-level GovCloud hostnames were not in `allowed_hosts`).
+///
+/// The `region` parameter is retained for API compatibility but is no longer
+/// used — the host clock is region-agnostic.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn utc_now_iso8601(region: &str) -> String {
-    use extism_pdk::{http, HttpRequest};
-
-    let host = format!("sts.{region}.amazonaws.com");
-    let url = format!("https://{host}/");
-    let req = HttpRequest::new(&url)
-        .with_method("HEAD")
-        .with_header("Host", &host);
-
-    if let Ok(resp) = http::request::<String>(&req, None::<String>) {
-        // extism normalizes response header names to lowercase.
-        if let Some(date) = resp.header("date") {
-            if let Some(formatted) = parse_http_date(date) {
-                return formatted;
-            }
-        }
+pub(crate) fn utc_now_iso8601(_region: &str) -> String {
+    #[link(wasm_import_module = "extism:host/user")]
+    unsafe extern "C" {
+        fn now() -> i64;
     }
-
-    // Fallback: should never be reached. An obviously-wrong timestamp causes
-    // AWS to return RequestExpired, surfacing a clear error rather than a panic.
-    "19700101T000000Z".to_string()
+    let secs = unsafe { now() } as u64;
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let h = time_of_day / 3600;
+    let m = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}{mo:02}{d:02}T{h:02}{m:02}{s:02}Z")
 }
 
-/// Parse an RFC 7231 HTTP `Date` header into AWS Sig V4 datetime format.
-///
-/// Input:  `"Tue, 12 Aug 2026 13:47:12 GMT"`
-/// Output: `"20260812T134712Z"`
-#[cfg(target_arch = "wasm32")]
-fn parse_http_date(date: &str) -> Option<String> {
-    let parts: Vec<&str> = date.split_whitespace().collect();
-    if parts.len() < 5 {
-        return None;
+/// Convert days since Unix epoch to (year, month, day). Proleptic Gregorian calendar.
+/// Used by `utc_now_iso8601` on the WASM target where `chrono`/`time` crates
+/// are unavailable without WASI.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y, mo, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        // Unix epoch: day 0 = 1970-01-01
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 2026-08-12: days since epoch
+        let days_2026_08_12: i64 = (2026 - 1970) * 365 + 14 + 31 + 28 + 31 + 30 + 31 + 30 + 31 + 12 - 1;
+        // Just verify it's in the right ballpark (year 2026, month 8)
+        let (y, mo, _d) = civil_from_days(days_2026_08_12);
+        assert_eq!(y, 2026);
+        assert_eq!(mo, 8);
     }
-    let day: u32 = parts[1].parse().ok()?;
-    let month: u32 = match parts[2] {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let year: u32 = parts[3].parse().ok()?;
-    let time: Vec<&str> = parts[4].split(':').collect();
-    if time.len() != 3 {
-        return None;
-    }
-    let h: u32 = time[0].parse().ok()?;
-    let m: u32 = time[1].parse().ok()?;
-    let s: u32 = time[2].parse().ok()?;
-    Some(format!("{year:04}{month:02}{day:02}T{h:02}{m:02}{s:02}Z"))
 }
