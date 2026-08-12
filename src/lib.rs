@@ -545,6 +545,7 @@ fn apply_with_aws(
 #[cfg(target_arch = "wasm32")]
 #[plugin_fn]
 pub fn metadata() -> FnResult<Json<PluginMetadata>> {
+    use deckwatch_plugin_sdk::{ConfigField, ConfigFieldType};
     Ok(Json(PluginMetadata {
         name: "aws".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -558,6 +559,78 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
         ],
         depends_on: vec![],
         optional_depends_on: vec![],
+        config_schema: vec![
+            ConfigField {
+                key: "AWS_REGION".into(),
+                label: "AWS Region".into(),
+                description: "Region for provisioned resources (e.g. us-gov-west-1). Typically inherited from the pod environment via inherit_env_keys.".into(),
+                field_type: ConfigFieldType::String,
+                default: Some("us-east-1".into()),
+                required: true,
+                options: vec![],
+                env_source: Some("AWS_REGION".into()),
+            },
+            ConfigField {
+                key: "IAM_ENDPOINT".into(),
+                label: "IAM Endpoint".into(),
+                description: "Override the IAM API hostname. Defaults to partition-aware auto-detection (iam.us-gov.amazonaws.com for GovCloud, iam.amazonaws.com otherwise).".into(),
+                field_type: ConfigFieldType::String,
+                default: None,
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
+            ConfigField {
+                key: "IAM_SIGNING_REGION".into(),
+                label: "IAM Signing Region".into(),
+                description: "Override the Sig V4 signing region for IAM calls. Defaults to us-gov-west-1 for GovCloud, us-east-1 otherwise.".into(),
+                field_type: ConfigFieldType::String,
+                default: None,
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
+            ConfigField {
+                key: "ROLE_PATH".into(),
+                label: "IAM Role Path".into(),
+                description: "IAM path prefix for created roles. Must start and end with /. Must match your IAM policy resource constraint.".into(),
+                field_type: ConfigFieldType::String,
+                default: Some("/deckwatch-plugin/".into()),
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
+            ConfigField {
+                key: "BUCKET_PREFIX".into(),
+                label: "S3 Bucket Prefix".into(),
+                description: "Prepended to all S3 bucket names (e.g. myorg-). Keeps bucket names globally unique across environments.".into(),
+                field_type: ConfigFieldType::String,
+                default: Some("".into()),
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
+            ConfigField {
+                key: "AWS_ACCESS_KEY_ID".into(),
+                label: "Access Key ID".into(),
+                description: "Static AWS access key. Leave blank when using IRSA (inherit_env_keys).".into(),
+                field_type: ConfigFieldType::Secret,
+                default: None,
+                required: false,
+                options: vec![],
+                env_source: Some("AWS_ACCESS_KEY_ID".into()),
+            },
+            ConfigField {
+                key: "AWS_SECRET_ACCESS_KEY".into(),
+                label: "Secret Access Key".into(),
+                description: "Static AWS secret key. Leave blank when using IRSA (inherit_env_keys).".into(),
+                field_type: ConfigFieldType::Secret,
+                default: None,
+                required: false,
+                options: vec![],
+                env_source: Some("AWS_SECRET_ACCESS_KEY".into()),
+            },
+        ],
     }))
 }
 
