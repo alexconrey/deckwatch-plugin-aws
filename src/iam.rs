@@ -1,8 +1,12 @@
 //! IAM role management via the AWS IAM Query API.
 //!
-//! IAM is a global service with a single endpoint (`iam.amazonaws.com`). Its
-//! query API uses the same POST form-encoded body pattern as RDS; the Sig V4
-//! region is always `"us-east-1"` regardless of where the workload runs.
+//! IAM endpoint and Sig V4 signing region are partition-aware:
+//! - Commercial:  `iam.amazonaws.com`,     signing region `us-east-1`
+//! - GovCloud:    `iam.us-gov.amazonaws.com`, signing region `us-gov-west-1`
+//!
+//! GovCloud credentials are rejected by the commercial endpoint with
+//! `InvalidClientTokenId`, so the partition must be derived from the
+//! workload region before making any IAM call.
 //!
 //! ## Trust policy
 //!
@@ -25,9 +29,14 @@ use extism_pdk::*;
 
 use crate::{aws_sign, AwsCredentials};
 
-// IAM is a global service — always use us-east-1 for Sig V4.
-const IAM_REGION: &str = "us-east-1";
-const IAM_HOST: &str = "iam.amazonaws.com";
+/// Returns `(iam_host, iam_signing_region)` for the given workload region.
+fn iam_endpoint(region: &str) -> (&'static str, &'static str) {
+    if region.starts_with("us-gov-") {
+        ("iam.us-gov.amazonaws.com", "us-gov-west-1")
+    } else {
+        ("iam.amazonaws.com", "us-east-1")
+    }
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -125,15 +134,16 @@ fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<String>, S
 }
 
 fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
+    let (iam_host, iam_region) = iam_endpoint(&creds.region);
     let datetime = aws_sign::utc_now_iso8601(&creds.region);
     let auth = aws_sign::authorization_header(
         "POST",
-        IAM_HOST,
+        iam_host,
         "/",
         "",
         body,
         &datetime,
-        IAM_REGION,
+        iam_region,
         "iam",
         &creds.access_key,
         &creds.secret_key,
@@ -141,11 +151,11 @@ fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
         Some("application/x-www-form-urlencoded"),
     );
 
-    let url = format!("https://{IAM_HOST}/");
+    let url = format!("https://{iam_host}/");
     let mut req = HttpRequest::new(&url)
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")
-        .with_header("Host", IAM_HOST)
+        .with_header("Host", iam_host)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 
