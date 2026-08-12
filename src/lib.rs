@@ -25,7 +25,7 @@ mod s3;
 mod sts;
 
 #[cfg(target_arch = "wasm32")]
-use deckwatch_plugin_sdk::PluginMetadata;
+use deckwatch_plugin_sdk::{ConfigField, ConfigFieldType, PluginMetadata, PluginResource, ResourceProvisionRequest, ResourceProvisionResult};
 use deckwatch_plugin_sdk::{EnvVarSpec, PluginContext, PluginResult};
 #[cfg(target_arch = "wasm32")]
 use extism_pdk::*;
@@ -442,18 +442,16 @@ fn apply_with_aws(
         return PluginResult::default();
     }
 
-    let mut errors: Vec<String> = Vec::new();
-
     // ── 1. Ensure IAM role ────────────────────────────────────────────────────
     let role_arn = match iam::ensure_role(&cfg.role_name, creds) {
         Ok(arn) => arn,
         Err(e) => {
-            errors.push(format!("ensure_role failed: {e}"));
-            // Fall back to static result, but surface the error via result.errors
-            // so deckwatch can log it — extism log!() is unreachable from the host.
-            let mut result = apply_inner(ctx, bucket_prefix);
-            result.errors = errors;
-            return result;
+            log!(
+                LogLevel::Error,
+                "deckwatch-plugin-aws: ensure_role failed: {e}"
+            );
+            // Fall back to static result so the deployment isn't blocked.
+            return apply_inner(ctx, bucket_prefix);
         }
     };
 
@@ -467,7 +465,10 @@ fn apply_with_aws(
                     &creds.region,
                     creds,
                 ) {
-                    errors.push(format!("attach_rds_policy: {e}"));
+                    log!(
+                        LogLevel::Warn,
+                        "deckwatch-plugin-aws: attach_rds_policy: {e}"
+                    );
                 }
                 if let Some(ref schedule) = rds_cfg.snapshot_schedule {
                     if let Err(e) = backup::configure_backup(
@@ -478,13 +479,19 @@ fn apply_with_aws(
                         &rds_cfg.backup_role_arn,
                         creds,
                     ) {
-                        errors.push(format!("configure_backup: {e}"));
+                        log!(
+                            LogLevel::Warn,
+                            "deckwatch-plugin-aws: configure_backup: {e}"
+                        );
                     }
                 }
                 endpoint
             }
             Err(e) => {
-                errors.push(format!("ensure_instance: {e}"));
+                log!(
+                    LogLevel::Error,
+                    "deckwatch-plugin-aws: ensure_instance: {e}"
+                );
                 String::new()
             }
         }
@@ -498,11 +505,14 @@ fn apply_with_aws(
         match s3::ensure_bucket(s3_cfg, &full_bucket, creds) {
             Ok(()) => {
                 if let Err(e) = iam::attach_s3_policy(&cfg.role_name, &full_bucket, creds) {
-                    errors.push(format!("attach_s3_policy: {e}"));
+                    log!(
+                        LogLevel::Warn,
+                        "deckwatch-plugin-aws: attach_s3_policy: {e}"
+                    );
                 }
             }
             Err(e) => {
-                errors.push(format!("ensure_bucket: {e}"));
+                log!(LogLevel::Error, "deckwatch-plugin-aws: ensure_bucket: {e}");
             }
         }
         full_bucket
@@ -534,7 +544,6 @@ fn apply_with_aws(
         result.outputs.insert("s3_bucket".into(), s3_bucket);
     }
 
-    result.errors = errors;
     result
 }
 
@@ -545,7 +554,6 @@ fn apply_with_aws(
 #[cfg(target_arch = "wasm32")]
 #[plugin_fn]
 pub fn metadata() -> FnResult<Json<PluginMetadata>> {
-    use deckwatch_plugin_sdk::{ConfigField, ConfigFieldType};
     Ok(Json(PluginMetadata {
         name: "aws".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -559,31 +567,26 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
         ],
         depends_on: vec![],
         optional_depends_on: vec![],
-        config_schema: vec![
+        config_schema: vec![],
+        resources: vec![rds_resource(), s3_resource()],
+    }))
+}
+
+// ── Resource declarations ─────────────────────────────────────────────────────
+
+#[cfg(target_arch = "wasm32")]
+fn rds_resource() -> PluginResource {
+    PluginResource {
+        id: "rds".into(),
+        label: "RDS Database".into(),
+        icon: "mdi-database".into(),
+        description: "Provision an Amazon RDS instance for this application.".into(),
+        singleton: true,
+        fields: vec![
             ConfigField {
-                key: "AWS_REGION".into(),
-                label: "AWS Region".into(),
-                description: "Region for provisioned resources (e.g. us-gov-west-1). Typically inherited from the pod environment via inherit_env_keys.".into(),
-                field_type: ConfigFieldType::String,
-                default: Some("us-east-1".into()),
-                required: true,
-                options: vec![],
-                env_source: Some("AWS_REGION".into()),
-            },
-            ConfigField {
-                key: "IAM_ENDPOINT".into(),
-                label: "IAM Endpoint".into(),
-                description: "Override the IAM API hostname. Defaults to partition-aware auto-detection (iam.us-gov.amazonaws.com for GovCloud, iam.amazonaws.com otherwise).".into(),
-                field_type: ConfigFieldType::String,
-                default: None,
-                required: false,
-                options: vec![],
-                env_source: None,
-            },
-            ConfigField {
-                key: "IAM_SIGNING_REGION".into(),
-                label: "IAM Signing Region".into(),
-                description: "Override the Sig V4 signing region for IAM calls. Defaults to us-gov-west-1 for GovCloud, us-east-1 otherwise.".into(),
+                key: "identifier".into(),
+                label: "DB Identifier".into(),
+                description: "RDS instance identifier (default: {namespace}-{app_name}-db)".into(),
                 field_type: ConfigFieldType::String,
                 default: None,
                 required: false,
@@ -591,47 +594,204 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
                 env_source: None,
             },
             ConfigField {
-                key: "ROLE_PATH".into(),
-                label: "IAM Role Path".into(),
-                description: "IAM path prefix for created roles. Must start and end with /. Must match your IAM policy resource constraint.".into(),
+                key: "engine".into(),
+                label: "Engine".into(),
+                description: "Database engine: postgres or mysql".into(),
+                field_type: ConfigFieldType::Select,
+                default: Some("postgres".into()),
+                required: false,
+                options: vec!["postgres".into(), "mysql".into()],
+                env_source: None,
+            },
+            ConfigField {
+                key: "instance_class".into(),
+                label: "Instance Class".into(),
+                description: "RDS instance class".into(),
                 field_type: ConfigFieldType::String,
-                default: Some("/deckwatch-plugin/".into()),
+                default: Some("db.t3.micro".into()),
                 required: false,
                 options: vec![],
                 env_source: None,
             },
             ConfigField {
-                key: "BUCKET_PREFIX".into(),
-                label: "S3 Bucket Prefix".into(),
-                description: "Prepended to all S3 bucket names (e.g. myorg-). Keeps bucket names globally unique across environments.".into(),
+                key: "db_name".into(),
+                label: "Database Name".into(),
+                description: "Name for the initial database".into(),
                 field_type: ConfigFieldType::String,
-                default: Some("".into()),
+                default: Some("app".into()),
                 required: false,
                 options: vec![],
                 env_source: None,
-            },
-            ConfigField {
-                key: "AWS_ACCESS_KEY_ID".into(),
-                label: "Access Key ID".into(),
-                description: "Static AWS access key. Leave blank when using IRSA (inherit_env_keys).".into(),
-                field_type: ConfigFieldType::Secret,
-                default: None,
-                required: false,
-                options: vec![],
-                env_source: Some("AWS_ACCESS_KEY_ID".into()),
-            },
-            ConfigField {
-                key: "AWS_SECRET_ACCESS_KEY".into(),
-                label: "Secret Access Key".into(),
-                description: "Static AWS secret key. Leave blank when using IRSA (inherit_env_keys).".into(),
-                field_type: ConfigFieldType::Secret,
-                default: None,
-                required: false,
-                options: vec![],
-                env_source: Some("AWS_SECRET_ACCESS_KEY".into()),
             },
         ],
-    }))
+        output_keys: vec![
+            "DB_HOST".into(),
+            "DB_PORT".into(),
+            "DB_ENGINE".into(),
+            "DB_NAME".into(),
+        ],
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn s3_resource() -> PluginResource {
+    PluginResource {
+        id: "s3".into(),
+        label: "S3 Bucket".into(),
+        icon: "mdi-bucket".into(),
+        description: "Provision an Amazon S3 bucket for this application.".into(),
+        singleton: true,
+        fields: vec![
+            ConfigField {
+                key: "bucket_name".into(),
+                label: "Bucket Name".into(),
+                description: "S3 bucket name (a prefix will be applied automatically)".into(),
+                field_type: ConfigFieldType::String,
+                default: None,
+                required: true,
+                options: vec![],
+                env_source: None,
+            },
+            ConfigField {
+                key: "region".into(),
+                label: "Region".into(),
+                description: "AWS region for the bucket (defaults to credentials region)".into(),
+                field_type: ConfigFieldType::String,
+                default: None,
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
+        ],
+        output_keys: vec![
+            "S3_BUCKET".into(),
+            "S3_REGION".into(),
+            "AWS_REGION".into(),
+        ],
+    }
+}
+
+// ── WASM entry point: provision ───────────────────────────────────────────────
+
+/// Provision a single infrastructure resource on behalf of an application.
+///
+/// Called by deckwatch when an operator submits the provisioning form for a
+/// resource declared in [`metadata`]. The result's `state` map is persisted at
+/// application level and injected as env vars into all deployments on the next
+/// reconcile cycle.
+#[cfg(target_arch = "wasm32")]
+#[plugin_fn]
+pub fn provision(Json(req): Json<ResourceProvisionRequest>) -> FnResult<Json<ResourceProvisionResult>> {
+    let mut result = ResourceProvisionResult::default();
+
+    let creds = match AwsCredentials::from_config() {
+        Ok(c) => c,
+        Err(e) => {
+            result.errors.push(format!("credentials error: {e}"));
+            return Ok(Json(result));
+        }
+    };
+
+    match req.resource_id.as_str() {
+        "rds" => {
+            let identifier = req
+                .fields
+                .get("identifier")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    default_rds_identifier(&req.namespace, &req.application_name)
+                });
+            let engine = req
+                .fields
+                .get("engine")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "postgres".to_string());
+            let instance_class = req
+                .fields
+                .get("instance_class")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "db.t3.micro".to_string());
+            let db_name = req
+                .fields
+                .get("db_name")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "app".to_string());
+
+            let cfg = RdsConfig {
+                identifier,
+                engine: engine.clone(),
+                instance_class,
+                allocated_storage: "20".to_string(),
+                db_name: db_name.clone(),
+                multi_az: false,
+                subnet_group: None,
+                security_groups: vec![],
+                iam_auth: false,
+                snapshot_schedule: None,
+                snapshot_retention: 7,
+                backup_role_arn: String::new(),
+                region: creds.region.clone(),
+            };
+
+            match rds::ensure_instance(&cfg, &creds) {
+                Ok(endpoint) => {
+                    let port = engine_port(&engine).to_string();
+                    result.state.insert("DB_HOST".into(), endpoint);
+                    result.state.insert("DB_PORT".into(), port);
+                    result.state.insert("DB_ENGINE".into(), engine);
+                    result.state.insert("DB_NAME".into(), db_name);
+                }
+                Err(e) => {
+                    result.errors.push(format!("RDS provisioning error: {e}"));
+                }
+            }
+        }
+        "s3" => {
+            let bucket_name = req.fields.get("bucket_name").cloned().unwrap_or_default();
+            let region = req
+                .fields
+                .get("region")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| creds.region.clone());
+
+            let bucket_prefix = config::get("BUCKET_PREFIX")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let full_bucket = format!("{}{}", bucket_prefix, bucket_name);
+
+            let cfg = S3Config {
+                bucket_name: bucket_name.clone(),
+                region: region.clone(),
+                versioning: false,
+                public_access_block: true,
+                lifecycle_days: None,
+            };
+
+            match s3::ensure_bucket(&cfg, &full_bucket, &creds) {
+                Ok(()) => {
+                    result.state.insert("S3_BUCKET".into(), full_bucket);
+                    result.state.insert("S3_REGION".into(), region.clone());
+                    result.state.insert("AWS_REGION".into(), region);
+                }
+                Err(e) => {
+                    result.errors.push(format!("S3 provisioning error: {e}"));
+                }
+            }
+        }
+        other => {
+            result
+                .errors
+                .push(format!("unknown resource_id: {other}"));
+        }
+    }
+
+    Ok(Json(result))
 }
 
 /// Provision AWS resources and return env vars / Kubernetes resources for the
@@ -642,9 +802,11 @@ pub fn apply(Json(ctx): Json<PluginContext>) -> FnResult<Json<PluginResult>> {
     let creds = match AwsCredentials::from_config() {
         Ok(c) => c,
         Err(e) => {
-            let mut result = apply_inner(&ctx, "");
-            result.errors.push(format!("credentials error: {e}"));
-            return Ok(Json(result));
+            log!(
+                LogLevel::Error,
+                "deckwatch-plugin-aws: credentials error: {e}"
+            );
+            return Ok(Json(apply_inner(&ctx, "")));
         }
     };
 
