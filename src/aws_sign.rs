@@ -19,7 +19,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn sha256_hex(data: &str) -> String {
+pub(crate) fn sha256_hex(data: &str) -> String {
     hex(&Sha256::digest(data.as_bytes()))
 }
 
@@ -69,7 +69,7 @@ pub fn authorization_header(
     // ── Canonical request ─────────────────────────────────────────────────────
     let payload_hash = sha256_hex(body);
 
-    let mut signed_headers_list = vec!["host", "x-amz-date"];
+    let mut signed_headers_list = vec!["host", "x-amz-content-sha256", "x-amz-date"];
     if content_type.is_some() {
         signed_headers_list.push("content-type");
     }
@@ -83,7 +83,9 @@ pub fn authorization_header(
     if let Some(ct) = content_type {
         canonical_headers.push_str(&format!("content-type:{ct}\n"));
     }
-    canonical_headers.push_str(&format!("host:{host}\nx-amz-date:{datetime}\n"));
+    canonical_headers.push_str(&format!(
+        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{datetime}\n"
+    ));
     if let Some(tok) = session_token {
         canonical_headers.push_str(&format!("x-amz-security-token:{tok}\n"));
     }

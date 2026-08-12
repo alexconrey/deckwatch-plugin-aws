@@ -90,10 +90,12 @@ fn head_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<boo
         None,
     );
 
+    let payload_hash = aws_sign::sha256_hex("");
     let url = format!("https://{host}{path}");
     let mut req = HttpRequest::new(&url)
         .with_method("HEAD")
         .with_header("Host", &host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 
@@ -144,10 +146,12 @@ fn create_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(
         content_type,
     );
 
+    let payload_hash = aws_sign::sha256_hex(&body);
     let url = format!("https://{host}{path}");
     let mut req = HttpRequest::new(&url)
         .with_method("PUT")
         .with_header("Host", &host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 
@@ -245,11 +249,13 @@ fn s3_put(
         Some("application/xml"),
     );
 
+    let payload_hash = aws_sign::sha256_hex(body);
     let url = format!("https://{host}{path}?{sub_resource}");
     let mut req = HttpRequest::new(&url)
         .with_method("PUT")
         .with_header("Content-Type", "application/xml")
         .with_header("Host", &host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 

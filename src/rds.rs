@@ -142,11 +142,13 @@ fn rds_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
         Some("application/x-www-form-urlencoded"),
     );
 
+    let payload_hash = aws_sign::sha256_hex(body);
     let url = format!("https://{host}/");
     let mut req = HttpRequest::new(&url)
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")
         .with_header("Host", &host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 
