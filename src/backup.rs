@@ -89,7 +89,7 @@ fn backup_post(
     creds: &AwsCredentials,
 ) -> Result<String, String> {
     let host = format!("backup.{region}.amazonaws.com");
-    let datetime = aws_sign::utc_now_iso8601();
+    let datetime = aws_sign::utc_now_iso8601(region);
 
     let auth = aws_sign::authorization_header(
         "POST",

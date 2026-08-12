@@ -73,7 +73,7 @@ pub fn ensure_bucket(
 fn head_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<bool, String> {
     let host = format!("s3.{region}.amazonaws.com");
     let path = format!("/{bucket}");
-    let datetime = aws_sign::utc_now_iso8601();
+    let datetime = aws_sign::utc_now_iso8601(region);
 
     let auth = aws_sign::authorization_header(
         "HEAD",
@@ -118,7 +118,7 @@ fn head_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<boo
 fn create_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(), String> {
     let host = format!("s3.{region}.amazonaws.com");
     let path = format!("/{bucket}");
-    let datetime = aws_sign::utc_now_iso8601();
+    let datetime = aws_sign::utc_now_iso8601(region);
 
     let (body, content_type) = if region == "us-east-1" {
         (String::new(), None)
@@ -228,7 +228,7 @@ fn s3_put(
 ) -> Result<(), String> {
     let host = format!("s3.{region}.amazonaws.com");
     let path = format!("/{bucket}");
-    let datetime = aws_sign::utc_now_iso8601();
+    let datetime = aws_sign::utc_now_iso8601(region);
 
     let auth = aws_sign::authorization_header(
         "PUT",

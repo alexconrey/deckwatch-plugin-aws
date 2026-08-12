@@ -115,7 +115,7 @@ fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<String>, S
 }
 
 fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
-    let datetime = aws_sign::utc_now_iso8601();
+    let datetime = aws_sign::utc_now_iso8601(&creds.region);
     let auth = aws_sign::authorization_header(
         "POST",
         IAM_HOST,
