@@ -751,10 +751,19 @@ pub fn provision(
             match rds::ensure_instance(&cfg, &creds) {
                 Ok(endpoint) => {
                     let port = engine_port(&engine).to_string();
-                    result.state.insert("DB_HOST".into(), endpoint);
-                    result.state.insert("DB_PORT".into(), port);
-                    result.state.insert("DB_ENGINE".into(), engine);
-                    result.state.insert("DB_NAME".into(), db_name);
+                    result.state.insert("DB_HOST".into(), endpoint.clone());
+                    result.state.insert("DB_PORT".into(), port.clone());
+                    result.state.insert("DB_ENGINE".into(), engine.clone());
+                    result.state.insert("DB_NAME".into(), db_name.clone());
+                    result
+                        .deployment_annotations
+                        .insert("deckwatch.io/aws-rds-endpoint".into(), endpoint);
+                    result
+                        .deployment_annotations
+                        .insert("deckwatch.io/aws-rds-engine".into(), engine);
+                    result
+                        .deployment_annotations
+                        .insert("deckwatch.io/aws-rds-db-name".into(), db_name);
                 }
                 Err(e) => {
                     result.errors.push(format!("RDS provisioning error: {e}"));
@@ -786,9 +795,17 @@ pub fn provision(
 
             match s3::ensure_bucket(&cfg, &full_bucket, &creds) {
                 Ok(()) => {
-                    result.state.insert("S3_BUCKET".into(), full_bucket);
+                    result.state.insert("S3_BUCKET".into(), full_bucket.clone());
                     result.state.insert("S3_REGION".into(), region.clone());
-                    result.state.insert("AWS_REGION".into(), region);
+                    result.state.insert("AWS_REGION".into(), region.clone());
+                    // Stamp the bucket name and region as deployment annotations
+                    // so they're visible via `kubectl get deployment -o yaml`.
+                    result
+                        .deployment_annotations
+                        .insert("deckwatch.io/aws-s3-bucket".into(), full_bucket);
+                    result
+                        .deployment_annotations
+                        .insert("deckwatch.io/aws-s3-region".into(), region);
                 }
                 Err(e) => {
                     result.errors.push(format!("S3 provisioning error: {e}"));

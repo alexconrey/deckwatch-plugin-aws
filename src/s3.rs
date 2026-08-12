@@ -1,8 +1,9 @@
 //! S3 bucket provisioning via the AWS S3 REST API.
 //!
-//! S3 uses a REST API (not the Query API). All bucket operations target the
-//! regional endpoint `s3.<region>.amazonaws.com` using path-style addressing.
-//! Responses are XML; requests with a body set `Content-Type: application/xml`.
+//! Uses virtual-hosted-style endpoints (`{bucket}.s3.{region}.amazonaws.com`)
+//! and includes `x-amz-content-sha256` in all signed requests — both required
+//! by S3 GovCloud. CreateBucket is called directly (idempotent for owned buckets)
+//! to avoid HeadBucket which fails via extism's HTTP sandbox.
 
 use extism_pdk::*;
 
@@ -11,113 +12,64 @@ use crate::{aws_sign, AwsCredentials, S3Config};
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Ensure the S3 bucket exists, creating and configuring it if it does not.
-///
-/// Configuration applied on creation: versioning, public-access-block, and
-/// lifecycle expiration. Existing buckets are left as-is to avoid overwriting
-/// operator customisations.
 pub fn ensure_bucket(
     cfg: &S3Config,
     full_bucket: &str,
     creds: &AwsCredentials,
 ) -> Result<(), String> {
-    match head_bucket(full_bucket, &cfg.region, creds)? {
-        true => {
+    // CreateBucket is idempotent for buckets we own — returns 200 if it
+    // already exists, which is simpler than HeadBucket + conditional create.
+    create_bucket(full_bucket, &cfg.region, creds).or_else(|e| {
+        if e.contains("BucketAlreadyOwnedByYou") || e.contains("BucketAlreadyExists") {
             log!(
                 LogLevel::Info,
                 "deckwatch-plugin-aws: S3 bucket {full_bucket} already exists"
             );
             Ok(())
+        } else {
+            Err(e)
         }
-        false => {
-            create_bucket(full_bucket, &cfg.region, creds)?;
+    })?;
+
+    log!(
+        LogLevel::Info,
+        "deckwatch-plugin-aws: S3 bucket {full_bucket} ready"
+    );
+
+    if cfg.versioning {
+        if let Err(e) = put_bucket_versioning(full_bucket, &cfg.region, creds) {
             log!(
-                LogLevel::Info,
-                "deckwatch-plugin-aws: S3 bucket {full_bucket} created"
+                LogLevel::Warn,
+                "deckwatch-plugin-aws: put_bucket_versioning: {e}"
             );
-
-            if cfg.versioning {
-                if let Err(e) = put_bucket_versioning(full_bucket, &cfg.region, creds) {
-                    log!(
-                        LogLevel::Warn,
-                        "deckwatch-plugin-aws: put_bucket_versioning: {e}"
-                    );
-                }
-            }
-
-            if cfg.public_access_block {
-                if let Err(e) = put_public_access_block(full_bucket, &cfg.region, creds) {
-                    log!(
-                        LogLevel::Warn,
-                        "deckwatch-plugin-aws: put_public_access_block: {e}"
-                    );
-                }
-            }
-
-            if let Some(days) = cfg.lifecycle_days {
-                if let Err(e) = put_bucket_lifecycle(full_bucket, &cfg.region, days, creds) {
-                    log!(
-                        LogLevel::Warn,
-                        "deckwatch-plugin-aws: put_bucket_lifecycle: {e}"
-                    );
-                }
-            }
-
-            Ok(())
         }
     }
+    if cfg.public_access_block {
+        if let Err(e) = put_public_access_block(full_bucket, &cfg.region, creds) {
+            log!(
+                LogLevel::Warn,
+                "deckwatch-plugin-aws: put_public_access_block: {e}"
+            );
+        }
+    }
+    if let Some(days) = cfg.lifecycle_days {
+        if let Err(e) = put_bucket_lifecycle(full_bucket, &cfg.region, days, creds) {
+            log!(
+                LogLevel::Warn,
+                "deckwatch-plugin-aws: put_bucket_lifecycle: {e}"
+            );
+        }
+    }
+    Ok(())
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Check whether a bucket exists. Returns `true` on 200/301/403, `false` on 404.
-fn head_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<bool, String> {
-    let host = format!("s3.{region}.amazonaws.com");
-    let path = format!("/{bucket}");
-    let datetime = aws_sign::utc_now_iso8601(region);
-
-    let auth = aws_sign::authorization_header(
-        "HEAD",
-        &host,
-        &path,
-        "",
-        "",
-        &datetime,
-        region,
-        "s3",
-        &creds.access_key,
-        &creds.secret_key,
-        creds.session_token.as_deref(),
-        None,
-    );
-
-    let url = format!("https://{host}{path}");
-    let mut req = HttpRequest::new(&url)
-        .with_method("HEAD")
-        .with_header("Host", &host)
-        .with_header("X-Amz-Date", &datetime)
-        .with_header("Authorization", &auth);
-
-    if let Some(ref tok) = creds.session_token {
-        req = req.with_header("X-Amz-Security-Token", tok);
-    }
-
-    let resp = http::request::<String>(&req, None::<String>)
-        .map_err(|e| format!("S3 HeadBucket HTTP error: {e}"))?;
-
-    match resp.status_code() {
-        // 200 — exists and owned; 301 — exists in another region; 403 — exists
-        // but access denied (bucket name is taken).
-        200 | 301 | 403 => Ok(true),
-        404 => Ok(false),
-        status => Err(format!("S3 HeadBucket unexpected status: {status}")),
-    }
-}
-
-/// Create the bucket. `us-east-1` buckets must not send a
-/// `CreateBucketConfiguration` body — all other regions require it.
+/// Create the bucket using virtual-hosted-style addressing.
+/// `us-east-1` must not send a `CreateBucketConfiguration` body.
 fn create_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(), String> {
-    let host = format!("s3.{region}.amazonaws.com");
-    let path = format!("/{bucket}");
+    let host = format!("{bucket}.s3.{region}.amazonaws.com");
+    let path = "/";
     let datetime = aws_sign::utc_now_iso8601(region);
 
     let (body, content_type) = if region == "us-east-1" {
@@ -129,10 +81,10 @@ fn create_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(
         (xml, Some("application/xml"))
     };
 
-    let auth = aws_sign::authorization_header(
+    let (auth, payload_hash) = aws_sign::authorization_header(
         "PUT",
         &host,
-        &path,
+        path,
         "",
         &body,
         &datetime,
@@ -148,6 +100,7 @@ fn create_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(
     let mut req = HttpRequest::new(&url)
         .with_method("PUT")
         .with_header("Host", &host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 
@@ -226,14 +179,14 @@ fn s3_put(
     creds: &AwsCredentials,
     op: &str,
 ) -> Result<(), String> {
-    let host = format!("s3.{region}.amazonaws.com");
-    let path = format!("/{bucket}");
+    let host = format!("{bucket}.s3.{region}.amazonaws.com");
+    let path = "/";
     let datetime = aws_sign::utc_now_iso8601(region);
 
-    let auth = aws_sign::authorization_header(
+    let (auth, payload_hash) = aws_sign::authorization_header(
         "PUT",
         &host,
-        &path,
+        path,
         sub_resource,
         body,
         &datetime,
@@ -250,6 +203,7 @@ fn s3_put(
         .with_method("PUT")
         .with_header("Content-Type", "application/xml")
         .with_header("Host", &host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 
