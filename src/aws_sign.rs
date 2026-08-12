@@ -160,7 +160,8 @@ mod tests {
         // Unix epoch: day 0 = 1970-01-01
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         // 2026-08-12: days since epoch
-        let days_2026_08_12: i64 = (2026 - 1970) * 365 + 14 + 31 + 28 + 31 + 30 + 31 + 30 + 31 + 12 - 1;
+        let days_2026_08_12: i64 =
+            (2026 - 1970) * 365 + 14 + 31 + 28 + 31 + 30 + 31 + 30 + 31 + 12 - 1;
         // Just verify it's in the right ballpark (year 2026, month 8)
         let (y, mo, _d) = civil_from_days(days_2026_08_12);
         assert_eq!(y, 2026);
