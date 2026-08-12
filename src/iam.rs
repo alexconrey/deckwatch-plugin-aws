@@ -47,11 +47,18 @@ pub fn ensure_role(role_name: &str, creds: &AwsCredentials) -> Result<String, St
     // Create with a broad EKS trust policy. Operators should narrow this.
     let trust = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"eks.amazonaws.com"},"Action":"sts:AssumeRoleWithWebIdentity"}]}"#;
 
-    // Path scopes the role under /deckwatch-plugin/ so the deckwatch IRSA
-    // policy (resource: role/deckwatch-plugin/*) can manage it without
-    // requiring broad iam:CreateRole on role/*.
+    // Path scopes the role so the deckwatch IRSA policy can manage it.
+    // Configurable via the ROLE_PATH plugin config key (default: /deckwatch-plugin/).
+    // Must start and end with '/'. Operators set this to match their IAM policy resource.
+    let role_path = config::get("ROLE_PATH")
+        .ok()
+        .flatten()
+        .filter(|p| p.starts_with('/') && p.ends_with('/'))
+        .unwrap_or_else(|| "/deckwatch-plugin/".to_string());
+
     let body = format!(
-        "Action=CreateRole&Version=2010-05-08&Path=%2Fdeckwatch-plugin%2F&RoleName={}&AssumeRolePolicyDocument={}",
+        "Action=CreateRole&Version=2010-05-08&Path={}&RoleName={}&AssumeRolePolicyDocument={}",
+        url_encode(&role_path),
         url_encode(role_name),
         url_encode(trust),
     );
