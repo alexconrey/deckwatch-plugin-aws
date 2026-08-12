@@ -24,12 +24,14 @@ mod s3;
 #[cfg(target_arch = "wasm32")]
 mod sts;
 
-#[cfg(target_arch = "wasm32")]
+// ConfigField, ConfigFieldType, and PluginResource are pure types — no WASM host
+// functions needed. Import unconditionally so resource helpers can be unit-tested
+// on the host target too.
 use deckwatch_plugin_sdk::{
-    ConfigField, ConfigFieldType, PluginMetadata, PluginResource, ResourceProvisionRequest,
-    ResourceProvisionResult,
+    ConfigField, ConfigFieldType, EnvVarSpec, PluginContext, PluginResource, PluginResult,
 };
-use deckwatch_plugin_sdk::{EnvVarSpec, PluginContext, PluginResult};
+#[cfg(target_arch = "wasm32")]
+use deckwatch_plugin_sdk::{PluginMetadata, ResourceProvisionRequest, ResourceProvisionResult};
 #[cfg(target_arch = "wasm32")]
 use extism_pdk::*;
 
@@ -570,15 +572,26 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
         ],
         depends_on: vec![],
         optional_depends_on: vec![],
-        config_schema: vec![],
+        config_schema: vec![
+            ConfigField { key: "AWS_REGION".into(), label: "AWS Region".into(), description: "Region for provisioned resources. Typically inherited from the pod environment via inherit_env_keys.".into(), field_type: ConfigFieldType::String, default: Some("us-east-1".into()), required: true, options: vec![], env_source: Some("AWS_REGION".into()) },
+            ConfigField { key: "IAM_ENDPOINT".into(), label: "IAM Endpoint".into(), description: "Override IAM hostname. Auto-detected from region (iam.us-gov.amazonaws.com for GovCloud).".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
+            ConfigField { key: "IAM_SIGNING_REGION".into(), label: "IAM Signing Region".into(), description: "Override Sig V4 region for IAM. Auto-detected from region.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
+            ConfigField { key: "ROLE_PATH".into(), label: "IAM Role Path".into(), description: "Path prefix for created roles. Must start and end with /. Must match your IAM policy resource.".into(), field_type: ConfigFieldType::String, default: Some("/deckwatch-plugin/".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "BUCKET_PREFIX".into(), label: "S3 Bucket Prefix".into(), description: "Prepended to all S3 bucket names (e.g. myorg-).".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "AWS_ACCESS_KEY_ID".into(), label: "Access Key ID".into(), description: "Static AWS access key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_ACCESS_KEY_ID".into()) },
+            ConfigField { key: "AWS_SECRET_ACCESS_KEY".into(), label: "Secret Access Key".into(), description: "Static AWS secret key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SECRET_ACCESS_KEY".into()) },
+        ],
         resources: vec![rds_resource(), s3_resource()],
     }))
 }
 
 // ── Resource declarations ─────────────────────────────────────────────────────
+// No #[cfg(target_arch = "wasm32")] — these are pure struct constructors that
+// must be testable on the host target to catch metadata() regressions.
+// `pub` so the host compiler doesn't flag them as dead code (they're used by
+// `metadata()` which is wasm32-only, and by host-side unit tests).
 
-#[cfg(target_arch = "wasm32")]
-fn rds_resource() -> PluginResource {
+pub fn rds_resource() -> PluginResource {
     PluginResource {
         id: "rds".into(),
         label: "RDS Database".into(),
@@ -636,8 +649,7 @@ fn rds_resource() -> PluginResource {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn s3_resource() -> PluginResource {
+pub fn s3_resource() -> PluginResource {
     PluginResource {
         id: "s3".into(),
         label: "S3 Bucket".into(),
@@ -1030,6 +1042,43 @@ mod tests {
         assert!(
             result.outputs.contains_key("role_arn"),
             "outputs must always contain 'role_arn'"
+        );
+    }
+
+    // 14. rds_resource() declares the expected fields — catches metadata() regressions.
+    #[test]
+    fn rds_resource_has_required_fields() {
+        let r = rds_resource();
+        assert_eq!(r.id, "rds");
+        assert!(r.singleton, "RDS must be singleton");
+        assert!(
+            !r.fields.is_empty(),
+            "RDS resource must declare form fields"
+        );
+        assert!(
+            !r.output_keys.is_empty(),
+            "RDS resource must declare output env var keys"
+        );
+        assert!(
+            r.output_keys.iter().any(|k| k == "DB_HOST"),
+            "DB_HOST must be in output_keys"
+        );
+    }
+
+    // 15. s3_resource() declares the expected fields.
+    #[test]
+    fn s3_resource_has_required_fields() {
+        let r = s3_resource();
+        assert_eq!(r.id, "s3");
+        assert!(r.singleton, "S3 must be singleton");
+        assert!(!r.fields.is_empty(), "S3 resource must declare form fields");
+        assert!(
+            !r.output_keys.is_empty(),
+            "S3 resource must declare output env var keys"
+        );
+        assert!(
+            r.output_keys.iter().any(|k| k == "S3_BUCKET"),
+            "S3_BUCKET must be in output_keys"
         );
     }
 }
