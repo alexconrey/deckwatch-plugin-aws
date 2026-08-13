@@ -461,15 +461,12 @@ pub fn apply_inner(ctx: &PluginContext, bucket_prefix: &str) -> PluginResult {
     }
 
     let mut result = PluginResult::default();
-    let sa = workload_sa_name(&ctx.deployment_name);
 
-    // ── ServiceAccount ────────────────────────────────────────────────────────
-    // The role ARN is unknown statically; the WASM path overwrites this SA with
-    // the real ARN after ensure_role() returns.
-    result
-        .kubernetes_resources
-        .push(service_account_yaml(&sa, "", &ctx.namespace));
-    result.service_account_name = Some(sa.clone());
+    // NOTE: service_account_name and the SA kubernetes_resource are intentionally
+    // NOT set here. apply_inner is the fallback used when ensure_role() fails.
+    // Setting the SA in the fallback would reference an SA that was never created,
+    // blocking pod scheduling. The WASM path (apply_with_aws) sets these only
+    // after the IAM role is confirmed to exist.
 
     // ── RDS env vars ──────────────────────────────────────────────────────────
     if let Some(ref rds) = cfg.rds {
@@ -524,8 +521,13 @@ pub fn apply_inner(ctx: &PluginContext, bucket_prefix: &str) -> PluginResult {
     }
 
     // ── Plugin outputs ────────────────────────────────────────────────────────
+    // role_arn and service_account_name are set by apply_with_aws after the
+    // IAM role is confirmed to exist. Placeholder empty values here allow
+    // downstream plugins to detect that this plugin ran.
     result.outputs.insert("role_arn".into(), String::new());
-    result.outputs.insert("service_account_name".into(), sa);
+    result
+        .outputs
+        .insert("service_account_name".into(), String::new());
 
     result
 }
@@ -1371,10 +1373,13 @@ mod tests {
             find_env(&result, "S3_BUCKET").is_none(),
             "no S3 env vars expected"
         );
-        assert!(result.service_account_name.is_some(), "SA must be created");
         assert!(
-            !result.kubernetes_resources.is_empty(),
-            "SA resource must be emitted"
+            result.service_account_name.is_none(),
+            "SA must NOT be set in apply_inner — only after successful IAM role creation"
+        );
+        assert!(
+            result.kubernetes_resources.is_empty(),
+            "SA resource not emitted in apply_inner — only after successful IAM"
         );
     }
 
@@ -1497,23 +1502,19 @@ mod tests {
         );
     }
 
-    // 11. When any AWS resource is enabled, a ServiceAccount is in kubernetes_resources.
+    // 11. apply_inner does NOT emit a ServiceAccount — that only happens after
+    //     ensure_role() succeeds in apply_with_aws. This prevents a pod from
+    //     referencing an SA that was never created when IAM calls fail.
     #[test]
-    fn service_account_in_kubernetes_resources() {
+    fn service_account_not_in_apply_inner() {
         let result = apply_inner(&ctx(&[("aws.deckwatch.io/enabled", "true")]), "");
         assert!(
-            !result.kubernetes_resources.is_empty(),
-            "kubernetes_resources must be non-empty"
-        );
-        let sa = &result.kubernetes_resources[0];
-        assert_eq!(
-            sa["kind"].as_str(),
-            Some("ServiceAccount"),
-            "first resource must be ServiceAccount"
+            result.kubernetes_resources.is_empty(),
+            "apply_inner must NOT emit SA kubernetes_resource — only apply_with_aws does after ensure_role succeeds"
         );
         assert!(
-            result.service_account_name.is_some(),
-            "service_account_name must be set"
+            result.service_account_name.is_none(),
+            "service_account_name must NOT be set in apply_inner"
         );
     }
 
@@ -1589,7 +1590,10 @@ mod tests {
             "",
         );
         assert_eq!(find_env(&result, "QUEUE_NAME"), Some("my-jobs"));
-        assert!(result.service_account_name.is_some());
+        assert!(
+            result.service_account_name.is_none(),
+            "SA not set in apply_inner"
+        );
     }
 
     #[test]
