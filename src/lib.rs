@@ -299,22 +299,44 @@ impl AwsConfig {
                 },
                 multi_az: ann_bool(ctx, "rds.deckwatch.io/multi-az", false),
                 subnet_group: {
-                    let raw = ann_str(ctx, "rds.deckwatch.io/subnet-group");
-                    if raw.is_empty() {
-                        None
+                    let ann_val = ann_str(ctx, "rds.deckwatch.io/subnet-group");
+                    if !ann_val.is_empty() {
+                        Some(ann_val)
                     } else {
-                        Some(raw)
+                        config::get("RDS_DEFAULT_SUBNET_GROUP")
+                            .ok()
+                            .flatten()
+                            .filter(|s| !s.is_empty())
                     }
                 },
                 security_groups: {
-                    let raw = ann_str(ctx, "rds.deckwatch.io/security-groups");
+                    let ann_val = ann_str(ctx, "rds.deckwatch.io/security-groups");
+                    let raw = if !ann_val.is_empty() {
+                        ann_val
+                    } else {
+                        config::get("RDS_DEFAULT_SECURITY_GROUPS")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default()
+                    };
                     if raw.is_empty() {
                         vec![]
                     } else {
                         raw.split(',').map(|s| s.trim().to_string()).collect()
                     }
                 },
-                iam_auth: ann_bool(ctx, "rds.deckwatch.io/iam-auth", false),
+                iam_auth: {
+                    let ann_val = ann(ctx, "rds.deckwatch.io/iam-auth");
+                    match ann_val {
+                        Some("true") | Some("yes") | Some("1") => true,
+                        Some("false") | Some("no") | Some("0") => false,
+                        _ => config::get("RDS_DEFAULT_IAM_AUTH")
+                            .ok()
+                            .flatten()
+                            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "yes" | "1"))
+                            .unwrap_or(true),
+                    }
+                },
                 snapshot_schedule: {
                     let raw = ann_str(ctx, "rds.deckwatch.io/snapshot-schedule");
                     if raw.is_empty() {
@@ -784,6 +806,9 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "AWS_SECRET_ACCESS_KEY".into(), label: "Secret Access Key".into(), description: "Static AWS secret key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SECRET_ACCESS_KEY".into()) },
             ConfigField { key: "AWS_SESSION_TOKEN".into(), label: "Session Token".into(), description: "Temporary session token for assumed-role or SSO credentials. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SESSION_TOKEN".into()) },
             ConfigField { key: "RDS_SKIP_FINAL_SNAPSHOT".into(), label: "Skip RDS Final Snapshot".into(), description: "Set to true to skip the final snapshot when deleting an RDS instance. Default: false (snapshot is always taken).".into(), field_type: ConfigFieldType::Bool, default: Some("false".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "RDS_DEFAULT_SUBNET_GROUP".into(), label: "RDS Default Subnet Group".into(), description: "DB subnet group name for all provisioned RDS instances. Required to place instances in the correct VPC.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
+            ConfigField { key: "RDS_DEFAULT_SECURITY_GROUPS".into(), label: "RDS Default Security Groups".into(), description: "Comma-separated VPC security group IDs applied to all provisioned RDS instances.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
+            ConfigField { key: "RDS_DEFAULT_IAM_AUTH".into(), label: "RDS IAM Auth by Default".into(), description: "Enable IAM database authentication on all provisioned RDS instances. Default: true.".into(), field_type: ConfigFieldType::Bool, default: Some("true".into()), required: false, options: vec![], env_source: None },
         ],
         resources: vec![rds_resource(), s3_resource(), sqs_resource(), secretsmanager_resource()],
     }))
@@ -1010,6 +1035,24 @@ pub fn provision(
                 .cloned()
                 .unwrap_or_else(|| "app".to_string());
 
+            let subnet_group = config::get("RDS_DEFAULT_SUBNET_GROUP")
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty());
+            let security_groups: Vec<String> = config::get("RDS_DEFAULT_SECURITY_GROUPS")
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let iam_auth = config::get("RDS_DEFAULT_IAM_AUTH")
+                .ok()
+                .flatten()
+                .map(|v| matches!(v.to_lowercase().as_str(), "true" | "yes" | "1"))
+                .unwrap_or(true);
+
             let cfg = RdsConfig {
                 identifier,
                 engine: engine.clone(),
@@ -1017,9 +1060,9 @@ pub fn provision(
                 allocated_storage: "20".to_string(),
                 db_name: db_name.clone(),
                 multi_az: false,
-                subnet_group: None,
-                security_groups: vec![],
-                iam_auth: false,
+                subnet_group,
+                security_groups,
+                iam_auth,
                 snapshot_schedule: None,
                 snapshot_retention: 7,
                 backup_role_arn: String::new(),

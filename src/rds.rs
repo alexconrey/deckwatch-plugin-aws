@@ -208,12 +208,23 @@ pub fn delete_instance(
     creds: &AwsCredentials,
 ) -> Result<(), String> {
     // 1. Disable deletion protection so the delete can proceed.
+    // If the instance is already gone, treat it as success (idempotent deprovision).
     let modify_body = format!(
         "Action=ModifyDBInstance&Version=2014-10-31&DBInstanceIdentifier={}&DeletionProtection=false&ApplyImmediately=true",
         url_encode(identifier)
     );
-    rds_query(&modify_body, creds)
-        .map_err(|e| format!("failed to disable deletion protection: {e}"))?;
+    match rds_query(&modify_body, creds) {
+        Ok(_) => {}
+        Err(e) if e.contains("DBInstanceNotFound") || e.contains("not found") => {
+            log!(
+                LogLevel::Info,
+                "deckwatch-plugin-aws: RDS instance {} already gone, deprovision complete",
+                identifier
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(format!("failed to disable deletion protection: {e}")),
+    }
 
     // 2. Delete the instance.
     let mut delete_body = format!(
