@@ -20,7 +20,12 @@ pub fn ensure_bucket(
     // CreateBucket is idempotent for buckets we own — returns 200 if it
     // already exists, which is simpler than HeadBucket + conditional create.
     create_bucket(full_bucket, &cfg.region, creds).or_else(|e| {
-        if e.contains("BucketAlreadyOwnedByYou") || e.contains("BucketAlreadyExists") {
+        // 409 BucketAlreadyOwnedByYou means we own the bucket — not an error.
+        // Error string format: "S3 CreateBucket error 409 [BucketAlreadyOwnedByYou]: ..."
+        if e.contains("BucketAlreadyOwnedByYou")
+            || e.contains("BucketAlreadyExists")
+            || e.contains("you already own it")
+        {
             log!(
                 LogLevel::Info,
                 "deckwatch-plugin-aws: S3 bucket {full_bucket} already exists"
@@ -117,8 +122,9 @@ fn create_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(
     let status = resp.status_code();
     if status >= 400 {
         let text = String::from_utf8_lossy(&resp.body()).to_string();
-        let msg = extract_tag(&text, "Message").unwrap_or(text);
-        return Err(format!("S3 CreateBucket error {status}: {msg}"));
+        let code = extract_tag(&text, "Code").unwrap_or_default();
+        let msg = extract_tag(&text, "Message").unwrap_or_else(|| text.clone());
+        return Err(format!("S3 CreateBucket error {status} [{code}]: {msg}"));
     }
 
     Ok(())
