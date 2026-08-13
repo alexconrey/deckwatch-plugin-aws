@@ -165,7 +165,7 @@ fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<String>, S
 fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
     let (iam_host, iam_region) = iam_endpoint(&creds.region);
     let datetime = aws_sign::utc_now_iso8601(&creds.region);
-    let auth = aws_sign::authorization_header(
+    let (auth, payload_hash) = aws_sign::authorization_header(
         "POST",
         &iam_host,
         "/",
@@ -185,6 +185,7 @@ fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")
         .with_header("Host", &iam_host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 

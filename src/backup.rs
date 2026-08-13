@@ -91,7 +91,7 @@ fn backup_post(
     let host = format!("backup.{region}.amazonaws.com");
     let datetime = aws_sign::utc_now_iso8601(region);
 
-    let auth = aws_sign::authorization_header(
+    let (auth, payload_hash) = aws_sign::authorization_header(
         "POST",
         &host,
         path,
@@ -111,6 +111,7 @@ fn backup_post(
         .with_method("POST")
         .with_header("Content-Type", "application/x-amz-json-1.1")
         .with_header("Host", &host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 
