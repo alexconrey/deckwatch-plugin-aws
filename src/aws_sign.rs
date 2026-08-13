@@ -36,6 +36,7 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8>
     hmac_sha256(&k_service, "aws4_request")
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Build the `Authorization` header value for an AWS Signature V4 request.
 ///
 /// - `method`        — HTTP method (e.g. `"PUT"`)
@@ -49,10 +50,10 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8>
 /// - `content_type` — `Some("application/xml")` or `Some("application/x-www-form-urlencoded")`
 ///   for requests with a body; `None` to omit the `Content-Type` header from
 ///   the signed headers (appropriate for HEAD requests).
-#[allow(clippy::too_many_arguments)]
-/// Returns `(authorization_header, payload_hash)`.
-/// `payload_hash` (hex SHA256 of `body`) must be sent as `X-Amz-Content-Sha256`
-/// — required by S3; other services (IAM, RDS) may omit it from the request.
+///
+/// Returns `(authorization_header, payload_hash)`. `payload_hash` (hex SHA256
+/// of `body`) must be sent as `X-Amz-Content-Sha256`; required by S3 —
+/// other services (IAM, RDS) may omit it from the request.
 pub fn authorization_header(
     method: &str,
     host: &str,
