@@ -54,7 +54,15 @@ fn describe_db_instance(
 ) -> Result<Option<DbInstanceInfo>, String> {
     let body =
         format!("Action=DescribeDBInstances&Version=2014-10-31&DBInstanceIdentifier={identifier}");
-    let xml = rds_query(&body, creds)?;
+    // DBInstanceNotFound is returned as a 404 error by rds_query — catch it here
+    // before propagating so ensure_instance knows to create the instance.
+    let xml = match rds_query(&body, creds) {
+        Ok(x) => x,
+        Err(e) if e.contains("DBInstanceNotFound") || e.contains("not found") => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
 
     if xml.contains("DBInstanceNotFound") {
         return Ok(None);
@@ -78,7 +86,7 @@ fn create_db_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<(), Str
         ("DBName", &cfg.db_name),
         ("MultiAZ", &multi_az),
         ("EnableIAMDatabaseAuthentication", &iam_auth),
-        ("MasterUsername", "admin"),
+        ("MasterUsername", "dbadmin"),
         // Delegate password management to AWS Secrets Manager so no plaintext
         // credential appears in the API call or plugin state.
         ("ManageMasterUserPassword", "true"),
@@ -147,6 +155,7 @@ fn rds_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")
         .with_header("Host", &host)
+                .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 

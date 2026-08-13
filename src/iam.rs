@@ -185,6 +185,7 @@ fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")
         .with_header("Host", &iam_host)
+                .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 
