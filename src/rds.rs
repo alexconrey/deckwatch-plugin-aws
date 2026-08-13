@@ -155,7 +155,7 @@ fn rds_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")
         .with_header("Host", &host)
-                .with_header("X-Amz-Content-Sha256", &payload_hash)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)
         .with_header("Authorization", &auth);
 
@@ -198,4 +198,39 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Delete the RDS instance, optionally taking a final snapshot first.
+/// Disables deletion protection before deleting (required if it was enabled).
+pub fn delete_instance(
+    identifier: &str,
+    skip_final_snapshot: bool,
+    creds: &AwsCredentials,
+) -> Result<(), String> {
+    // 1. Disable deletion protection so the delete can proceed.
+    let modify_body = format!(
+        "Action=ModifyDBInstance&Version=2014-10-31&DBInstanceIdentifier={}&DeletionProtection=false&ApplyImmediately=true",
+        url_encode(identifier)
+    );
+    rds_query(&modify_body, creds)
+        .map_err(|e| format!("failed to disable deletion protection: {e}"))?;
+
+    // 2. Delete the instance.
+    let mut delete_body = format!(
+        "Action=DeleteDBInstance&Version=2014-10-31&DBInstanceIdentifier={}",
+        url_encode(identifier)
+    );
+    if skip_final_snapshot {
+        delete_body.push_str("&SkipFinalSnapshot=true");
+    } else {
+        let snapshot_id = format!("{identifier}-final");
+        delete_body.push_str(&format!(
+            "&SkipFinalSnapshot=false&FinalDBSnapshotIdentifier={}",
+            url_encode(&snapshot_id)
+        ));
+    }
+
+    rds_query(&delete_body, creds).map_err(|e| format!("DeleteDBInstance failed: {e}"))?;
+
+    Ok(())
 }

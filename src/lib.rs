@@ -31,7 +31,10 @@ use deckwatch_plugin_sdk::{
     ConfigField, ConfigFieldType, EnvVarSpec, PluginContext, PluginResource, PluginResult,
 };
 #[cfg(target_arch = "wasm32")]
-use deckwatch_plugin_sdk::{PluginMetadata, ResourceProvisionRequest, ResourceProvisionResult};
+use deckwatch_plugin_sdk::{
+    PluginMetadata, ResourceDeprovisionRequest, ResourceDeprovisionResult,
+    ResourceProvisionRequest, ResourceProvisionResult,
+};
 #[cfg(target_arch = "wasm32")]
 use extism_pdk::*;
 
@@ -580,6 +583,7 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "BUCKET_PREFIX".into(), label: "S3 Bucket Prefix".into(), description: "Prepended to all S3 bucket names (e.g. myorg-).".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "AWS_ACCESS_KEY_ID".into(), label: "Access Key ID".into(), description: "Static AWS access key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_ACCESS_KEY_ID".into()) },
             ConfigField { key: "AWS_SECRET_ACCESS_KEY".into(), label: "Secret Access Key".into(), description: "Static AWS secret key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SECRET_ACCESS_KEY".into()) },
+            ConfigField { key: "RDS_SKIP_FINAL_SNAPSHOT".into(), label: "Skip RDS Final Snapshot".into(), description: "Set to true to skip the final snapshot when deleting an RDS instance. Default: false (snapshot is always taken).".into(), field_type: ConfigFieldType::Bool, default: Some("false".into()), required: false, options: vec![], env_source: None },
         ],
         resources: vec![rds_resource(), s3_resource()],
     }))
@@ -811,6 +815,92 @@ pub fn provision(
                     result.errors.push(format!("S3 provisioning error: {e}"));
                 }
             }
+        }
+        other => {
+            result.errors.push(format!("unknown resource_id: {other}"));
+        }
+    }
+
+    Ok(Json(result))
+}
+
+/// Clean up provisioned resources before deckwatch removes the DB record.
+///
+/// - **RDS**: disables deletion protection, optionally takes a final snapshot
+///   (default: yes), then deletes the instance. Set `RDS_SKIP_FINAL_SNAPSHOT=true`
+///   in plugin config to skip the snapshot.
+/// - **S3**: leaves the bucket intact — non-empty buckets cannot be deleted without
+///   enumerating and removing all objects. Deckwatch records are removed; the bucket
+///   remains in AWS and can be cleaned up manually or via a lifecycle rule.
+#[cfg(target_arch = "wasm32")]
+#[plugin_fn]
+pub fn deprovision(
+    Json(req): Json<ResourceDeprovisionRequest>,
+) -> FnResult<Json<ResourceDeprovisionResult>> {
+    let mut result = ResourceDeprovisionResult::default();
+
+    let creds = match AwsCredentials::from_config() {
+        Ok(c) => c,
+        Err(e) => {
+            result.errors.push(format!("credentials error: {e}"));
+            result.message = "Deprovisioning skipped — credentials unavailable.".into();
+            return Ok(Json(result));
+        }
+    };
+
+    let skip_snapshot = config::get("RDS_SKIP_FINAL_SNAPSHOT")
+        .ok()
+        .flatten()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    match req.resource_id.as_str() {
+        "rds" => {
+            // Derive the identifier — same logic as provision(): from state, then
+            // from fields, then fall back to the default naming convention.
+            let identifier = req
+                .state
+                .get("DB_IDENTIFIER")
+                .or_else(|| req.fields.get("identifier"))
+                .cloned()
+                .unwrap_or_else(|| format!("{}-{}-db", req.namespace, req.application_name));
+
+            let snapshot_msg = if skip_snapshot {
+                "no final snapshot (RDS_SKIP_FINAL_SNAPSHOT=true)".to_string()
+            } else {
+                format!("final snapshot: {identifier}-final")
+            };
+
+            match rds::delete_instance(&identifier, skip_snapshot, &creds) {
+                Ok(()) => {
+                    result.message =
+                        format!("RDS instance '{identifier}' deleted ({snapshot_msg}).");
+                }
+                Err(e) => {
+                    result.errors.push(format!("delete_instance failed: {e}"));
+                    result.message = format!(
+                        "RDS instance '{identifier}' could not be deleted — manual cleanup required."
+                    );
+                }
+            }
+        }
+        "s3" => {
+            // S3 buckets with objects cannot be deleted without listing and removing
+            // every object. We intentionally leave the bucket in place and tell the
+            // operator what to do.
+            let bucket = req
+                .state
+                .get("S3_BUCKET")
+                .or_else(|| req.fields.get("bucket_name"))
+                .cloned()
+                .unwrap_or_default();
+
+            result.message = format!(
+                "S3 bucket '{bucket}' was NOT deleted — non-empty buckets must be \
+                 emptied manually before deletion. Use the AWS console, CLI \
+                 (`aws s3 rm s3://{bucket} --recursive`), or configure a bucket \
+                 lifecycle rule to expire objects."
+            );
         }
         other => {
             result.errors.push(format!("unknown resource_id: {other}"));

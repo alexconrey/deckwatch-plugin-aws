@@ -10,7 +10,7 @@ license = "Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-deckwatch-plugin-sdk = { git = "https://github.com/alexconrey/deckwatch-plugin-sdk", tag = "v0.8.0" }
+deckwatch-plugin-sdk = { git = "https://github.com/alexconrey/deckwatch-plugin-sdk", tag = "v0.8.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # AWS Signature V4 signing — pure Rust, compiles to wasm32-unknown-unknown
