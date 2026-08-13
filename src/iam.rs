@@ -145,14 +145,30 @@ pub fn ensure_role(
 ///
 /// Using an inline (embedded) policy avoids the 10-managed-policy limit per role
 /// and keeps the policy lifecycle tied to the role.
+/// `rds_resource_id` is the `DbiResourceId` (e.g. `db-CO2YWIF6C7KV5K3DJQ4IEBP7II`),
+/// not the instance identifier. `db_user` is the PostgreSQL username that has
+/// `rds_iam` granted. The partition is derived from the region.
 pub fn attach_rds_policy(
     role_name: &str,
-    rds_identifier: &str,
+    rds_resource_id: &str,
+    db_user: &str,
     region: &str,
     creds: &AwsCredentials,
 ) -> Result<(), String> {
+    let partition = if region.starts_with("us-gov-") {
+        "aws-us-gov"
+    } else if region.starts_with("cn-") {
+        "aws-cn"
+    } else {
+        "aws"
+    };
+    let account = config::get("AWS_ROLE_ARN")
+        .ok()
+        .flatten()
+        .and_then(|arn| arn.split(':').nth(4).map(|s| s.to_string()))
+        .unwrap_or_else(|| "*".to_string());
     let policy = format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"rds-db:connect","Resource":"arn:aws:rds-db:{region}:*:dbuser/{rds_identifier}/*"}}]}}"#
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"rds-db:connect","Resource":"arn:{partition}:rds-db:{region}:{account}:dbuser:{rds_resource_id}/{db_user}"}}]}}"#
     );
     let body = format!(
         "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-rds-connect&PolicyDocument={}",
