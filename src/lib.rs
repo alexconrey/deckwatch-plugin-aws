@@ -303,10 +303,10 @@ impl AwsConfig {
                     if !ann_val.is_empty() {
                         Some(ann_val)
                     } else {
-                        config::get("RDS_DEFAULT_SUBNET_GROUP")
-                            .ok()
-                            .flatten()
-                            .filter(|s| !s.is_empty())
+                        #[cfg(target_arch = "wasm32")]
+                        { config::get("RDS_DEFAULT_SUBNET_GROUP").ok().flatten().filter(|s| !s.is_empty()) }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        { None }
                     }
                 },
                 security_groups: {
@@ -314,10 +314,10 @@ impl AwsConfig {
                     let raw = if !ann_val.is_empty() {
                         ann_val
                     } else {
-                        config::get("RDS_DEFAULT_SECURITY_GROUPS")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default()
+                        #[cfg(target_arch = "wasm32")]
+                        { config::get("RDS_DEFAULT_SECURITY_GROUPS").ok().flatten().unwrap_or_default() }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        { String::new() }
                     };
                     if raw.is_empty() {
                         vec![]
@@ -330,11 +330,14 @@ impl AwsConfig {
                     match ann_val {
                         Some("true") | Some("yes") | Some("1") => true,
                         Some("false") | Some("no") | Some("0") => false,
-                        _ => config::get("RDS_DEFAULT_IAM_AUTH")
-                            .ok()
-                            .flatten()
-                            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "yes" | "1"))
-                            .unwrap_or(true),
+                        _ => {
+                            #[cfg(target_arch = "wasm32")]
+                            { config::get("RDS_DEFAULT_IAM_AUTH").ok().flatten()
+                                .map(|v| matches!(v.to_lowercase().as_str(), "true" | "yes" | "1"))
+                                .unwrap_or(true) }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            { false }
+                        }
                     }
                 },
                 snapshot_schedule: {
@@ -599,10 +602,13 @@ fn apply_with_aws(
     // ── 2. RDS ────────────────────────────────────────────────────────────────
     let rds_endpoint = if let Some(ref rds_cfg) = cfg.rds {
         match rds::ensure_instance(rds_cfg, creds) {
-            Ok(endpoint) => {
+            Ok((endpoint, resource_id)) => {
+                let rds_user = if rds_cfg.iam_auth { "dbadmin" } else { "*" };
+                let id_for_policy = if resource_id.is_empty() { &rds_cfg.identifier } else { &resource_id };
                 if let Err(e) = iam::attach_rds_policy(
                     &cfg.role_name,
-                    &rds_cfg.identifier,
+                    id_for_policy,
+                    rds_user,
                     &creds.region,
                     creds,
                 ) {
@@ -1085,14 +1091,49 @@ pub fn provision(
                 region: creds.region.clone(),
             };
 
+            // DB username: "k2crm" (IAM auth user) when IAM auth is on, else "dbadmin".
+            let db_user = if iam_auth { req.application_name.clone() } else { "dbadmin".to_string() };
+
             match rds::ensure_instance(&cfg, &creds) {
-                Ok(endpoint) => {
+                Ok((endpoint, resource_id)) => {
                     let port = engine_port(&engine).to_string();
                     if endpoint.is_empty() {
                         result
                             .state
                             .insert("DB_STATUS".into(), "provisioning".into());
                     } else {
+                        // Create a workload IAM role and ServiceAccount for IRSA so
+                        // the application pod can generate RDS IAM auth tokens without
+                        // storing any credentials.
+                        if iam_auth && !resource_id.is_empty() {
+                            let role_name = format!("{}-{}-rds", req.namespace, req.application_name);
+                            let sa_name = format!("{}-aws-sa", req.application_name);
+                            match iam::ensure_role(&role_name, &req.namespace, &sa_name, &creds) {
+                                Ok(role_arn) => {
+                                    if let Err(e) = iam::attach_rds_policy(
+                                        &role_name,
+                                        &resource_id,
+                                        &db_user,
+                                        &creds.region,
+                                        &creds,
+                                    ) {
+                                        log!(LogLevel::Warn, "deckwatch-plugin-aws: attach_rds_policy: {e}");
+                                    }
+                                    result.state.insert("DB_ROLE_ARN".into(), role_arn.clone());
+                                    result.kubernetes_resources.push(service_account_yaml(
+                                        &sa_name,
+                                        &role_arn,
+                                        &req.namespace,
+                                    ));
+                                    result.state.insert("DB_SA_NAME".into(), sa_name);
+                                }
+                                Err(e) => {
+                                    log!(LogLevel::Warn, "deckwatch-plugin-aws: ensure_role for RDS: {e}");
+                                }
+                            }
+                            result.state.insert("DB_IAM_AUTH".into(), "true".into());
+                        }
+
                         result.state.insert("DB_HOST".into(), endpoint.clone());
                         result.state.insert("POSTGRES_HOST".into(), endpoint.clone());
                         result.state.insert("DB_STATUS".into(), "available".into());
@@ -1105,7 +1146,7 @@ pub fn provision(
                     result.state.insert("DB_ENGINE".into(), engine.clone());
                     result.state.insert("DB_NAME".into(), db_name.clone());
                     result.state.insert("POSTGRES_DB".into(), db_name.clone());
-                    result.state.insert("POSTGRES_USER".into(), "dbadmin".into());
+                    result.state.insert("POSTGRES_USER".into(), db_user);
                     result
                         .deployment_annotations
                         .insert("deckwatch.io/aws-rds-engine".into(), engine);

@@ -16,7 +16,9 @@ use crate::{aws_sign, AwsCredentials, RdsConfig};
 /// Returns the endpoint hostname. The endpoint may be empty if the instance was
 /// just created and is not yet in the `available` state — callers should treat
 /// an empty string as "provisioning in progress" and not block the deployment.
-pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<String, String> {
+/// Returns `(endpoint, resource_id)`. Both are empty strings when the instance
+/// was just created and is not yet in the `available` state.
+pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<(String, String), String> {
     match describe_db_instance(&cfg.identifier, creds)? {
         Some(info) => {
             log!(
@@ -25,7 +27,7 @@ pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<String
                 cfg.identifier,
                 info.status
             );
-            Ok(info.endpoint_address)
+            Ok((info.endpoint_address, info.resource_id))
         }
         None => {
             create_db_instance(cfg, creds)?;
@@ -34,8 +36,7 @@ pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<String
                 "deckwatch-plugin-aws: RDS instance {} creation initiated",
                 cfg.identifier
             );
-            // Endpoint not yet available — the next reconcile will fill it in.
-            Ok(String::new())
+            Ok((String::new(), String::new()))
         }
     }
 }
@@ -46,6 +47,7 @@ pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<String
 struct DbInstanceInfo {
     status: String,
     endpoint_address: String,
+    resource_id: String,
 }
 
 fn describe_db_instance(
@@ -71,6 +73,7 @@ fn describe_db_instance(
     Ok(Some(DbInstanceInfo {
         status: extract_tag(&xml, "DBInstanceStatus").unwrap_or_default(),
         endpoint_address: extract_tag(&xml, "Address").unwrap_or_default(),
+        resource_id: extract_tag(&xml, "DbiResourceId").unwrap_or_default(),
     }))
 }
 
