@@ -42,6 +42,7 @@ use deckwatch_plugin_sdk::{
 #[cfg(target_arch = "wasm32")]
 use extism_pdk::*;
 
+#[cfg(target_arch = "wasm32")]
 use serde_json::json;
 
 // ── Annotation helpers ────────────────────────────────────────────────────────
@@ -214,6 +215,7 @@ fn default_secret_name(namespace: &str, deployment: &str) -> String {
     format!("{namespace}/{deployment}")
 }
 
+#[cfg(target_arch = "wasm32")]
 fn workload_sa_name(deployment: &str) -> String {
     format!("{deployment}-aws-sa")
 }
@@ -425,6 +427,7 @@ impl AwsConfig {
 ///
 /// `role_arn` is empty in the static/host path and filled in by the WASM path
 /// after creating the actual IAM role.
+#[cfg(target_arch = "wasm32")]
 fn service_account_yaml(sa_name: &str, role_arn: &str, namespace: &str) -> serde_json::Value {
     json!({
         "apiVersion": "v1",
