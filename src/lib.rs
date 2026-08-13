@@ -504,7 +504,16 @@ pub fn apply_inner(ctx: &PluginContext, bucket_prefix: &str) -> PluginResult {
             .push(EnvVarSpec::value("DB_PORT", port.to_string()));
         result
             .env_vars
+            .push(EnvVarSpec::value("POSTGRES_PORT", port.to_string()));
+        result
+            .env_vars
             .push(EnvVarSpec::value("DB_NAME", &rds.db_name));
+        result
+            .env_vars
+            .push(EnvVarSpec::value("POSTGRES_DB", &rds.db_name));
+        result
+            .env_vars
+            .push(EnvVarSpec::value("POSTGRES_USER", "dbadmin"));
         if rds.iam_auth {
             result
                 .env_vars
@@ -746,6 +755,9 @@ fn apply_with_aws(
                 .push(EnvVarSpec::value("DB_HOST", &rds_endpoint));
             result
                 .env_vars
+                .push(EnvVarSpec::value("POSTGRES_HOST", &rds_endpoint));
+            result
+                .env_vars
                 .push(EnvVarSpec::value("DB_STATUS", "available"));
             result.outputs.insert("rds_endpoint".into(), rds_endpoint);
             result
@@ -874,6 +886,10 @@ pub fn rds_resource() -> PluginResource {
             "DB_PORT".into(),
             "DB_ENGINE".into(),
             "DB_NAME".into(),
+            "POSTGRES_HOST".into(),
+            "POSTGRES_PORT".into(),
+            "POSTGRES_DB".into(),
+            "POSTGRES_USER".into(),
         ],
     }
 }
@@ -1078,14 +1094,18 @@ pub fn provision(
                             .insert("DB_STATUS".into(), "provisioning".into());
                     } else {
                         result.state.insert("DB_HOST".into(), endpoint.clone());
+                        result.state.insert("POSTGRES_HOST".into(), endpoint.clone());
                         result.state.insert("DB_STATUS".into(), "available".into());
                         result
                             .deployment_annotations
                             .insert("deckwatch.io/aws-rds-endpoint".into(), endpoint);
                     }
-                    result.state.insert("DB_PORT".into(), port);
+                    result.state.insert("DB_PORT".into(), port.clone());
+                    result.state.insert("POSTGRES_PORT".into(), port);
                     result.state.insert("DB_ENGINE".into(), engine.clone());
                     result.state.insert("DB_NAME".into(), db_name.clone());
+                    result.state.insert("POSTGRES_DB".into(), db_name.clone());
+                    result.state.insert("POSTGRES_USER".into(), "dbadmin".into());
                     result
                         .deployment_annotations
                         .insert("deckwatch.io/aws-rds-engine".into(), engine);
