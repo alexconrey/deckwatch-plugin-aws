@@ -36,7 +36,7 @@ use deckwatch_plugin_sdk::{
 };
 #[cfg(target_arch = "wasm32")]
 use deckwatch_plugin_sdk::{
-    PluginMetadata, ResourceDeprovisionRequest, ResourceDeprovisionResult,
+    McpTuningField, PluginMetadata, ResourceDeprovisionRequest, ResourceDeprovisionResult,
     ResourceProvisionRequest, ResourceProvisionResult,
 };
 #[cfg(target_arch = "wasm32")]
@@ -781,6 +781,40 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "RDS_SKIP_FINAL_SNAPSHOT".into(), label: "Skip RDS Final Snapshot".into(), description: "Set to true to skip the final snapshot when deleting an RDS instance. Default: false (snapshot is always taken).".into(), field_type: ConfigFieldType::Bool, default: Some("false".into()), required: false, options: vec![], env_source: None },
         ],
         resources: vec![rds_resource(), s3_resource(), sqs_resource(), secretsmanager_resource()],
+        mcp_tuning_fields: vec![
+            McpTuningField {
+                key: "rds_naming_convention".into(),
+                label: "RDS Instance Naming Convention".into(),
+                description: "Convention for naming RDS instances created by this plugin. \
+                              Used by the AI agent when suggesting identifiers.".into(),
+                placeholder: "k2-{namespace}-{app}".into(),
+                default: None,
+            },
+            McpTuningField {
+                key: "s3_bucket_prefix_convention".into(),
+                label: "S3 Bucket Naming Convention".into(),
+                description: "Convention for naming S3 buckets created by this plugin. \
+                              Prepended or combined with the application name.".into(),
+                placeholder: "k2-{namespace}-{app}-".into(),
+                default: None,
+            },
+            McpTuningField {
+                key: "iam_role_path".into(),
+                label: "IAM Role Path".into(),
+                description: "Path prefix for IAM roles created by this plugin. \
+                              Must start and end with /. Mirrors the ROLE_PATH config key.".into(),
+                placeholder: "/deckwatch-plugin/".into(),
+                default: Some("/deckwatch-plugin/".into()),
+            },
+            McpTuningField {
+                key: "preferred_rds_instance_class".into(),
+                label: "Preferred RDS Instance Class".into(),
+                description: "Default RDS instance class to suggest when the operator does not \
+                              specify one. e.g. db.t3.micro for dev, db.r6g.large for prod.".into(),
+                placeholder: "db.t3.micro".into(),
+                default: None,
+            },
+        ],
     }))
 }
 
