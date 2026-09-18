@@ -33,6 +33,7 @@ mod sts;
 // on the host target too.
 use deckwatch_plugin_sdk::{
     ConfigField, ConfigFieldType, EnvVarSpec, PluginContext, PluginResource, PluginResult,
+    WantsServiceAccount,
 };
 #[cfg(target_arch = "wasm32")]
 use deckwatch_plugin_sdk::{
@@ -41,8 +42,6 @@ use deckwatch_plugin_sdk::{
 };
 #[cfg(target_arch = "wasm32")]
 use extism_pdk::*;
-
-use serde_json::json;
 
 // ── Annotation helpers ────────────────────────────────────────────────────────
 
@@ -123,6 +122,14 @@ impl AwsCredentials {
 
 pub struct AwsConfig {
     pub enabled: bool,
+    /// Logical application name used to key the shared IAM role and ServiceAccount.
+    ///
+    /// Derived from (in priority order):
+    /// 1. `aws.deckwatch.io/app-name` annotation — explicit override.
+    /// 2. `app.kubernetes.io/name` pod template label — standard k8s label.
+    /// 3. `app` pod template label — common Helm/ArgoCD convention.
+    /// 4. `deployment_name` — one per-deployment role/SA as the fallback.
+    pub app_name: String,
     pub role_name: String,
     pub rds: Option<RdsConfig>,
     pub s3: Option<S3Config>,
@@ -227,6 +234,39 @@ fn engine_port(engine: &str) -> u16 {
 
 // ── Config parsing ────────────────────────────────────────────────────────────
 
+/// Derive the logical application name shared across all deployments of an app.
+///
+/// Resolution order:
+/// 1. `aws.deckwatch.io/app-name` annotation — operator-supplied explicit override.
+/// 2. `app.kubernetes.io/name` pod template label — standard Kubernetes label.
+/// 3. `app` pod template label — common Helm/ArgoCD shorthand.
+/// 4. `deployment_name` — fallback gives one IAM role per deployment.
+///
+/// Using a consistent app-name across multiple deployments lets them share a
+/// single IAM role and ServiceAccount rather than provisioning one each.
+fn derive_app_name(ctx: &PluginContext) -> &str {
+    if let Some(v) = ctx
+        .annotations
+        .get("aws.deckwatch.io/app-name")
+        .map(String::as_str)
+    {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Some(v) = ctx.labels.get("app.kubernetes.io/name").map(String::as_str) {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Some(v) = ctx.labels.get("app").map(String::as_str) {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    ctx.deployment_name.as_str()
+}
+
 impl AwsConfig {
     pub fn from_context(ctx: &PluginContext) -> Self {
         let rds_enabled = ann_bool(ctx, "rds.deckwatch.io/enabled", false);
@@ -244,10 +284,14 @@ impl AwsConfig {
             || ecr_enabled
             || sm_enabled;
 
+        // Logical application name — shared across all deployments of the same app
+        // so they all receive the same IAM role and ServiceAccount.
+        let app_name = derive_app_name(ctx).to_string();
+
         let role_name = {
             let raw = ann_str(ctx, "aws.deckwatch.io/role-name");
             if raw.is_empty() {
-                default_role_name(&ctx.namespace, &ctx.deployment_name)
+                default_role_name(&ctx.namespace, &app_name)
             } else {
                 raw
             }
@@ -409,6 +453,7 @@ impl AwsConfig {
 
         AwsConfig {
             enabled: aws_enabled,
+            app_name,
             role_name,
             rds,
             s3,
@@ -417,30 +462,6 @@ impl AwsConfig {
             secretsmanager,
         }
     }
-}
-
-// ── ServiceAccount YAML (pure) ────────────────────────────────────────────────
-
-/// Build a Kubernetes `ServiceAccount` manifest with an IRSA role annotation.
-///
-/// `role_arn` is empty in the static/host path and filled in by the WASM path
-/// after creating the actual IAM role.
-fn service_account_yaml(sa_name: &str, role_arn: &str, namespace: &str) -> serde_json::Value {
-    json!({
-        "apiVersion": "v1",
-        "kind": "ServiceAccount",
-        "metadata": {
-            "name": sa_name,
-            "namespace": namespace,
-            "annotations": {
-                "eks.amazonaws.com/role-arn": role_arn,
-            },
-            "labels": {
-                "managed-by": "deckwatch",
-                "plugin": "deckwatch-plugin-aws",
-            },
-        },
-    })
 }
 
 // ── apply_inner (pure — no AWS API calls) ─────────────────────────────────────
@@ -461,15 +482,17 @@ pub fn apply_inner(ctx: &PluginContext, bucket_prefix: &str) -> PluginResult {
     }
 
     let mut result = PluginResult::default();
-    let sa = workload_sa_name(&ctx.deployment_name);
+    let sa = workload_sa_name(&cfg.app_name);
 
     // ── ServiceAccount ────────────────────────────────────────────────────────
-    // The role ARN is unknown statically; the WASM path overwrites this SA with
-    // the real ARN after ensure_role() returns.
-    result
-        .kubernetes_resources
-        .push(service_account_yaml(&sa, "", &ctx.namespace));
-    result.service_account_name = Some(sa.clone());
+    // Request SA creation/upsert via the structured WantsServiceAccount path.
+    // Deckwatch handles create-or-patch with retry semantics and audit-log
+    // visibility. The role ARN is unknown in the pure/static path; the WASM
+    // path overwrites this with the real ARN after ensure_role() returns.
+    result.wants_service_account = Some(WantsServiceAccount {
+        name: sa.clone(),
+        irsa_role_arn: String::new(),
+    });
 
     // ── RDS env vars ──────────────────────────────────────────────────────────
     if let Some(ref rds) = cfg.rds {
@@ -545,7 +568,7 @@ fn apply_with_aws(
         return PluginResult::default();
     }
 
-    let sa = workload_sa_name(&ctx.deployment_name);
+    let sa = workload_sa_name(&cfg.app_name);
 
     // ── 1. Ensure IAM role (OIDC-scoped trust policy) ─────────────────────────
     let role_arn = match iam::ensure_role(&cfg.role_name, &ctx.namespace, &sa, creds) {
@@ -696,10 +719,12 @@ fn apply_with_aws(
     // ── 7. Build result ───────────────────────────────────────────────────────
     let mut result = apply_inner(ctx, bucket_prefix);
 
-    result.kubernetes_resources.clear();
-    result
-        .kubernetes_resources
-        .push(service_account_yaml(&sa, &role_arn, &ctx.namespace));
+    // Overwrite the placeholder SA request with the real IAM role ARN.
+    // Deckwatch will create-or-patch the SA with the IRSA annotation.
+    result.wants_service_account = Some(WantsServiceAccount {
+        name: sa.clone(),
+        irsa_role_arn: role_arn.clone(),
+    });
 
     result.outputs.insert("role_arn".into(), role_arn);
     result.outputs.insert("service_account_name".into(), sa);
@@ -1158,7 +1183,12 @@ pub fn provision(
 
             match sqs::ensure_queue(&cfg, &creds) {
                 Ok(info) => {
-                    let name = info.queue_arn.split(':').last().unwrap_or("").to_string();
+                    let name = info
+                        .queue_arn
+                        .split(':')
+                        .next_back()
+                        .unwrap_or("")
+                        .to_string();
                     result.state.insert("QUEUE_URL".into(), info.queue_url);
                     result.state.insert("QUEUE_NAME".into(), name);
                 }
@@ -1373,6 +1403,24 @@ mod tests {
                 .collect(),
             labels: HashMap::new(),
             plugin_outputs: HashMap::new(),
+            provisioned_resources: HashMap::new(),
+        }
+    }
+
+    fn ctx_with_labels(annotations: &[(&str, &str)], labels: &[(&str, &str)]) -> PluginContext {
+        PluginContext {
+            namespace: "production".into(),
+            deployment_name: "my-app".into(),
+            annotations: annotations
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            plugin_outputs: HashMap::new(),
+            provisioned_resources: HashMap::new(),
         }
     }
 
@@ -1391,9 +1439,10 @@ mod tests {
         assert!(result.env_vars.is_empty());
         assert!(result.kubernetes_resources.is_empty());
         assert!(result.service_account_name.is_none());
+        assert!(result.wants_service_account.is_none());
     }
 
-    // 2. Master opt-in with no sub-resources: no DB or S3 env vars but SA is present.
+    // 2. Master opt-in with no sub-resources: no DB or S3 env vars but SA is requested.
     #[test]
     fn aws_enabled_alone_no_rds_no_s3() {
         let result = apply_inner(&ctx(&[("aws.deckwatch.io/enabled", "true")]), "");
@@ -1405,10 +1454,14 @@ mod tests {
             find_env(&result, "S3_BUCKET").is_none(),
             "no S3 env vars expected"
         );
-        assert!(result.service_account_name.is_some(), "SA must be created");
         assert!(
-            !result.kubernetes_resources.is_empty(),
-            "SA resource must be emitted"
+            result.wants_service_account.is_some(),
+            "wants_service_account must be set"
+        );
+        // No raw SA in kubernetes_resources — SA is created via the structured path.
+        assert!(
+            result.kubernetes_resources.is_empty(),
+            "SA must not be in kubernetes_resources"
         );
     }
 
@@ -1491,12 +1544,54 @@ mod tests {
         assert_eq!(find_env(&result, "S3_BUCKET"), Some("myorg-assets"));
     }
 
-    // 8. role-name defaults to <namespace>-<deployment>-role.
+    // 8. role-name defaults to <namespace>-<app_name>-role.
+    //    When no app label is set, app_name falls back to deployment_name.
     #[test]
     fn role_name_defaults() {
         let c = ctx(&[("aws.deckwatch.io/enabled", "true")]);
         let cfg = AwsConfig::from_context(&c);
         assert_eq!(cfg.role_name, "production-my-app-role");
+        assert_eq!(cfg.app_name, "my-app");
+    }
+
+    // 8b. app_name is derived from the app.kubernetes.io/name label when set,
+    //     so multiple deployments of the same app share one IAM role and SA.
+    #[test]
+    fn role_name_uses_app_label_when_set() {
+        let c = ctx_with_labels(
+            &[("aws.deckwatch.io/enabled", "true")],
+            &[("app.kubernetes.io/name", "my-service")],
+        );
+        let cfg = AwsConfig::from_context(&c);
+        assert_eq!(cfg.app_name, "my-service");
+        assert_eq!(cfg.role_name, "production-my-service-role");
+    }
+
+    // 8c. aws.deckwatch.io/app-name annotation overrides label.
+    #[test]
+    fn role_name_uses_annotation_override() {
+        let c = ctx_with_labels(
+            &[
+                ("aws.deckwatch.io/enabled", "true"),
+                ("aws.deckwatch.io/app-name", "shared-app"),
+            ],
+            &[("app.kubernetes.io/name", "my-service")],
+        );
+        let cfg = AwsConfig::from_context(&c);
+        assert_eq!(cfg.app_name, "shared-app");
+        assert_eq!(cfg.role_name, "production-shared-app-role");
+    }
+
+    // 8d. SA name is keyed on app_name, not deployment_name.
+    #[test]
+    fn sa_name_keyed_on_app_name() {
+        let c = ctx_with_labels(
+            &[("aws.deckwatch.io/enabled", "true")],
+            &[("app", "backend")],
+        );
+        let result = apply_inner(&c, "");
+        let wsa = result.wants_service_account.unwrap();
+        assert_eq!(wsa.name, "backend-aws-sa");
     }
 
     // 9. RDS identifier defaults to <namespace>-<deployment>-db (≤ 63 chars).
@@ -1531,23 +1626,27 @@ mod tests {
         );
     }
 
-    // 11. When any AWS resource is enabled, a ServiceAccount is in kubernetes_resources.
+    // 11. When any AWS resource is enabled, wants_service_account is set.
     #[test]
-    fn service_account_in_kubernetes_resources() {
+    fn wants_service_account_set_when_enabled() {
         let result = apply_inner(&ctx(&[("aws.deckwatch.io/enabled", "true")]), "");
-        assert!(
-            !result.kubernetes_resources.is_empty(),
-            "kubernetes_resources must be non-empty"
-        );
-        let sa = &result.kubernetes_resources[0];
+        let wsa = result
+            .wants_service_account
+            .as_ref()
+            .expect("wants_service_account must be Some when AWS is enabled");
         assert_eq!(
-            sa["kind"].as_str(),
-            Some("ServiceAccount"),
-            "first resource must be ServiceAccount"
+            wsa.name, "my-app-aws-sa",
+            "SA name must be keyed on deployment_name when no app label is set"
         );
+        // IRSA ARN is empty in the pure path (filled in by WASM after IAM call).
         assert!(
-            result.service_account_name.is_some(),
-            "service_account_name must be set"
+            wsa.irsa_role_arn.is_empty(),
+            "irsa_role_arn must be empty in the pure (non-WASM) path"
+        );
+        // SA must NOT appear in kubernetes_resources — deckwatch handles it.
+        assert!(
+            result.kubernetes_resources.is_empty(),
+            "kubernetes_resources must be empty — SA is handled via wants_service_account"
         );
     }
 
@@ -1623,7 +1722,7 @@ mod tests {
             "",
         );
         assert_eq!(find_env(&result, "QUEUE_NAME"), Some("my-jobs"));
-        assert!(result.service_account_name.is_some());
+        assert!(result.wants_service_account.is_some());
     }
 
     #[test]

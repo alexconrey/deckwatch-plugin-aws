@@ -137,9 +137,7 @@ fn create_queue(name: &str, cfg: &SqsConfig, creds: &AwsCredentials) -> Result<S
 fn arn_from_queue_url(queue_url: &str, region: &str) -> Option<String> {
     let prefix = format!("https://sqs.{region}.amazonaws.com/");
     let path = queue_url.strip_prefix(&prefix)?;
-    let mut parts = path.splitn(2, '/');
-    let account_id = parts.next()?;
-    let queue_name = parts.next()?;
+    let (account_id, queue_name) = path.split_once('/')?;
     Some(format!("arn:aws:sqs:{region}:{account_id}:{queue_name}"))
 }
 

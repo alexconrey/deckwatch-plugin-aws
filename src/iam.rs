@@ -75,7 +75,7 @@ fn trust_policy_document(namespace: &str, sa_name: &str) -> String {
             // ARN format: arn:aws[-partition]:iam::<account>:oidc-provider/<url>
             let oidc_url = arn
                 .split(':')
-                .last()
+                .next_back()
                 .unwrap_or("")
                 .trim_start_matches("oidc-provider/");
             format!(
