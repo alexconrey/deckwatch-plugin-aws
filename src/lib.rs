@@ -897,12 +897,23 @@ pub fn rds_resource() -> PluginResource {
                 options: vec![],
                 env_source: None,
             },
+            ConfigField {
+                key: "iam_auth".into(),
+                label: "IAM Authentication".into(),
+                description: "Use IAM database authentication instead of a password. Requires the workload's IAM role to have rds-db:connect permission.".into(),
+                field_type: ConfigFieldType::Bool,
+                default: Some("false".into()),
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
         ],
         output_keys: vec![
             "DB_HOST".into(),
             "DB_PORT".into(),
             "DB_ENGINE".into(),
             "DB_NAME".into(),
+            "DB_IAM_AUTH".into(),
         ],
     }
 }
@@ -1063,6 +1074,11 @@ pub fn provision(
                 .filter(|s| !s.is_empty())
                 .cloned()
                 .unwrap_or_else(|| "app".to_string());
+            let iam_auth = req
+                .fields
+                .get("iam_auth")
+                .map(|v| matches!(v.as_str(), "true" | "yes" | "1"))
+                .unwrap_or(false);
 
             let cfg = RdsConfig {
                 identifier,
@@ -1073,7 +1089,7 @@ pub fn provision(
                 multi_az: false,
                 subnet_group: None,
                 security_groups: vec![],
-                iam_auth: false,
+                iam_auth,
                 snapshot_schedule: None,
                 snapshot_retention: 7,
                 backup_role_arn: String::new(),
@@ -1097,12 +1113,24 @@ pub fn provision(
                     result.state.insert("DB_PORT".into(), port);
                     result.state.insert("DB_ENGINE".into(), engine.clone());
                     result.state.insert("DB_NAME".into(), db_name.clone());
+                    if iam_auth {
+                        result.state.insert("DB_IAM_AUTH".into(), "true".into());
+                    }
+                    // Stamp opt-in annotations so apply() activates on every reconcile.
+                    result
+                        .deployment_annotations
+                        .insert("rds.deckwatch.io/enabled".into(), "true".into());
                     result
                         .deployment_annotations
                         .insert("deckwatch.io/aws-rds-engine".into(), engine);
                     result
                         .deployment_annotations
                         .insert("deckwatch.io/aws-rds-db-name".into(), db_name);
+                    if iam_auth {
+                        result
+                            .deployment_annotations
+                            .insert("rds.deckwatch.io/iam-auth".into(), "true".into());
+                    }
                 }
                 Err(e) => {
                     result.errors.push(format!("RDS provisioning error: {e}"));
