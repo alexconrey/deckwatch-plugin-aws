@@ -13,15 +13,10 @@ use crate::{aws_sign, AwsCredentials, RdsConfig};
 
 /// Ensure an RDS DB instance exists, creating it if it does not.
 ///
-/// Returns the endpoint hostname. The endpoint may be empty if the instance was
-/// just created and is not yet in the `available` state — callers should treat
-/// an empty string as "provisioning in progress" and not block the deployment.
-/// Returns `(endpoint, resource_id)`. Both are empty strings when the instance
-/// was just created and is not yet in the `available` state.
-pub fn ensure_instance(
-    cfg: &RdsConfig,
-    creds: &AwsCredentials,
-) -> Result<(String, String), String> {
+/// All fields are empty when the instance was just created and is not yet in
+/// the `available` state — callers should treat an empty endpoint as
+/// "provisioning in progress" and not block the deployment.
+pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<RdsInstance, String> {
     match describe_db_instance(&cfg.identifier, creds)? {
         Some(info) => {
             log!(
@@ -30,7 +25,11 @@ pub fn ensure_instance(
                 cfg.identifier,
                 info.status
             );
-            Ok((info.endpoint_address, info.resource_id))
+            Ok(RdsInstance {
+                endpoint: info.endpoint_address,
+                resource_id: info.resource_id,
+                master_secret_arn: info.master_secret_arn,
+            })
         }
         None => {
             create_db_instance(cfg, creds)?;
@@ -39,18 +38,31 @@ pub fn ensure_instance(
                 "deckwatch-plugin-aws: RDS instance {} creation initiated",
                 cfg.identifier
             );
-            Ok((String::new(), String::new()))
+            Ok(RdsInstance::default())
         }
     }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
+/// The parts of a DB instance callers need once it exists.
+#[derive(Debug, Default)]
+pub struct RdsInstance {
+    /// Endpoint hostname.
+    pub endpoint: String,
+    /// `DbiResourceId` (e.g. `db-ABC…`), used in `rds-db:connect` ARNs.
+    pub resource_id: String,
+    /// ARN of the Secrets Manager secret holding the master credentials
+    /// (`ManageMasterUserPassword`). Empty when RDS does not manage it.
+    pub master_secret_arn: String,
+}
+
 #[derive(Debug, Default)]
 struct DbInstanceInfo {
     status: String,
     endpoint_address: String,
     resource_id: String,
+    master_secret_arn: String,
 }
 
 fn describe_db_instance(
@@ -77,6 +89,7 @@ fn describe_db_instance(
         status: extract_tag(&xml, "DBInstanceStatus").unwrap_or_default(),
         endpoint_address: extract_tag(&xml, "Address").unwrap_or_default(),
         resource_id: extract_tag(&xml, "DbiResourceId").unwrap_or_default(),
+        master_secret_arn: extract_tag(&xml, "SecretArn").unwrap_or_default(),
     }))
 }
 

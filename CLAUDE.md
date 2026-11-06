@@ -67,6 +67,26 @@ Snapshot scheduling is implemented via **AWS Backup**, not a Kubernetes
 endpoint. This produces no `kubernetes_resources`; all schedule state lives in
 AWS.
 
+### IAM database user bootstrap
+
+With IAM auth the workload connects as a Postgres user named after the app,
+which must exist and be granted `rds_iam`. RDS only creates the master user and
+WASM cannot open a Postgres connection, so once the instance is available
+`provision()` emits a ServiceAccount + one-shot Job (`<app>-db-bootstrap`) via
+`kubernetes_resources`:
+
+- The Job's IRSA role (`<ns>-<app>-rds-bootstrap`) can only read this
+  instance's RDS-managed master secret. The workload role never can.
+- An init container fetches the secret into a memory-backed emptyDir; the psql
+  container runs idempotent `CREATE ROLE … LOGIN` / `GRANT rds_iam` / database
+  and `public` schema grants, then deletes the file. The password never enters
+  plugin state, a Kubernetes Secret, or the Job spec.
+- Images default to `amazon/aws-cli` and `postgres:18-alpine`, overridable via
+  `DB_BOOTSTRAP_AWSCLI_IMAGE` / `DB_BOOTSTRAP_PSQL_IMAGE`.
+
+Postgres only. Requires deckwatch to apply `kubernetes_resources` from the
+pending-resource reconcile loop and RBAC `patch` on `batch/jobs`.
+
 ## Annotation reference
 
 ### Global (`aws.deckwatch.io/`)
