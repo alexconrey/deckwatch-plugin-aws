@@ -359,11 +359,43 @@ struct BootstrapSpec<'a> {
     psql_image: &'a str,
 }
 
+/// Escape a string for a container `command`/`args`/`env` value. Kubernetes
+/// expands `$(VAR)` there and turns `$$` into `$`, which would otherwise mangle
+/// shell variables and Postgres `$$` dollar quotes.
+#[cfg(any(target_arch = "wasm32", test))]
+fn k8s_literal(s: &str) -> String {
+    s.replace('$', "$$")
+}
+
+/// FNV-1a over `s`, as 8 hex chars. Used to give each distinct Job spec its
+/// own name; pod templates are immutable, so a changed spec cannot be applied
+/// over an existing Job of the same name.
+#[cfg(any(target_arch = "wasm32", test))]
+fn short_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", h as u32)
+}
+
+/// Job name: `<app>-db-bootstrap-<hash>`, kept within the 63-char limit.
+#[cfg(any(target_arch = "wasm32", test))]
+fn bootstrap_job_name(app: &str, template: &serde_json::Value) -> String {
+    let mut prefix = bootstrap_name(app);
+    prefix.truncate(54);
+    let prefix = prefix.trim_end_matches('-');
+    format!("{prefix}-{}", short_hash(&template.to_string()))
+}
+
 /// ServiceAccount + Job that create the IAM-auth database user.
 ///
-/// The Job spec is deterministic so re-applying it on every provision/refresh
-/// is a no-op while it exists; once the TTL removes it, the next refresh
-/// re-runs the (idempotent) SQL.
+/// The Job name carries a hash of its pod template, so re-applying an
+/// unchanged spec on every provision/refresh is a no-op while it exists, and a
+/// changed spec (e.g. new image) creates a new Job instead of failing on the
+/// immutable template. Once the TTL removes a Job, the next refresh re-runs
+/// the (idempotent) SQL.
 #[cfg(any(target_arch = "wasm32", test))]
 fn db_bootstrap_manifests(spec: &BootstrapSpec) -> Vec<serde_json::Value> {
     let name = bootstrap_name(spec.app);
@@ -396,19 +428,7 @@ echo "database user bootstrap complete""#;
         },
     });
 
-    let job = json!({
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "metadata": {
-            "name": name,
-            "namespace": spec.namespace,
-            "labels": labels,
-        },
-        "spec": {
-            "backoffLimit": 6,
-            "activeDeadlineSeconds": 900,
-            "ttlSecondsAfterFinished": 86400,
-            "template": {
+    let template = json!({
                 "metadata": { "labels": labels },
                 "spec": {
                     "serviceAccountName": name,
@@ -422,11 +442,11 @@ echo "database user bootstrap complete""#;
                         "image": spec.awscli_image,
                         "command": [
                             "/bin/sh", "-c",
-                            "aws secretsmanager get-secret-value --secret-id \"$MASTER_SECRET_ARN\" --query SecretString --output text > /work/master.json",
+                            k8s_literal("aws secretsmanager get-secret-value --secret-id \"$MASTER_SECRET_ARN\" --query SecretString --output text > /work/master.json"),
                         ],
                         "env": [
-                            { "name": "MASTER_SECRET_ARN", "value": spec.master_secret_arn },
-                            { "name": "AWS_REGION", "value": spec.region },
+                            { "name": "MASTER_SECRET_ARN", "value": k8s_literal(spec.master_secret_arn) },
+                            { "name": "AWS_REGION", "value": k8s_literal(spec.region) },
                         ],
                         "volumeMounts": [{ "name": "work", "mountPath": "/work" }],
                         "securityContext": no_escalation,
@@ -434,19 +454,33 @@ echo "database user bootstrap complete""#;
                     "containers": [{
                         "name": "create-db-user",
                         "image": spec.psql_image,
-                        "command": ["/bin/sh", "-c", psql_script],
+                        "command": ["/bin/sh", "-c", k8s_literal(psql_script)],
                         "env": [
-                            { "name": "PGHOST", "value": spec.host },
-                            { "name": "PGPORT", "value": spec.port },
-                            { "name": "PGDATABASE", "value": spec.db_name },
+                            { "name": "PGHOST", "value": k8s_literal(spec.host) },
+                            { "name": "PGPORT", "value": k8s_literal(spec.port) },
+                            { "name": "PGDATABASE", "value": k8s_literal(spec.db_name) },
                             { "name": "PGSSLMODE", "value": "require" },
-                            { "name": "BOOTSTRAP_SQL", "value": spec.sql },
+                            { "name": "BOOTSTRAP_SQL", "value": k8s_literal(spec.sql) },
                         ],
                         "volumeMounts": [{ "name": "work", "mountPath": "/work" }],
                         "securityContext": no_escalation,
                     }],
                 },
-            },
+    });
+
+    let job = json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": bootstrap_job_name(spec.app, &template),
+            "namespace": spec.namespace,
+            "labels": labels,
+        },
+        "spec": {
+            "backoffLimit": 6,
+            "activeDeadlineSeconds": 900,
+            "ttlSecondsAfterFinished": 86400,
+            "template": template,
         },
     });
 
@@ -2406,7 +2440,11 @@ mod tests {
 
         assert_eq!(job["apiVersion"], "batch/v1");
         assert_eq!(job["kind"], "Job");
-        assert_eq!(job["metadata"]["name"], "radiation-db-db-bootstrap");
+        let job_name = job["metadata"]["name"].as_str().unwrap();
+        assert!(
+            job_name.starts_with("radiation-db-db-bootstrap-"),
+            "{job_name}"
+        );
         let pod = &job["spec"]["template"]["spec"];
         // Runs as the bootstrap SA, never the workload SA (which must not be
         // able to read the master secret).
@@ -2454,5 +2492,72 @@ mod tests {
         let all = serde_json::to_string(&out).unwrap();
         assert!(!all.to_lowercase().contains("\"password\":"));
         assert!(!all.contains("\"kind\":\"Secret\""));
+    }
+
+    /// What the kubelet does to container command/env values: `$$` becomes
+    /// `$`; `$(VAR)` would be substituted, but none of ours resolve.
+    fn k8s_expand(s: &str) -> String {
+        s.replace("$$", "$")
+    }
+
+    #[test]
+    fn bootstrap_values_survive_kubernetes_variable_expansion() {
+        let sql = bootstrap_sql("radiation-db", "radiation").unwrap();
+        assert!(sql.contains("DO $$"));
+        let out = sample_bootstrap();
+        let pod = &out[1]["spec"]["template"]["spec"];
+        let env_sql = pod["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "BOOTSTRAP_SQL")
+            .unwrap()["value"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Unescaped, Postgres received "DO $" and failed with a syntax error.
+        assert_eq!(k8s_expand(&env_sql), sql);
+
+        let script = k8s_expand(pod["containers"][0]["command"][2].as_str().unwrap());
+        assert!(script.contains(r#""$BOOTSTRAP_SQL""#));
+        assert!(script.contains("PGPASSWORD=$(sed"));
+        let init = k8s_expand(pod["initContainers"][0]["command"][2].as_str().unwrap());
+        assert!(init.contains(r#""$MASTER_SECRET_ARN""#));
+    }
+
+    #[test]
+    fn bootstrap_job_name_tracks_spec_and_fits_limit() {
+        let a = sample_bootstrap();
+        let b = sample_bootstrap();
+        assert_eq!(
+            a[1]["metadata"]["name"], b[1]["metadata"]["name"],
+            "stable for identical spec"
+        );
+
+        let sql = bootstrap_sql("radiation-db", "radiation").unwrap();
+        let changed = db_bootstrap_manifests(&BootstrapSpec {
+            namespace: "rad",
+            app: "radiation-db",
+            role_arn: "arn:aws-us-gov:iam::123456789012:role/deckwatch-plugin/rad-radiation-db-rds-bootstrap",
+            master_secret_arn: "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:rds!db-abc",
+            region: "us-gov-west-1",
+            host: "rad-radiation-db.example.rds.amazonaws.com",
+            port: "5432",
+            db_name: "radiation",
+            sql: &sql,
+            awscli_image: "amazon/aws-cli:test",
+            psql_image: "postgres:other",
+        });
+        assert_ne!(
+            a[1]["metadata"]["name"], changed[1]["metadata"]["name"],
+            "new spec, new Job"
+        );
+        // The SA name is unaffected by spec changes.
+        assert_eq!(a[0]["metadata"]["name"], changed[0]["metadata"]["name"]);
+
+        let long_app = "a".repeat(53);
+        let name = bootstrap_job_name(&long_app, &serde_json::json!({}));
+        assert!(name.len() <= 63, "{} chars: {name}", name.len());
+        assert!(!name.contains("--"));
     }
 }
