@@ -75,7 +75,7 @@ fn trust_policy_document(namespace: &str, sa_name: &str) -> String {
             // ARN format: arn:aws[-partition]:iam::<account>:oidc-provider/<url>
             let oidc_url = arn
                 .split(':')
-                .last()
+                .next_back()
                 .unwrap_or("")
                 .trim_start_matches("oidc-provider/");
             format!(
@@ -274,13 +274,13 @@ fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<String>, S
         "Action=GetRole&Version=2010-05-08&RoleName={}",
         url_encode(role_name)
     );
-    let xml = iam_query(&body, creds)?;
-
-    if xml.contains("NoSuchEntity") {
-        return Ok(None);
+    // A missing role comes back as HTTP 404 with Code=NoSuchEntity, which
+    // iam_query surfaces as Err — map it to Ok(None) so ensure_role creates it.
+    match iam_query(&body, creds) {
+        Ok(xml) => Ok(extract_tag(&xml, "Arn")),
+        Err(e) if e.contains("NoSuchEntity") => Ok(None),
+        Err(e) => Err(e),
     }
-
-    Ok(extract_tag(&xml, "Arn"))
 }
 
 fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
@@ -321,10 +321,11 @@ fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
     let text = String::from_utf8_lossy(&resp.body()).to_string();
 
     if status >= 400 {
+        let code = extract_tag(&text, "Code").unwrap_or_default();
         let msg = extract_tag(&text, "Message")
             .or_else(|| extract_tag(&text, "message"))
             .unwrap_or_else(|| text.clone());
-        return Err(format!("IAM API error {status}: {msg}"));
+        return Err(format!("IAM API error {status} {code}: {msg}"));
     }
 
     Ok(text)

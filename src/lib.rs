@@ -36,8 +36,8 @@ use deckwatch_plugin_sdk::{
 };
 #[cfg(target_arch = "wasm32")]
 use deckwatch_plugin_sdk::{
-    PluginMetadata, ResourceDeprovisionRequest, ResourceDeprovisionResult,
-    ResourceProvisionRequest, ResourceProvisionResult,
+    McpTuningField, PluginMetadata, ResourceDeprovisionRequest, ResourceDeprovisionResult,
+    ResourceProvisionRequest, ResourceProvisionResult, WantsServiceAccount,
 };
 #[cfg(target_arch = "wasm32")]
 use extism_pdk::*;
@@ -124,6 +124,14 @@ impl AwsCredentials {
 
 pub struct AwsConfig {
     pub enabled: bool,
+    /// Logical application name used to key the shared IAM role and ServiceAccount.
+    ///
+    /// Derived from (in priority order):
+    /// 1. `aws.deckwatch.io/app-name` annotation — explicit override.
+    /// 2. `app.kubernetes.io/name` pod template label — standard k8s label.
+    /// 3. `app` pod template label — common Helm/ArgoCD convention.
+    /// 4. `deployment_name` — one per-deployment role/SA as the fallback.
+    pub app_name: String,
     pub role_name: String,
     pub rds: Option<RdsConfig>,
     pub s3: Option<S3Config>,
@@ -215,9 +223,60 @@ fn default_secret_name(namespace: &str, deployment: &str) -> String {
     format!("{namespace}/{deployment}")
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 fn workload_sa_name(deployment: &str) -> String {
     format!("{deployment}-aws-sa")
+}
+
+/// IAM role name `provision()` creates for an application's RDS IRSA binding.
+/// Stamped as `aws.deckwatch.io/role-name` so `apply()` reuses the same role.
+#[cfg(target_arch = "wasm32")]
+fn rds_role_name(namespace: &str, app: &str) -> String {
+    format!("{namespace}-{app}-rds")
+}
+
+/// Database user the workload connects as. With IAM auth this is the app name
+/// (the user granted `rds_iam`); otherwise the RDS master user.
+fn rds_db_user(iam_auth: bool, app: &str) -> String {
+    if iam_auth {
+        app.to_string()
+    } else {
+        "dbadmin".to_string()
+    }
+}
+
+/// Deployment annotations `provision()` stamps so `apply()` activates on
+/// reconcile and resolves the *same* instance, IAM role, and ServiceAccount.
+///
+/// Without the identifier, `apply()` would fall back to
+/// `<namespace>-<deployment>-db` and create a second instance; without the
+/// role and app names it would create a second role and repoint the SA.
+#[cfg(any(target_arch = "wasm32", test))]
+fn rds_apply_annotations(
+    app: &str,
+    identifier: &str,
+    engine: &str,
+    instance_class: &str,
+    db_name: &str,
+    iam_auth: bool,
+    role_name: &str,
+) -> std::collections::HashMap<String, String> {
+    [
+        ("rds.deckwatch.io/enabled", "true"),
+        ("rds.deckwatch.io/identifier", identifier),
+        ("rds.deckwatch.io/engine", engine),
+        ("rds.deckwatch.io/instance-class", instance_class),
+        ("rds.deckwatch.io/db-name", db_name),
+        (
+            "rds.deckwatch.io/iam-auth",
+            if iam_auth { "true" } else { "false" },
+        ),
+        ("aws.deckwatch.io/app-name", app),
+        ("aws.deckwatch.io/role-name", role_name),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
 }
 
 fn engine_port(engine: &str) -> u16 {
@@ -228,6 +287,39 @@ fn engine_port(engine: &str) -> u16 {
 }
 
 // ── Config parsing ────────────────────────────────────────────────────────────
+
+/// Derive the logical application name shared across all deployments of an app.
+///
+/// Resolution order:
+/// 1. `aws.deckwatch.io/app-name` annotation — operator-supplied explicit override.
+/// 2. `app.kubernetes.io/name` pod template label — standard Kubernetes label.
+/// 3. `app` pod template label — common Helm/ArgoCD shorthand.
+/// 4. `deployment_name` — fallback gives one IAM role per deployment.
+///
+/// Using a consistent app-name across multiple deployments lets them share a
+/// single IAM role and ServiceAccount rather than provisioning one each.
+fn derive_app_name(ctx: &PluginContext) -> &str {
+    if let Some(v) = ctx
+        .annotations
+        .get("aws.deckwatch.io/app-name")
+        .map(String::as_str)
+    {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Some(v) = ctx.labels.get("app.kubernetes.io/name").map(String::as_str) {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Some(v) = ctx.labels.get("app").map(String::as_str) {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    ctx.deployment_name.as_str()
+}
 
 impl AwsConfig {
     pub fn from_context(ctx: &PluginContext) -> Self {
@@ -246,10 +338,14 @@ impl AwsConfig {
             || ecr_enabled
             || sm_enabled;
 
+        // Logical application name — shared across all deployments of the same app
+        // so they all receive the same IAM role and ServiceAccount.
+        let app_name = derive_app_name(ctx).to_string();
+
         let role_name = {
             let raw = ann_str(ctx, "aws.deckwatch.io/role-name");
             if raw.is_empty() {
-                default_role_name(&ctx.namespace, &ctx.deployment_name)
+                default_role_name(&ctx.namespace, &app_name)
             } else {
                 raw
             }
@@ -304,9 +400,16 @@ impl AwsConfig {
                         Some(ann_val)
                     } else {
                         #[cfg(target_arch = "wasm32")]
-                        { config::get("RDS_DEFAULT_SUBNET_GROUP").ok().flatten().filter(|s| !s.is_empty()) }
+                        {
+                            config::get("RDS_DEFAULT_SUBNET_GROUP")
+                                .ok()
+                                .flatten()
+                                .filter(|s| !s.is_empty())
+                        }
                         #[cfg(not(target_arch = "wasm32"))]
-                        { None }
+                        {
+                            None
+                        }
                     }
                 },
                 security_groups: {
@@ -315,9 +418,16 @@ impl AwsConfig {
                         ann_val
                     } else {
                         #[cfg(target_arch = "wasm32")]
-                        { config::get("RDS_DEFAULT_SECURITY_GROUPS").ok().flatten().unwrap_or_default() }
+                        {
+                            config::get("RDS_DEFAULT_SECURITY_GROUPS")
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default()
+                        }
                         #[cfg(not(target_arch = "wasm32"))]
-                        { String::new() }
+                        {
+                            String::new()
+                        }
                     };
                     if raw.is_empty() {
                         vec![]
@@ -332,11 +442,19 @@ impl AwsConfig {
                         Some("false") | Some("no") | Some("0") => false,
                         _ => {
                             #[cfg(target_arch = "wasm32")]
-                            { config::get("RDS_DEFAULT_IAM_AUTH").ok().flatten()
-                                .map(|v| matches!(v.to_lowercase().as_str(), "true" | "yes" | "1"))
-                                .unwrap_or(true) }
+                            {
+                                config::get("RDS_DEFAULT_IAM_AUTH")
+                                    .ok()
+                                    .flatten()
+                                    .map(|v| {
+                                        matches!(v.to_lowercase().as_str(), "true" | "yes" | "1")
+                                    })
+                                    .unwrap_or(true)
+                            }
                             #[cfg(not(target_arch = "wasm32"))]
-                            { false }
+                            {
+                                false
+                            }
                         }
                     }
                 },
@@ -436,6 +554,7 @@ impl AwsConfig {
 
         AwsConfig {
             enabled: aws_enabled,
+            app_name,
             role_name,
             rds,
             s3,
@@ -446,12 +565,12 @@ impl AwsConfig {
     }
 }
 
-// ── ServiceAccount YAML (pure) ────────────────────────────────────────────────
+// ── ServiceAccount YAML ───────────────────────────────────────────────────────
 
 /// Build a Kubernetes `ServiceAccount` manifest with an IRSA role annotation.
 ///
-/// `role_arn` is empty in the static/host path and filled in by the WASM path
-/// after creating the actual IAM role.
+/// Used by `provision()`, which has no structured `WantsServiceAccount` path.
+/// Only emitted once the IAM role is confirmed to exist.
 #[cfg(target_arch = "wasm32")]
 fn service_account_yaml(sa_name: &str, role_arn: &str, namespace: &str) -> serde_json::Value {
     json!({
@@ -490,11 +609,11 @@ pub fn apply_inner(ctx: &PluginContext, bucket_prefix: &str) -> PluginResult {
 
     let mut result = PluginResult::default();
 
-    // NOTE: service_account_name and the SA kubernetes_resource are intentionally
-    // NOT set here. apply_inner is the fallback used when ensure_role() fails.
-    // Setting the SA in the fallback would reference an SA that was never created,
-    // blocking pod scheduling. The WASM path (apply_with_aws) sets these only
-    // after the IAM role is confirmed to exist.
+    // NOTE: wants_service_account is intentionally NOT set here. apply_inner is
+    // the fallback used when ensure_role() fails. Requesting the SA in the
+    // fallback binds the pod to an SA with no IRSA role, so every AWS call from
+    // the workload fails. apply_with_aws requests the SA only after the IAM
+    // role is confirmed to exist.
 
     // ── RDS env vars ──────────────────────────────────────────────────────────
     if let Some(ref rds) = cfg.rds {
@@ -514,9 +633,10 @@ pub fn apply_inner(ctx: &PluginContext, bucket_prefix: &str) -> PluginResult {
         result
             .env_vars
             .push(EnvVarSpec::value("POSTGRES_DB", &rds.db_name));
-        result
-            .env_vars
-            .push(EnvVarSpec::value("POSTGRES_USER", "dbadmin"));
+        result.env_vars.push(EnvVarSpec::value(
+            "POSTGRES_USER",
+            rds_db_user(rds.iam_auth, &cfg.app_name),
+        ));
         if rds.iam_auth {
             result
                 .env_vars
@@ -584,7 +704,7 @@ fn apply_with_aws(
         return PluginResult::default();
     }
 
-    let sa = workload_sa_name(&ctx.deployment_name);
+    let sa = workload_sa_name(&cfg.app_name);
 
     // ── 1. Ensure IAM role (OIDC-scoped trust policy) ─────────────────────────
     let role_arn = match iam::ensure_role(&cfg.role_name, &ctx.namespace, &sa, creds) {
@@ -603,19 +723,22 @@ fn apply_with_aws(
     let rds_endpoint = if let Some(ref rds_cfg) = cfg.rds {
         match rds::ensure_instance(rds_cfg, creds) {
             Ok((endpoint, resource_id)) => {
-                let rds_user = if rds_cfg.iam_auth { "dbadmin" } else { "*" };
-                let id_for_policy = if resource_id.is_empty() { &rds_cfg.identifier } else { &resource_id };
-                if let Err(e) = iam::attach_rds_policy(
-                    &cfg.role_name,
-                    id_for_policy,
-                    rds_user,
-                    &creds.region,
-                    creds,
-                ) {
-                    log!(
-                        LogLevel::Warn,
-                        "deckwatch-plugin-aws: attach_rds_policy: {e}"
-                    );
+                // rds-db:connect is scoped to the DbiResourceId, which is only
+                // known once the instance exists; the next reconcile attaches it.
+                if rds_cfg.iam_auth && !resource_id.is_empty() {
+                    let db_user = rds_db_user(true, &cfg.app_name);
+                    if let Err(e) = iam::attach_rds_policy(
+                        &cfg.role_name,
+                        &resource_id,
+                        &db_user,
+                        &creds.region,
+                        creds,
+                    ) {
+                        log!(
+                            LogLevel::Warn,
+                            "deckwatch-plugin-aws: attach_rds_policy: {e}"
+                        );
+                    }
                 }
                 if let Some(ref schedule) = rds_cfg.snapshot_schedule {
                     if let Err(e) = backup::configure_backup(
@@ -738,10 +861,12 @@ fn apply_with_aws(
     // ── 7. Build result ───────────────────────────────────────────────────────
     let mut result = apply_inner(ctx, bucket_prefix);
 
-    result.kubernetes_resources.clear();
-    result
-        .kubernetes_resources
-        .push(service_account_yaml(&sa, &role_arn, &ctx.namespace));
+    // The IAM role is confirmed to exist, so request the SA with its ARN.
+    // Deckwatch will create-or-patch the SA with the IRSA annotation.
+    result.wants_service_account = Some(WantsServiceAccount {
+        name: sa.clone(),
+        irsa_role_arn: role_arn.clone(),
+    });
 
     result.outputs.insert("role_arn".into(), role_arn);
     result.outputs.insert("service_account_name".into(), sa);
@@ -829,6 +954,40 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "RDS_DEFAULT_IAM_AUTH".into(), label: "RDS IAM Auth by Default".into(), description: "Enable IAM database authentication on all provisioned RDS instances. Default: true.".into(), field_type: ConfigFieldType::Bool, default: Some("true".into()), required: false, options: vec![], env_source: None },
         ],
         resources: vec![rds_resource(), s3_resource(), sqs_resource(), secretsmanager_resource()],
+        mcp_tuning_fields: vec![
+            McpTuningField {
+                key: "rds_naming_convention".into(),
+                label: "RDS Instance Naming Convention".into(),
+                description: "Convention for naming RDS instances created by this plugin. \
+                              Used by the AI agent when suggesting identifiers.".into(),
+                placeholder: "k2-{namespace}-{app}".into(),
+                default: None,
+            },
+            McpTuningField {
+                key: "s3_bucket_prefix_convention".into(),
+                label: "S3 Bucket Naming Convention".into(),
+                description: "Convention for naming S3 buckets created by this plugin. \
+                              Prepended or combined with the application name.".into(),
+                placeholder: "k2-{namespace}-{app}-".into(),
+                default: None,
+            },
+            McpTuningField {
+                key: "iam_role_path".into(),
+                label: "IAM Role Path".into(),
+                description: "Path prefix for IAM roles created by this plugin. \
+                              Must start and end with /. Mirrors the ROLE_PATH config key.".into(),
+                placeholder: "/deckwatch-plugin/".into(),
+                default: Some("/deckwatch-plugin/".into()),
+            },
+            McpTuningField {
+                key: "preferred_rds_instance_class".into(),
+                label: "Preferred RDS Instance Class".into(),
+                description: "Default RDS instance class to suggest when the operator does not \
+                              specify one. e.g. db.t3.micro for dev, db.r6g.large for prod.".into(),
+                placeholder: "db.t3.micro".into(),
+                default: None,
+            },
+        ],
     }))
 }
 
@@ -886,12 +1045,23 @@ pub fn rds_resource() -> PluginResource {
                 options: vec![],
                 env_source: None,
             },
+            ConfigField {
+                key: "iam_auth".into(),
+                label: "IAM Authentication".into(),
+                description: "Use IAM database authentication instead of a password. Provisions an IRSA role with rds-db:connect for the workload. Defaults to the RDS_DEFAULT_IAM_AUTH plugin setting.".into(),
+                field_type: ConfigFieldType::Bool,
+                default: None,
+                required: false,
+                options: vec![],
+                env_source: None,
+            },
         ],
         output_keys: vec![
             "DB_HOST".into(),
             "DB_PORT".into(),
             "DB_ENGINE".into(),
             "DB_NAME".into(),
+            "DB_IAM_AUTH".into(),
             "POSTGRES_HOST".into(),
             "POSTGRES_PORT".into(),
             "POSTGRES_DB".into(),
@@ -1056,7 +1226,6 @@ pub fn provision(
                 .filter(|s| !s.is_empty())
                 .cloned()
                 .unwrap_or_else(|| "app".to_string());
-
             let subnet_group = config::get("RDS_DEFAULT_SUBNET_GROUP")
                 .ok()
                 .flatten()
@@ -1069,16 +1238,21 @@ pub fn provision(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            let iam_auth = config::get("RDS_DEFAULT_IAM_AUTH")
-                .ok()
-                .flatten()
+            // The iam_auth form field wins when set; otherwise fall back to the
+            // RDS_DEFAULT_IAM_AUTH plugin setting (default true).
+            let iam_auth = req
+                .fields
+                .get("iam_auth")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| config::get("RDS_DEFAULT_IAM_AUTH").ok().flatten())
                 .map(|v| matches!(v.to_lowercase().as_str(), "true" | "yes" | "1"))
                 .unwrap_or(true);
 
             let cfg = RdsConfig {
-                identifier,
+                identifier: identifier.clone(),
                 engine: engine.clone(),
-                instance_class,
+                instance_class: instance_class.clone(),
                 allocated_storage: "20".to_string(),
                 db_name: db_name.clone(),
                 multi_az: false,
@@ -1091,8 +1265,8 @@ pub fn provision(
                 region: creds.region.clone(),
             };
 
-            // DB username: "k2crm" (IAM auth user) when IAM auth is on, else "dbadmin".
-            let db_user = if iam_auth { req.application_name.clone() } else { "dbadmin".to_string() };
+            let db_user = rds_db_user(iam_auth, &req.application_name);
+            let role_name = rds_role_name(&req.namespace, &req.application_name);
 
             match rds::ensure_instance(&cfg, &creds) {
                 Ok((endpoint, resource_id)) => {
@@ -1106,8 +1280,7 @@ pub fn provision(
                         // the application pod can generate RDS IAM auth tokens without
                         // storing any credentials.
                         if iam_auth && !resource_id.is_empty() {
-                            let role_name = format!("{}-{}-rds", req.namespace, req.application_name);
-                            let sa_name = format!("{}-aws-sa", req.application_name);
+                            let sa_name = workload_sa_name(&req.application_name);
                             match iam::ensure_role(&role_name, &req.namespace, &sa_name, &creds) {
                                 Ok(role_arn) => {
                                     if let Err(e) = iam::attach_rds_policy(
@@ -1117,7 +1290,13 @@ pub fn provision(
                                         &creds.region,
                                         &creds,
                                     ) {
-                                        log!(LogLevel::Warn, "deckwatch-plugin-aws: attach_rds_policy: {e}");
+                                        log!(
+                                            LogLevel::Warn,
+                                            "deckwatch-plugin-aws: attach_rds_policy: {e}"
+                                        );
+                                        result.warnings.push(format!(
+                                            "attach rds-db:connect policy to {role_name}: {e}"
+                                        ));
                                     }
                                     result.state.insert("DB_ROLE_ARN".into(), role_arn.clone());
                                     result.kubernetes_resources.push(service_account_yaml(
@@ -1128,14 +1307,21 @@ pub fn provision(
                                     result.state.insert("DB_SA_NAME".into(), sa_name);
                                 }
                                 Err(e) => {
-                                    log!(LogLevel::Warn, "deckwatch-plugin-aws: ensure_role for RDS: {e}");
+                                    log!(
+                                        LogLevel::Warn,
+                                        "deckwatch-plugin-aws: ensure_role for RDS: {e}"
+                                    );
+                                    result.warnings.push(format!(
+                                        "IAM role {role_name} not created; pods cannot use RDS IAM auth until it exists: {e}"
+                                    ));
                                 }
                             }
-                            result.state.insert("DB_IAM_AUTH".into(), "true".into());
                         }
 
                         result.state.insert("DB_HOST".into(), endpoint.clone());
-                        result.state.insert("POSTGRES_HOST".into(), endpoint.clone());
+                        result
+                            .state
+                            .insert("POSTGRES_HOST".into(), endpoint.clone());
                         result.state.insert("DB_STATUS".into(), "available".into());
                         result
                             .deployment_annotations
@@ -1147,12 +1333,24 @@ pub fn provision(
                     result.state.insert("DB_NAME".into(), db_name.clone());
                     result.state.insert("POSTGRES_DB".into(), db_name.clone());
                     result.state.insert("POSTGRES_USER".into(), db_user);
+                    if iam_auth {
+                        result.state.insert("DB_IAM_AUTH".into(), "true".into());
+                    }
                     result
                         .deployment_annotations
-                        .insert("deckwatch.io/aws-rds-engine".into(), engine);
+                        .insert("deckwatch.io/aws-rds-engine".into(), engine.clone());
                     result
                         .deployment_annotations
-                        .insert("deckwatch.io/aws-rds-db-name".into(), db_name);
+                        .insert("deckwatch.io/aws-rds-db-name".into(), db_name.clone());
+                    result.deployment_annotations.extend(rds_apply_annotations(
+                        &req.application_name,
+                        &identifier,
+                        &engine,
+                        &instance_class,
+                        &db_name,
+                        iam_auth,
+                        &role_name,
+                    ));
                 }
                 Err(e) => {
                     result.errors.push(format!("RDS provisioning error: {e}"));
@@ -1233,7 +1431,12 @@ pub fn provision(
 
             match sqs::ensure_queue(&cfg, &creds) {
                 Ok(info) => {
-                    let name = info.queue_arn.split(':').last().unwrap_or("").to_string();
+                    let name = info
+                        .queue_arn
+                        .split(':')
+                        .next_back()
+                        .unwrap_or("")
+                        .to_string();
                     result.state.insert("QUEUE_URL".into(), info.queue_url);
                     result.state.insert("QUEUE_NAME".into(), name);
                 }
@@ -1448,6 +1651,24 @@ mod tests {
                 .collect(),
             labels: HashMap::new(),
             plugin_outputs: HashMap::new(),
+            provisioned_resources: HashMap::new(),
+        }
+    }
+
+    fn ctx_with_labels(annotations: &[(&str, &str)], labels: &[(&str, &str)]) -> PluginContext {
+        PluginContext {
+            namespace: "production".into(),
+            deployment_name: "my-app".into(),
+            annotations: annotations
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            plugin_outputs: HashMap::new(),
+            provisioned_resources: HashMap::new(),
         }
     }
 
@@ -1466,9 +1687,11 @@ mod tests {
         assert!(result.env_vars.is_empty());
         assert!(result.kubernetes_resources.is_empty());
         assert!(result.service_account_name.is_none());
+        assert!(result.wants_service_account.is_none());
     }
 
-    // 2. Master opt-in with no sub-resources: no DB or S3 env vars but SA is present.
+    // 2. Master opt-in with no sub-resources: no DB or S3 env vars and no SA
+    //    (the SA is only requested after ensure_role succeeds).
     #[test]
     fn aws_enabled_alone_no_rds_no_s3() {
         let result = apply_inner(&ctx(&[("aws.deckwatch.io/enabled", "true")]), "");
@@ -1481,12 +1704,12 @@ mod tests {
             "no S3 env vars expected"
         );
         assert!(
-            result.service_account_name.is_none(),
-            "SA must NOT be set in apply_inner — only after successful IAM role creation"
+            result.wants_service_account.is_none(),
+            "SA must NOT be requested in apply_inner — only after successful IAM role creation"
         );
         assert!(
             result.kubernetes_resources.is_empty(),
-            "SA resource not emitted in apply_inner — only after successful IAM"
+            "SA must not be in kubernetes_resources"
         );
     }
 
@@ -1569,12 +1792,53 @@ mod tests {
         assert_eq!(find_env(&result, "S3_BUCKET"), Some("myorg-assets"));
     }
 
-    // 8. role-name defaults to <namespace>-<deployment>-role.
+    // 8. role-name defaults to <namespace>-<app_name>-role.
+    //    When no app label is set, app_name falls back to deployment_name.
     #[test]
     fn role_name_defaults() {
         let c = ctx(&[("aws.deckwatch.io/enabled", "true")]);
         let cfg = AwsConfig::from_context(&c);
         assert_eq!(cfg.role_name, "production-my-app-role");
+        assert_eq!(cfg.app_name, "my-app");
+    }
+
+    // 8b. app_name is derived from the app.kubernetes.io/name label when set,
+    //     so multiple deployments of the same app share one IAM role and SA.
+    #[test]
+    fn role_name_uses_app_label_when_set() {
+        let c = ctx_with_labels(
+            &[("aws.deckwatch.io/enabled", "true")],
+            &[("app.kubernetes.io/name", "my-service")],
+        );
+        let cfg = AwsConfig::from_context(&c);
+        assert_eq!(cfg.app_name, "my-service");
+        assert_eq!(cfg.role_name, "production-my-service-role");
+    }
+
+    // 8c. aws.deckwatch.io/app-name annotation overrides label.
+    #[test]
+    fn role_name_uses_annotation_override() {
+        let c = ctx_with_labels(
+            &[
+                ("aws.deckwatch.io/enabled", "true"),
+                ("aws.deckwatch.io/app-name", "shared-app"),
+            ],
+            &[("app.kubernetes.io/name", "my-service")],
+        );
+        let cfg = AwsConfig::from_context(&c);
+        assert_eq!(cfg.app_name, "shared-app");
+        assert_eq!(cfg.role_name, "production-shared-app-role");
+    }
+
+    // 8d. SA name is keyed on app_name, not deployment_name.
+    #[test]
+    fn sa_name_keyed_on_app_name() {
+        let c = ctx_with_labels(
+            &[("aws.deckwatch.io/enabled", "true")],
+            &[("app", "backend")],
+        );
+        let cfg = AwsConfig::from_context(&c);
+        assert_eq!(workload_sa_name(&cfg.app_name), "backend-aws-sa");
     }
 
     // 9. RDS identifier defaults to <namespace>-<deployment>-db (≤ 63 chars).
@@ -1609,20 +1873,56 @@ mod tests {
         );
     }
 
-    // 11. apply_inner does NOT emit a ServiceAccount — that only happens after
+    // 11. apply_inner does NOT request a ServiceAccount — that only happens after
     //     ensure_role() succeeds in apply_with_aws. This prevents a pod from
-    //     referencing an SA that was never created when IAM calls fail.
+    //     binding to an SA with no IRSA role when IAM calls fail.
     #[test]
     fn service_account_not_in_apply_inner() {
         let result = apply_inner(&ctx(&[("aws.deckwatch.io/enabled", "true")]), "");
         assert!(
-            result.kubernetes_resources.is_empty(),
-            "apply_inner must NOT emit SA kubernetes_resource — only apply_with_aws does after ensure_role succeeds"
+            result.wants_service_account.is_none(),
+            "apply_inner must NOT set wants_service_account — only apply_with_aws does after ensure_role succeeds"
         );
         assert!(
             result.service_account_name.is_none(),
             "service_account_name must NOT be set in apply_inner"
         );
+        assert!(
+            result.kubernetes_resources.is_empty(),
+            "apply_inner must NOT emit an SA kubernetes_resource"
+        );
+    }
+
+    // 11b. The annotations provision() stamps make apply() resolve the same
+    //      RDS instance, IAM role, ServiceAccount, and DB user — not the
+    //      <namespace>-<deployment> defaults, which would create duplicates.
+    #[test]
+    fn provision_annotations_round_trip_through_apply() {
+        let anns = rds_apply_annotations(
+            "radiation-db",
+            "rad-radiation-db",
+            "postgres",
+            "db.t3.micro",
+            "radiation",
+            true,
+            "rad-radiation-db-rds",
+        );
+        let pairs: Vec<(&str, &str)> = anns.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let c = ctx_with_labels(&pairs, &[("app", "some-other-label")]);
+        let cfg = AwsConfig::from_context(&c);
+
+        assert!(cfg.enabled);
+        assert_eq!(cfg.app_name, "radiation-db");
+        assert_eq!(cfg.role_name, "rad-radiation-db-rds");
+        assert_eq!(workload_sa_name(&cfg.app_name), "radiation-db-aws-sa");
+        let rds = cfg.rds.expect("rds must be enabled");
+        assert_eq!(rds.identifier, "rad-radiation-db");
+        assert_eq!(rds.db_name, "radiation");
+        assert!(rds.iam_auth);
+
+        let result = apply_inner(&c, "");
+        assert_eq!(find_env(&result, "POSTGRES_USER"), Some("radiation-db"));
+        assert_eq!(find_env(&result, "DB_NAME"), Some("radiation"));
     }
 
     // 12. MySQL engine → DB_PORT=3306.
@@ -1698,8 +1998,8 @@ mod tests {
         );
         assert_eq!(find_env(&result, "QUEUE_NAME"), Some("my-jobs"));
         assert!(
-            result.service_account_name.is_none(),
-            "SA not set in apply_inner"
+            result.wants_service_account.is_none(),
+            "SA not requested in apply_inner"
         );
     }
 

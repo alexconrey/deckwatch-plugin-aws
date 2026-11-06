@@ -18,7 +18,10 @@ use crate::{aws_sign, AwsCredentials, RdsConfig};
 /// an empty string as "provisioning in progress" and not block the deployment.
 /// Returns `(endpoint, resource_id)`. Both are empty strings when the instance
 /// was just created and is not yet in the `available` state.
-pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<(String, String), String> {
+pub fn ensure_instance(
+    cfg: &RdsConfig,
+    creds: &AwsCredentials,
+) -> Result<(String, String), String> {
     match describe_db_instance(&cfg.identifier, creds)? {
         Some(info) => {
             log!(
