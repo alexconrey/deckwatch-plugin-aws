@@ -42,7 +42,7 @@ use deckwatch_plugin_sdk::{
 #[cfg(target_arch = "wasm32")]
 use extism_pdk::*;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 use serde_json::json;
 
 // ── Annotation helpers ────────────────────────────────────────────────────────
@@ -277,6 +277,239 @@ fn rds_apply_annotations(
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect()
+}
+
+// ── IAM database user bootstrap ───────────────────────────────────────────────
+//
+// With IAM auth the workload connects as a Postgres user that must exist and be
+// granted `rds_iam`. RDS only creates the master user, and a WASM plugin cannot
+// open a Postgres connection, so provision() emits a one-shot Job that does it.
+//
+// The Job runs under its own ServiceAccount whose IRSA role can read only this
+// instance's master secret. An init container fetches the secret into a
+// memory-backed emptyDir; the psql container reads it, runs idempotent SQL, and
+// deletes it. The password never enters plugin state, a Kubernetes Secret, or
+// the workload's role.
+
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_BOOTSTRAP_AWSCLI_IMAGE: &str = "amazon/aws-cli:2.39.6";
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_BOOTSTRAP_PSQL_IMAGE: &str = "postgres:18-alpine";
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn bootstrap_name(app: &str) -> String {
+    format!("{app}-db-bootstrap")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn bootstrap_role_name(namespace: &str, app: &str) -> String {
+    format!("{namespace}-{app}-rds-bootstrap")
+}
+
+/// Idempotent SQL creating `db_user` for IAM auth with full use of `db_name`.
+///
+/// Both names are interpolated as quoted identifiers, so they are validated
+/// against the character sets Kubernetes app names and RDS DB names allow.
+#[cfg(any(target_arch = "wasm32", test))]
+fn bootstrap_sql(db_user: &str, db_name: &str) -> Result<String, String> {
+    let user_ok = !db_user.is_empty()
+        && db_user.len() <= 63
+        && db_user
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !user_ok {
+        return Err(format!("unsupported database user name {db_user:?}"));
+    }
+    let name_ok = db_name.len() <= 63
+        && db_name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && db_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !name_ok {
+        return Err(format!("unsupported database name {db_name:?}"));
+    }
+    Ok(format!(
+        r#"DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{db_user}') THEN
+    CREATE ROLE "{db_user}" WITH LOGIN;
+  END IF;
+END
+$$;
+GRANT rds_iam TO "{db_user}";
+GRANT CONNECT, CREATE, TEMPORARY ON DATABASE "{db_name}" TO "{db_user}";
+GRANT USAGE, CREATE ON SCHEMA public TO "{db_user}";
+"#
+    ))
+}
+
+/// Inputs for [`db_bootstrap_manifests`].
+#[cfg(any(target_arch = "wasm32", test))]
+struct BootstrapSpec<'a> {
+    namespace: &'a str,
+    app: &'a str,
+    role_arn: &'a str,
+    master_secret_arn: &'a str,
+    region: &'a str,
+    host: &'a str,
+    port: &'a str,
+    db_name: &'a str,
+    sql: &'a str,
+    awscli_image: &'a str,
+    psql_image: &'a str,
+}
+
+/// ServiceAccount + Job that create the IAM-auth database user.
+///
+/// The Job spec is deterministic so re-applying it on every provision/refresh
+/// is a no-op while it exists; once the TTL removes it, the next refresh
+/// re-runs the (idempotent) SQL.
+#[cfg(any(target_arch = "wasm32", test))]
+fn db_bootstrap_manifests(spec: &BootstrapSpec) -> Vec<serde_json::Value> {
+    let name = bootstrap_name(spec.app);
+    let labels = json!({
+        "app.kubernetes.io/managed-by": "deckwatch",
+        "app.kubernetes.io/component": "db-bootstrap",
+        "app.kubernetes.io/part-of": spec.app,
+        "plugin": "deckwatch-plugin-aws",
+    });
+    let no_escalation = json!({ "allowPrivilegeEscalation": false });
+
+    // Extract username/password from the secret JSON with busybox sed (no jq in
+    // the image), then undo JSON backslash escapes in the password.
+    let psql_script = r#"set -eu
+PGUSER=$(sed -nE 's/.*"username" *: *"([^"]*)".*/\1/p' /work/master.json)
+PGPASSWORD=$(sed -nE 's/.*"password" *: *"(([^"\\]|\\.)*)".*/\1/p' /work/master.json | sed -E 's/\\(.)/\1/g')
+rm -f /work/master.json
+export PGUSER PGPASSWORD
+printf '%s\n' "$BOOTSTRAP_SQL" | psql -v ON_ERROR_STOP=1 -f -
+echo "database user bootstrap complete""#;
+
+    let sa = json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": name,
+            "namespace": spec.namespace,
+            "annotations": { "eks.amazonaws.com/role-arn": spec.role_arn },
+            "labels": labels,
+        },
+    });
+
+    let job = json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": name,
+            "namespace": spec.namespace,
+            "labels": labels,
+        },
+        "spec": {
+            "backoffLimit": 6,
+            "activeDeadlineSeconds": 900,
+            "ttlSecondsAfterFinished": 86400,
+            "template": {
+                "metadata": { "labels": labels },
+                "spec": {
+                    "serviceAccountName": name,
+                    "restartPolicy": "Never",
+                    "volumes": [{
+                        "name": "work",
+                        "emptyDir": { "medium": "Memory", "sizeLimit": "1Mi" },
+                    }],
+                    "initContainers": [{
+                        "name": "fetch-master-secret",
+                        "image": spec.awscli_image,
+                        "command": [
+                            "/bin/sh", "-c",
+                            "aws secretsmanager get-secret-value --secret-id \"$MASTER_SECRET_ARN\" --query SecretString --output text > /work/master.json",
+                        ],
+                        "env": [
+                            { "name": "MASTER_SECRET_ARN", "value": spec.master_secret_arn },
+                            { "name": "AWS_REGION", "value": spec.region },
+                        ],
+                        "volumeMounts": [{ "name": "work", "mountPath": "/work" }],
+                        "securityContext": no_escalation,
+                    }],
+                    "containers": [{
+                        "name": "create-db-user",
+                        "image": spec.psql_image,
+                        "command": ["/bin/sh", "-c", psql_script],
+                        "env": [
+                            { "name": "PGHOST", "value": spec.host },
+                            { "name": "PGPORT", "value": spec.port },
+                            { "name": "PGDATABASE", "value": spec.db_name },
+                            { "name": "PGSSLMODE", "value": "require" },
+                            { "name": "BOOTSTRAP_SQL", "value": spec.sql },
+                        ],
+                        "volumeMounts": [{ "name": "work", "mountPath": "/work" }],
+                        "securityContext": no_escalation,
+                    }],
+                },
+            },
+        },
+    });
+
+    vec![sa, job]
+}
+
+/// Create the bootstrap IAM role (read-only access to this instance's master
+/// secret) and return the ServiceAccount + Job manifests.
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments)]
+fn db_user_bootstrap(
+    namespace: &str,
+    app: &str,
+    engine: &str,
+    instance: &rds::RdsInstance,
+    port: &str,
+    db_name: &str,
+    db_user: &str,
+    creds: &AwsCredentials,
+) -> Result<Vec<serde_json::Value>, String> {
+    if engine != "postgres" {
+        return Err(format!(
+            "automatic user creation supports postgres only, not {engine}"
+        ));
+    }
+    if instance.master_secret_arn.is_empty() {
+        return Err("instance has no RDS-managed master secret".into());
+    }
+    let sql = bootstrap_sql(db_user, db_name)?;
+
+    let role_name = bootstrap_role_name(namespace, app);
+    let role_arn = iam::ensure_role(&role_name, namespace, &bootstrap_name(app), creds)
+        .map_err(|e| format!("bootstrap IAM role {role_name}: {e}"))?;
+    iam::attach_secretsmanager_policy(
+        &role_name,
+        std::slice::from_ref(&instance.master_secret_arn),
+        creds,
+    )
+    .map_err(|e| format!("grant {role_name} read on master secret: {e}"))?;
+
+    let cfg_or = |key: &str, default: &str| {
+        config::get(key)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default.to_string())
+    };
+    let awscli_image = cfg_or("DB_BOOTSTRAP_AWSCLI_IMAGE", DEFAULT_BOOTSTRAP_AWSCLI_IMAGE);
+    let psql_image = cfg_or("DB_BOOTSTRAP_PSQL_IMAGE", DEFAULT_BOOTSTRAP_PSQL_IMAGE);
+
+    Ok(db_bootstrap_manifests(&BootstrapSpec {
+        namespace,
+        app,
+        role_arn: &role_arn,
+        master_secret_arn: &instance.master_secret_arn,
+        region: &creds.region,
+        host: &instance.endpoint,
+        port,
+        db_name,
+        sql: &sql,
+        awscli_image: &awscli_image,
+        psql_image: &psql_image,
+    }))
 }
 
 fn engine_port(engine: &str) -> u16 {
@@ -722,14 +955,14 @@ fn apply_with_aws(
     // ── 2. RDS ────────────────────────────────────────────────────────────────
     let rds_endpoint = if let Some(ref rds_cfg) = cfg.rds {
         match rds::ensure_instance(rds_cfg, creds) {
-            Ok((endpoint, resource_id)) => {
+            Ok(instance) => {
                 // rds-db:connect is scoped to the DbiResourceId, which is only
                 // known once the instance exists; the next reconcile attaches it.
-                if rds_cfg.iam_auth && !resource_id.is_empty() {
+                if rds_cfg.iam_auth && !instance.resource_id.is_empty() {
                     let db_user = rds_db_user(true, &cfg.app_name);
                     if let Err(e) = iam::attach_rds_policy(
                         &cfg.role_name,
-                        &resource_id,
+                        &instance.resource_id,
                         &db_user,
                         &creds.region,
                         creds,
@@ -755,7 +988,7 @@ fn apply_with_aws(
                         );
                     }
                 }
-                endpoint
+                instance.endpoint
             }
             Err(e) => {
                 log!(
@@ -952,6 +1185,8 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "RDS_DEFAULT_SUBNET_GROUP".into(), label: "RDS Default Subnet Group".into(), description: "DB subnet group name for all provisioned RDS instances. Required to place instances in the correct VPC.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "RDS_DEFAULT_SECURITY_GROUPS".into(), label: "RDS Default Security Groups".into(), description: "Comma-separated VPC security group IDs applied to all provisioned RDS instances.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "RDS_DEFAULT_IAM_AUTH".into(), label: "RDS IAM Auth by Default".into(), description: "Enable IAM database authentication on all provisioned RDS instances. Default: true.".into(), field_type: ConfigFieldType::Bool, default: Some("true".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "DB_BOOTSTRAP_AWSCLI_IMAGE".into(), label: "DB Bootstrap AWS CLI Image".into(), description: "Image for the init container that reads the RDS master secret when creating the IAM database user.".into(), field_type: ConfigFieldType::String, default: Some(DEFAULT_BOOTSTRAP_AWSCLI_IMAGE.into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "DB_BOOTSTRAP_PSQL_IMAGE".into(), label: "DB Bootstrap psql Image".into(), description: "Image with psql used to create the IAM database user. Match or exceed the RDS engine major version.".into(), field_type: ConfigFieldType::String, default: Some(DEFAULT_BOOTSTRAP_PSQL_IMAGE.into()), required: false, options: vec![], env_source: None },
         ],
         resources: vec![rds_resource(), s3_resource(), sqs_resource(), secretsmanager_resource()],
         mcp_tuning_fields: vec![
@@ -1269,8 +1504,10 @@ pub fn provision(
             let role_name = rds_role_name(&req.namespace, &req.application_name);
 
             match rds::ensure_instance(&cfg, &creds) {
-                Ok((endpoint, resource_id)) => {
+                Ok(instance) => {
                     let port = engine_port(&engine).to_string();
+                    let endpoint = instance.endpoint.clone();
+                    let resource_id = instance.resource_id.clone();
                     if endpoint.is_empty() {
                         result
                             .state
@@ -1305,6 +1542,32 @@ pub fn provision(
                                         &req.namespace,
                                     ));
                                     result.state.insert("DB_SA_NAME".into(), sa_name);
+
+                                    // Create the IAM-auth database user. Nothing else
+                                    // does, and without it Postgres rejects the token.
+                                    match db_user_bootstrap(
+                                        &req.namespace,
+                                        &req.application_name,
+                                        &engine,
+                                        &instance,
+                                        &port,
+                                        &db_name,
+                                        &db_user,
+                                        &creds,
+                                    ) {
+                                        Ok(resources) => {
+                                            result.kubernetes_resources.extend(resources)
+                                        }
+                                        Err(e) => {
+                                            log!(
+                                                LogLevel::Warn,
+                                                "deckwatch-plugin-aws: db user bootstrap: {e}"
+                                            );
+                                            result.warnings.push(format!(
+                                                "database user {db_user} not bootstrapped; create it and GRANT rds_iam manually: {e}"
+                                            ));
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     log!(
@@ -2075,5 +2338,121 @@ mod tests {
         assert_eq!(r.id, "secretsmanager");
         assert!(r.singleton);
         assert!(r.output_keys.iter().any(|k| k == "SM_SECRET_ARN"));
+    }
+
+    // ── IAM database user bootstrap ──────────────────────────────────────────
+
+    #[test]
+    fn bootstrap_sql_creates_iam_user_idempotently() {
+        let sql = bootstrap_sql("radiation-db", "radiation").unwrap();
+        assert!(sql.contains("WHERE rolname = 'radiation-db'"));
+        assert!(sql.contains(r#"CREATE ROLE "radiation-db" WITH LOGIN;"#));
+        assert!(sql.contains(r#"GRANT rds_iam TO "radiation-db";"#));
+        assert!(sql.contains(r#"ON DATABASE "radiation" TO "radiation-db";"#));
+        assert!(sql.contains(r#"ON SCHEMA public TO "radiation-db";"#));
+        assert!(
+            !sql.contains("PASSWORD"),
+            "IAM users must not get a password"
+        );
+    }
+
+    #[test]
+    fn bootstrap_sql_rejects_unsafe_identifiers() {
+        for user in ["", "Robert", "a\"; DROP ROLE x; --", "a'b", &"a".repeat(64)] {
+            assert!(
+                bootstrap_sql(user, "app").is_err(),
+                "user {user:?} must be rejected"
+            );
+        }
+        for db in ["", "1app", "app-db", "app\"x", &"a".repeat(64)] {
+            assert!(
+                bootstrap_sql("app", db).is_err(),
+                "db {db:?} must be rejected"
+            );
+        }
+        assert!(bootstrap_sql("my-app-2", "App_db1").is_ok());
+    }
+
+    fn sample_bootstrap() -> Vec<serde_json::Value> {
+        let sql = bootstrap_sql("radiation-db", "radiation").unwrap();
+        db_bootstrap_manifests(&BootstrapSpec {
+            namespace: "rad",
+            app: "radiation-db",
+            role_arn: "arn:aws-us-gov:iam::123456789012:role/deckwatch-plugin/rad-radiation-db-rds-bootstrap",
+            master_secret_arn: "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:rds!db-abc",
+            region: "us-gov-west-1",
+            host: "rad-radiation-db.example.rds.amazonaws.com",
+            port: "5432",
+            db_name: "radiation",
+            sql: &sql,
+            awscli_image: "amazon/aws-cli:test",
+            psql_image: "postgres:test",
+        })
+    }
+
+    #[test]
+    fn bootstrap_emits_dedicated_irsa_sa_and_job() {
+        let out = sample_bootstrap();
+        assert_eq!(out.len(), 2);
+        let (sa, job) = (&out[0], &out[1]);
+
+        assert_eq!(sa["kind"], "ServiceAccount");
+        assert_eq!(sa["metadata"]["name"], "radiation-db-db-bootstrap");
+        assert_eq!(sa["metadata"]["namespace"], "rad");
+        assert!(sa["metadata"]["annotations"]["eks.amazonaws.com/role-arn"]
+            .as_str()
+            .unwrap()
+            .ends_with("/rad-radiation-db-rds-bootstrap"));
+
+        assert_eq!(job["apiVersion"], "batch/v1");
+        assert_eq!(job["kind"], "Job");
+        assert_eq!(job["metadata"]["name"], "radiation-db-db-bootstrap");
+        let pod = &job["spec"]["template"]["spec"];
+        // Runs as the bootstrap SA, never the workload SA (which must not be
+        // able to read the master secret).
+        assert_eq!(pod["serviceAccountName"], "radiation-db-db-bootstrap");
+        assert_eq!(pod["restartPolicy"], "Never");
+        assert_eq!(pod["volumes"][0]["emptyDir"]["medium"], "Memory");
+        assert!(job["spec"]["ttlSecondsAfterFinished"].is_number());
+    }
+
+    #[test]
+    fn bootstrap_job_wires_secret_and_connection_without_embedding_credentials() {
+        let out = sample_bootstrap();
+        let pod = &out[1]["spec"]["template"]["spec"];
+        let env = |c: &serde_json::Value, k: &str| -> Option<String> {
+            c["env"].as_array()?.iter().find(|e| e["name"] == k)?["value"]
+                .as_str()
+                .map(String::from)
+        };
+
+        let init = &pod["initContainers"][0];
+        assert_eq!(init["image"], "amazon/aws-cli:test");
+        assert_eq!(
+            env(init, "MASTER_SECRET_ARN").as_deref(),
+            Some("arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:rds!db-abc")
+        );
+
+        let main = &pod["containers"][0];
+        assert_eq!(main["image"], "postgres:test");
+        assert_eq!(
+            env(main, "PGHOST").as_deref(),
+            Some("rad-radiation-db.example.rds.amazonaws.com")
+        );
+        assert_eq!(env(main, "PGDATABASE").as_deref(), Some("radiation"));
+        assert_eq!(env(main, "PGSSLMODE").as_deref(), Some("require"));
+        assert!(env(main, "BOOTSTRAP_SQL")
+            .unwrap()
+            .contains("GRANT rds_iam"));
+        assert!(
+            env(main, "PGPASSWORD").is_none(),
+            "password is read at runtime, never set in the spec"
+        );
+
+        // The secret is only ever referenced by ARN; nothing secret-shaped is
+        // serialized into the manifests.
+        let all = serde_json::to_string(&out).unwrap();
+        assert!(!all.to_lowercase().contains("\"password\":"));
+        assert!(!all.contains("\"kind\":\"Secret\""));
     }
 }
