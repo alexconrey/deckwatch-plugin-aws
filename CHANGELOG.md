@@ -8,6 +8,12 @@ history.
 ## [Unreleased]
 
 ### Added
+- **Apps can write their own secrets.** A Secrets Manager secret the plugin
+  creates for an app now also grants `PutSecretValue`, so pods using the app's
+  ServiceAccount can set its value (`SM_SECRET_ARN` is injected). Provisioning
+  marks it with `secretsmanager.deckwatch.io/owned-secret-arns`. Secrets
+  referenced with `secret-arns` stay read-only. With `RESOURCE_NAME_PREFIX` set,
+  write access applies only to names under the prefix.
 - `RDS_BACKUP_RETENTION_DAYS` (default **14**, range 1–35) and `RDS_BACKUP_WINDOW`
   config keys.
 - `RESOURCE_NAME_PREFIX`: prepended to every SQS queue and Secrets Manager secret

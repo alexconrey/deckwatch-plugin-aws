@@ -88,12 +88,25 @@ What gets created:
 | `secret_name` | `<namespace>/<app>` | Name or path. |
 
 What gets created:
-- An **empty** secret. Populate the value yourself or from CI.
-- The `deckwatch-secretsmanager-access` inline policy (`GetSecretValue` and
-  `DescribeSecret` on that secret) on the app's workload role.
+- An **empty** secret. If a secret with that name already exists, it's adopted
+  as is, value included.
+- The `deckwatch-secretsmanager-access` inline policy on the app's workload role,
+  covering that secret: `GetSecretValue` and `DescribeSecret`, plus
+  **`PutSecretValue`**, so the app can set its own values.
 - The `<app>-aws-sa` ServiceAccount.
-- A `secretsmanager.deckwatch.io/secret-arns` annotation. It grants access without
-  `enabled`, so reconciles re-assert read access but never create another secret.
+- `SM_SECRET_ARN` and `SM_SECRET_NAME` env vars in every deployment of the app.
+- A `secretsmanager.deckwatch.io/owned-secret-arns` annotation. It grants access
+  without `enabled`, so reconciles re-assert read and write access but never
+  create another secret.
+
+To set the value from a pod using the app's ServiceAccount:
+
+```bash
+aws secretsmanager put-secret-value --secret-id "$SM_SECRET_ARN" \
+  --secret-string '{"API_KEY":"…"}'
+```
+
+Reads fail until the first value is set.
 
 ## Annotation reference
 
@@ -160,7 +173,8 @@ RDS instances are always created in the plugin's `AWS_REGION`.
 
 | Annotation | Default | Notes |
 |---|---|---|
-| `secretsmanager.deckwatch.io/secret-arns` | *(none)* | Comma-separated ARNs of existing secrets to grant `GetSecretValue` and `DescribeSecret` on. |
+| `secretsmanager.deckwatch.io/secret-arns` | *(none)* | Comma-separated ARNs of existing secrets to grant **read** access on (`GetSecretValue`, `DescribeSecret`). |
+| `secretsmanager.deckwatch.io/owned-secret-arns` | *(none)* | Secrets the plugin created for the app (stamped by provisioning). Read **and** `PutSecretValue`. With `RESOURCE_NAME_PREFIX` set, write access only applies to names under the prefix. |
 | `secretsmanager.deckwatch.io/enabled` | `false` | Also create a managed (empty) secret and grant access to it. |
 | `secretsmanager.deckwatch.io/secret-name` | `<namespace>/<deployment>` | Name for the created secret. |
 
