@@ -217,6 +217,31 @@ fn default_sqs_queue_name(namespace: &str, deployment: &str) -> String {
     format!("{namespace}-{deployment}-queue")
 }
 
+/// `name` with `prefix` in front, unless it already starts with it.
+///
+/// Applied to every SQS queue and Secrets Manager secret name (defaults and
+/// user-chosen names alike) from `RESOURCE_NAME_PREFIX`, so the plugin's IAM
+/// policy can be scoped to `…:<prefix>*` instead of every queue or secret in
+/// the account. Idempotent, so names stamped in annotations aren't prefixed
+/// twice on reconcile.
+fn prefixed_name(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() || name.starts_with(prefix) {
+        name.to_string()
+    } else {
+        format!("{prefix}{name}")
+    }
+}
+
+/// `RESOURCE_NAME_PREFIX` from plugin config (empty when unset).
+#[cfg(target_arch = "wasm32")]
+fn configured_resource_name_prefix() -> String {
+    config::get("RESOURCE_NAME_PREFIX")
+        .ok()
+        .flatten()
+        .map(|p| p.trim().to_string())
+        .unwrap_or_default()
+}
+
 fn default_secret_name(namespace: &str, deployment: &str) -> String {
     format!("{namespace}/{deployment}")
 }
@@ -988,6 +1013,19 @@ fn derive_app_name(ctx: &PluginContext) -> &str {
 }
 
 impl AwsConfig {
+    /// [`from_context`](Self::from_context) with `RESOURCE_NAME_PREFIX` applied
+    /// to SQS queue and Secrets Manager secret names.
+    pub fn from_context_with_prefix(ctx: &PluginContext, resource_prefix: &str) -> Self {
+        let mut cfg = Self::from_context(ctx);
+        if let Some(ref mut sqs) = cfg.sqs {
+            sqs.queue_name = prefixed_name(resource_prefix, &sqs.queue_name);
+        }
+        if let Some(ref mut sm) = cfg.secretsmanager {
+            sm.secret_name = prefixed_name(resource_prefix, &sm.secret_name);
+        }
+        cfg
+    }
+
     pub fn from_context(ctx: &PluginContext) -> Self {
         let rds_enabled = ann_bool(ctx, "rds.deckwatch.io/enabled", false);
         let s3_enabled = ann_bool(ctx, "s3.deckwatch.io/enabled", false);
@@ -1260,7 +1298,16 @@ fn service_account_yaml(sa_name: &str, role_arn: &str, namespace: &str) -> serde
 /// `bucket_prefix` mirrors the `BUCKET_PREFIX` extism config key. Pass `""` in
 /// tests that do not exercise prefix behaviour.
 pub fn apply_inner(ctx: &PluginContext, bucket_prefix: &str) -> PluginResult {
-    let cfg = AwsConfig::from_context(ctx);
+    apply_inner_with_prefixes(ctx, bucket_prefix, "")
+}
+
+/// [`apply_inner`] with `RESOURCE_NAME_PREFIX` applied to queue and secret names.
+pub fn apply_inner_with_prefixes(
+    ctx: &PluginContext,
+    bucket_prefix: &str,
+    resource_prefix: &str,
+) -> PluginResult {
+    let cfg = AwsConfig::from_context_with_prefix(ctx, resource_prefix);
     if !cfg.enabled {
         return PluginResult::default();
     }
@@ -1356,8 +1403,9 @@ fn apply_with_aws(
     ctx: &PluginContext,
     creds: &AwsCredentials,
     bucket_prefix: &str,
+    resource_prefix: &str,
 ) -> PluginResult {
-    let cfg = AwsConfig::from_context(ctx);
+    let cfg = AwsConfig::from_context_with_prefix(ctx, resource_prefix);
     if !cfg.enabled {
         return PluginResult::default();
     }
@@ -1373,7 +1421,7 @@ fn apply_with_aws(
                 "deckwatch-plugin-aws: ensure_role failed: {e}"
             );
             // Fall back to static result so the deployment isn't blocked.
-            return apply_inner(ctx, bucket_prefix);
+            return apply_inner_with_prefixes(ctx, bucket_prefix, resource_prefix);
         }
     };
 
@@ -1522,7 +1570,7 @@ fn apply_with_aws(
     };
 
     // ── 7. Build result ───────────────────────────────────────────────────────
-    let mut result = apply_inner(ctx, bucket_prefix);
+    let mut result = apply_inner_with_prefixes(ctx, bucket_prefix, resource_prefix);
 
     // The IAM role is confirmed to exist, so request the SA with its ARN.
     // Deckwatch will create-or-patch the SA with the IRSA annotation.
@@ -1609,6 +1657,7 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "IAM_SIGNING_REGION".into(), label: "IAM Signing Region".into(), description: "Override Sig V4 region for IAM. Auto-detected from region.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "ROLE_PATH".into(), label: "IAM Role Path".into(), description: "Path prefix for created roles. Must start and end with /.".into(), field_type: ConfigFieldType::String, default: Some("/deckwatch-plugin/".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "BUCKET_PREFIX".into(), label: "S3 Bucket Prefix".into(), description: "Prepended to all S3 bucket names (e.g. myorg-).".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "RESOURCE_NAME_PREFIX".into(), label: "Resource Name Prefix".into(), description: "Prepended to every SQS queue and Secrets Manager secret name (e.g. k2-dw-), so the plugin's IAM policy can be scoped to <prefix>* instead of all queues and secrets in the account.".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "AWS_ACCESS_KEY_ID".into(), label: "Access Key ID".into(), description: "Static AWS access key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_ACCESS_KEY_ID".into()) },
             ConfigField { key: "AWS_SECRET_ACCESS_KEY".into(), label: "Secret Access Key".into(), description: "Static AWS secret key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SECRET_ACCESS_KEY".into()) },
             ConfigField { key: "AWS_SESSION_TOKEN".into(), label: "Session Token".into(), description: "Temporary session token for assumed-role or SSO credentials. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SESSION_TOKEN".into()) },
@@ -2177,6 +2226,7 @@ pub fn provision(
                 .filter(|s| !s.is_empty())
                 .cloned()
                 .unwrap_or_else(|| default_sqs_queue_name(&req.namespace, &req.application_name));
+            let queue_name = prefixed_name(&configured_resource_name_prefix(), &queue_name);
             let fifo = req
                 .fields
                 .get("fifo")
@@ -2241,6 +2291,7 @@ pub fn provision(
                 .filter(|s| !s.is_empty())
                 .cloned()
                 .unwrap_or_else(|| default_secret_name(&req.namespace, &req.application_name));
+            let secret_name = prefixed_name(&configured_resource_name_prefix(), &secret_name);
             let desc = format!(
                 "Managed by deckwatch for {}/{}",
                 req.namespace, req.application_name
@@ -2423,6 +2474,7 @@ pub fn deprovision(
                 .or_else(|| req.fields.get("secret_name"))
                 .cloned()
                 .unwrap_or_else(|| default_secret_name(&req.namespace, &req.application_name));
+            let secret_name = prefixed_name(&configured_resource_name_prefix(), &secret_name);
             match secretsmanager::schedule_delete_secret(&secret_name, 30, &creds) {
                 Ok(deletion_date) => {
                     notes.push(format!(
@@ -2560,6 +2612,12 @@ fn delete_role_if_unused(
 #[cfg(target_arch = "wasm32")]
 #[plugin_fn]
 pub fn apply(Json(ctx): Json<PluginContext>) -> FnResult<Json<PluginResult>> {
+    let bucket_prefix = config::get("BUCKET_PREFIX")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let resource_prefix = configured_resource_name_prefix();
+
     let creds = match AwsCredentials::from_config() {
         Ok(c) => c,
         Err(e) => {
@@ -2567,15 +2625,15 @@ pub fn apply(Json(ctx): Json<PluginContext>) -> FnResult<Json<PluginResult>> {
                 LogLevel::Error,
                 "deckwatch-plugin-aws: credentials error: {e}"
             );
-            return Ok(Json(apply_inner(&ctx, "")));
+            return Ok(Json(apply_inner_with_prefixes(
+                &ctx,
+                &bucket_prefix,
+                &resource_prefix,
+            )));
         }
     };
 
-    let bucket_prefix = config::get("BUCKET_PREFIX")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let result = apply_with_aws(&ctx, &creds, &bucket_prefix);
+    let result = apply_with_aws(&ctx, &creds, &bucket_prefix, &resource_prefix);
     Ok(Json(result))
 }
 
@@ -3052,6 +3110,65 @@ mod tests {
         assert_eq!(
             backup_plan_id(r#"{"BackupPlansList":[]}"#, "mydb-backup"),
             None
+        );
+    }
+
+    // ── RESOURCE_NAME_PREFIX ──────────────────────────────────────────────────
+
+    #[test]
+    fn prefixed_name_is_idempotent() {
+        assert_eq!(
+            prefixed_name("k2-dw-", "orders-queue"),
+            "k2-dw-orders-queue"
+        );
+        assert_eq!(
+            prefixed_name("k2-dw-", "k2-dw-orders-queue"),
+            "k2-dw-orders-queue"
+        );
+        assert_eq!(prefixed_name("", "orders-queue"), "orders-queue");
+    }
+
+    // Defaults and user-chosen names both get the prefix, so an IAM policy
+    // scoped to <prefix>* covers everything the plugin creates.
+    #[test]
+    fn resource_prefix_applies_to_queue_and_secret_names() {
+        let c = ctx(&[
+            ("sqs.deckwatch.io/enabled", "true"),
+            ("secretsmanager.deckwatch.io/enabled", "true"),
+        ]);
+        let cfg = AwsConfig::from_context_with_prefix(&c, "k2-dw-");
+        assert_eq!(cfg.sqs.unwrap().queue_name, "k2-dw-production-my-app-queue");
+        assert_eq!(
+            cfg.secretsmanager.unwrap().secret_name,
+            "k2-dw-production/my-app"
+        );
+
+        let named = ctx(&[
+            ("sqs.deckwatch.io/enabled", "true"),
+            ("sqs.deckwatch.io/queue-name", "orders"),
+            ("sqs.deckwatch.io/fifo", "true"),
+        ]);
+        let result = apply_inner_with_prefixes(&named, "", "k2-dw-");
+        assert_eq!(find_env(&result, "QUEUE_NAME"), Some("k2-dw-orders.fifo"));
+    }
+
+    // provision() stamps the already-prefixed name; reconciling it must not
+    // produce k2-dw-k2-dw-… (which would create a second queue).
+    #[test]
+    fn stamped_prefixed_queue_name_is_not_prefixed_again() {
+        let anns = sqs_apply_annotations("orders", "k2-dw-orders-events", false, 30, 4, "r");
+        let pairs: Vec<(&str, &str)> = anns.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let cfg = AwsConfig::from_context_with_prefix(&ctx(&pairs), "k2-dw-");
+        assert_eq!(cfg.sqs.unwrap().queue_name, "k2-dw-orders-events");
+    }
+
+    // Without a prefix configured, names are unchanged.
+    #[test]
+    fn apply_inner_without_prefix_is_unchanged() {
+        let c = ctx(&[("sqs.deckwatch.io/enabled", "true")]);
+        assert_eq!(
+            find_env(&apply_inner(&c, ""), "QUEUE_NAME"),
+            Some("production-my-app-queue")
         );
     }
 

@@ -957,6 +957,77 @@ async fn rds_deprovision_always_takes_a_final_snapshot() {
     );
 }
 
+/// With RESOURCE_NAME_PREFIX set, every queue and secret the plugin creates is
+/// named <prefix>…, so its IAM policy can be scoped to <prefix>* instead of all
+/// queues and secrets in the account. Reconciling the stamped annotations must
+/// reuse the same queue, never create a double-prefixed one.
+#[tokio::test]
+async fn resource_name_prefix_scopes_queue_and_secret_names() {
+    let region = "us-gov-west-1";
+    let prefix = format!("k2-dw-{}-", run_id());
+    let (ns, app) = ("prefix-it", unique("prefixed"));
+    let mut plugin = load_plugin(region, &[("RESOURCE_NAME_PREFIX", prefix.as_str())]);
+
+    let sqs_req = resource_request(app, ns, "sqs", &[("queue_name", "orders")]);
+    let sqs_res = call_provision(&mut plugin, &sqs_req);
+    assert!(
+        sqs_res.errors.is_empty(),
+        "provision errors: {:?}",
+        sqs_res.errors
+    );
+    let queue_name = format!("{prefix}orders");
+    assert_eq!(sqs_res.state.get("QUEUE_NAME"), Some(&queue_name));
+    assert_eq!(
+        sqs_res
+            .deployment_annotations
+            .get("sqs.deckwatch.io/queue-name"),
+        Some(&queue_name),
+        "the stamped name is already prefixed"
+    );
+
+    let sm_req = resource_request(app, ns, "secretsmanager", &[]);
+    let sm_res = call_provision(&mut plugin, &sm_req);
+    assert!(
+        sm_res.errors.is_empty(),
+        "provision errors: {:?}",
+        sm_res.errors
+    );
+    assert_eq!(
+        sm_res.state.get("SM_SECRET_NAME"),
+        Some(&format!("{prefix}{ns}/{app}"))
+    );
+
+    // Reconcile: apply() with the stamped annotations reuses the same queue.
+    let applied = call_apply(
+        &mut plugin,
+        &PluginContext {
+            namespace: ns.into(),
+            deployment_name: "worker".into(),
+            annotations: sqs_res.deployment_annotations.clone(),
+            labels: HashMap::new(),
+            plugin_outputs: HashMap::new(),
+            provisioned_resources: HashMap::new(),
+        },
+    );
+    assert_eq!(
+        applied.outputs.get("queue_url"),
+        sqs_res.state.get("QUEUE_URL")
+    );
+    let queues = sqs_client(region)
+        .await
+        .list_queues()
+        .queue_name_prefix(&prefix)
+        .send()
+        .await
+        .expect("list queues");
+    assert_eq!(
+        queues.queue_urls().len(),
+        1,
+        "no double-prefixed duplicate queue: {:?}",
+        queues.queue_urls()
+    );
+}
+
 /// A malformed AWS_ENDPOINT_URL must fail provisioning outright rather than
 /// fall back to real AWS endpoints.
 #[test]
