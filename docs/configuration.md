@@ -24,7 +24,7 @@ deckwatch can load the plugin from a GitHub release, a URL, or an uploaded file.
   "source": {
     "type": "github",
     "repo": "alexconrey/deckwatch-plugin-aws",
-    "ref": "v0.7.2",
+    "ref": "v0.8.0",
     "path": "plugin.wasm",
     "use_release": true
   }
@@ -164,8 +164,8 @@ the permissions below. The list comes from the API calls in `src/`. Replace
       "Sid": "WorkloadRoles",
       "Effect": "Allow",
       "Action": [
-        "iam:CreateRole", "iam:UpdateAssumeRolePolicy", "iam:PutRolePolicy",
-        "iam:DeleteRolePolicy", "iam:DeleteRole"
+        "iam:CreateRole", "iam:TagRole", "iam:UpdateAssumeRolePolicy",
+        "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:DeleteRole"
       ],
       "Resource": "arn:<partition>:iam::<account>:role/deckwatch-plugin/*"
     },
@@ -221,7 +221,10 @@ the permissions below. The list comes from the API calls in `src/`. Replace
     {
       "Sid": "Backup",
       "Effect": "Allow",
-      "Action": ["backup:CreateBackupPlan", "backup:ListBackupPlans", "backup:CreateBackupSelection"],
+      "Action": [
+        "backup:CreateBackupPlan", "backup:ListBackupPlans",
+        "backup:CreateBackupSelection", "backup:TagResource"
+      ],
       "Resource": "*"
     },
     {
@@ -255,12 +258,17 @@ Notes:
   it to the role in `rds.deckwatch.io/backup-role-arn`.
 - **Trust for `AssumeRoleWithWebIdentity`** goes on the plugin role's trust policy,
   for deckwatch's ServiceAccount, not in this permissions policy.
-- **Tagging permissions:** `iam:TagRole`, `rds:AddTagsToResource`,
-  `s3:Get/PutBucketTagging`, `sqs:TagQueue`, `secretsmanager:TagResource` and
-  `backup:TagResource` are needed when [resource tags](#resource-tags) are applied.
-  The managed `deckwatch.io/*` tags are always applied. AWS also requires the
-  tagging permission for tags passed *at creation*, e.g. `sqs:TagQueue` for
-  `CreateQueue` with tags.
+- **The tagging permissions are required, not optional.** Every create call
+  carries at least the managed `deckwatch.io/*` [tags](#resource-tags), and AWS
+  checks tags passed at creation against the tagging action. Without
+  `iam:TagRole`, `CreateRole` fails, and so the workload gets no role or
+  ServiceAccount. The same goes for `rds:AddTagsToResource` (`CreateDBInstance`),
+  `sqs:TagQueue` (`CreateQueue`) and `secretsmanager:TagResource`
+  (`CreateSecret`). `backup:TagResource` covers the backup plan's tags.
+  `s3:GetBucketTagging` and `s3:PutBucketTagging` merge bucket tags after the
+  bucket is created.
+- **moto doesn't check IAM**, so the integration tests can't catch a missing
+  permission. This list is maintained by hand from the API calls in `src/`.
 
 ### Scoping SQS and Secrets Manager to a prefix
 
@@ -297,5 +305,10 @@ tags, which configuration can't override:
 Tagging only adds or updates the plugin's keys. Other tags on a resource are left
 alone, and removing a key from `RESOURCE_TAGS` doesn't remove it from existing
 resources. If `RESOURCE_TAGS` is invalid, the plugin applies only the managed
-tags and reports the problem as a provisioning warning. Tagging failures are
-warnings too; they never block provisioning.
+tags and reports the problem as a provisioning warning.
+
+Re-tagging an existing resource (`TagRole`, `AddTagsToResource`, `TagQueue`,
+`TagResource`, the S3 merge) is best-effort: a failure is logged or reported as a
+warning and never blocks provisioning. **Creates are different.** Tags are part
+of the create call, so if the plugin lacks a
+[tagging permission](#plugin-iam-permissions), the create itself is denied.

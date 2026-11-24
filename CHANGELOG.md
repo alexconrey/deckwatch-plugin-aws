@@ -7,88 +7,100 @@ history.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-24
+
+### Upgrade notes
+- **New plugin IAM permissions.** Grant these before relying on the new
+  behaviour; [docs/configuration.md](docs/configuration.md#plugin-iam-permissions)
+  has the full policy:
+  - `iam:ListRolePolicies`, `iam:ListAttachedRolePolicies` (on `role/*`),
+    `iam:DeleteRolePolicy`, `iam:DeleteRole` (on the role path);
+  - tagging: `iam:TagRole`, `rds:AddTagsToResource`, `s3:GetBucketTagging`,
+    `s3:PutBucketTagging`, `sqs:TagQueue`, `secretsmanager:TagResource`,
+    `backup:TagResource`. **These are required.** Every create call now
+    carries tags, and AWS denies a create whose tags the caller can't apply.
+    Without `iam:TagRole`, workload roles aren't created at all;
+  - SQS and Secrets Manager actions scoped to `RESOURCE_NAME_PREFIX`, including
+    `sqs:GetQueueAttributes` for the empty-queue check.
+- **Refresh S3, SQS and Secrets Manager resources provisioned by earlier
+  versions** once after upgrading. That attaches the IAM policy they were
+  missing (see *Fixed*) and stamps the annotations that keep it in place.
+- **Set `RESOURCE_NAME_PREFIX` before provisioning any SQS queue or secret.**
+  Existing queues and secrets aren't renamed. Once a prefix is set, the next
+  refresh or reconcile creates a new, prefixed one, points the app at it and
+  moves its access. The old one is left in place, so drain the queue or copy the
+  secret's value first.
+- **RDS deletion always takes a final snapshot.** `RDS_SKIP_FINAL_SNAPSHOT` is
+  gone, and existing settings for it are ignored.
+- **Existing RDS instances below `RDS_BACKUP_RETENTION_DAYS` (default 14) are
+  raised on their next reconcile**, without an outage. Instances created by
+  earlier versions have 1 day.
+- **Provisioning or refreshing a resource can restart the application's pods**,
+  because deckwatch re-applies the stamped annotations.
+
 ### Added
-- **Apps can write their own secrets.** A Secrets Manager secret the plugin
-  creates for an app now also grants `PutSecretValue`, so pods using the app's
-  ServiceAccount can set its value (`SM_SECRET_ARN` is injected). Provisioning
-  marks it with `secretsmanager.deckwatch.io/owned-secret-arns`. Secrets
-  referenced with `secret-arns` stay read-only. With `RESOURCE_NAME_PREFIX` set,
-  write access applies only to names under the prefix.
-- `RDS_BACKUP_RETENTION_DAYS` (default **14**, range 1–35) and `RDS_BACKUP_WINDOW`
-  config keys.
-- `RESOURCE_NAME_PREFIX`: prepended to every SQS queue and Secrets Manager secret
-  name, so the plugin's IAM policy can be scoped to `<prefix>*` instead of every
-  queue and secret in the account.
-- `RESOURCE_TAGS`: `Key=Value` tags applied to every managed resource (IAM roles,
-  RDS, S3, SQS, secrets, backup plans) on create and on every reconcile. Also
-  adds the managed `deckwatch.io/managed-by`, `deckwatch.io/application` and
+- **`RESOURCE_NAME_PREFIX`**: prepended to every SQS queue and Secrets Manager
+  secret name, so the plugin's IAM policy can be scoped to `<prefix>*` instead of
+  every queue and secret in the account. (#37)
+- **`RESOURCE_TAGS`**: tags applied to every managed resource (IAM roles, RDS, S3,
+  SQS, secrets, backup plans) on create and on every reconcile, plus the managed
+  `deckwatch.io/managed-by`, `deckwatch.io/application` and
   `deckwatch.io/namespace` tags. S3 tags are merged, so existing bucket tags are
-  kept.
+  kept. Accepts `Key=Value` lists or the JSON object a deckwatch `key_value` field
+  stores. (#37)
+- **Apps can write their own secrets.** A secret the plugin creates for an app
+  also grants `PutSecretValue`, so pods using the app's ServiceAccount can set
+  its value via `SM_SECRET_ARN`. Secrets referenced with `secret-arns` stay
+  read-only. (#38)
+- `RDS_BACKUP_RETENTION_DAYS` (default **14**, range 1–35) and
+  `RDS_BACKUP_WINDOW`. (#32)
+- `AWS_ENDPOINT_URL`, for running against moto or LocalStack (testing only;
+  fails closed when malformed). (#24)
+- End-to-end integration tests that run `plugin.wasm` against moto in CI (S3,
+  SQS, Secrets Manager, RDS, tags, AWS Backup); SigV4 known-answer tests;
+  Dependabot for cargo and GitHub Actions. (#24, #25, #28, #29, #31, #32, #37)
+- Documentation set under `docs/`, rewritten README, and this changelog. (#30)
 
 ### Changed
-- **RDS instances keep 14 days of automated backups by default**, instead of RDS's
-  API default of 1 day. Existing instances below the setting are raised on
-  reconcile (no outage between non-zero values). Retention is never lowered, and
-  disabled backups are reported rather than re-enabled automatically. Snapshots
-  copy instance tags.
-- Deleting an RDS instance keeps its automated backups until they expire
-  (`DeleteAutomatedBackups=false`), in addition to the final snapshot.
 - **Removing a resource never destroys data without a recovery path.**
-  - RDS always takes a final snapshot, now timestamped
-    (`<identifier>-final-YYYYMMDD-HHMMSS`) so repeat deletions can't collide.
-  - SQS queues that still hold messages are kept, along with the app's access.
+  - RDS always takes a timestamped final snapshot
+    (`<identifier>-final-YYYYMMDD-HHMMSS`) and keeps its automated backups.
   - S3 buckets are kept.
+  - SQS queues that still hold messages are kept, along with the app's access.
   - Secrets keep a 30-day recovery window.
+
+  (#31, #32)
 - **Removing a resource cleans up IAM.** Its inline policy is removed from the
-  workload role, and the role (and, for RDS, the bootstrap Job's role) is deleted
-  once nothing is left on it.
+  workload role, and the role (and the RDS bootstrap role) is deleted once
+  nothing is left on it. (#31)
+- **RDS instances keep 14 days of automated backups by default**, instead of the
+  API default of 1 day. Existing instances are raised on reconcile and never
+  lowered; disabled backups are reported, not re-enabled. Snapshots copy instance
+  tags. (#32)
+- DB bootstrap Job images: `amazon/aws-cli:2.42.2`, `postgres:19-alpine`. (#25)
+- `hmac` 0.13 and `sha2` 0.11 (signatures byte-identical), plus `md-5` for S3
+  `Content-MD5`. GitHub Actions moved to their Node 24 releases. (#25, #28, #37)
 
 ### Fixed
-- **AWS Backup snapshot schedules now create a backup plan.** The plugin sent
-  `CreateBackupPlan` and `CreateBackupSelection` as `POST`, with a
-  `"BackupPlanData"` body and the JSON-RPC content type. AWS Backup's REST-JSON
-  API expects `PUT`, `"BackupPlan"` and `application/json`, so no plan was ever
-  created.
-- S3 bucket-configuration `PUT`s (tagging, lifecycle, versioning, public access
-  block) now send `Content-MD5`, the message integrity header S3 requires on
-  these operations.
-- Secret names and descriptions are JSON-escaped when creating secrets.
-- **Provisioned SQS queues and Secrets Manager secrets now grant the workload
-  access.** They attach `deckwatch-sqs-access` / `deckwatch-secretsmanager-access`
-  to the app role, emit the ServiceAccount, and stamp annotations so every reconcile
-  re-asserts the grant.
-- **Secrets Manager and AWS Backup responses are parsed as JSON**, instead of by
-  `"key":"` substring matching. Responses with whitespace previously failed, and
-  Secrets Manager's numeric `DeletionDate` showed as "unknown".
-- **Provisioning an S3 bucket now grants the workload access to it.** `provision("s3")`
-  never attached an IAM policy, and the S3 policy used `arn:aws:s3:::` ARNs, which
-  never match GovCloud buckets. It now attaches `deckwatch-s3-access` with the
-  correct partition to the application's role, emits the ServiceAccount, and stamps
-  annotations so every reconcile keeps the policy in place. (#24)
-- **SQS queues are created.** `GetQueueUrl` on a missing queue returns HTTP 400,
-  which was treated as a hard failure, so annotation-based SQS never created queues. (#29)
-- **GovCloud ARNs for SQS and AWS Backup.** Queue and RDS ARNs were hardcoded to the
-  `aws` partition. Queue URLs in legacy and emulator form are now parsed as well. (#29)
-
-### Added
-- `AWS_ENDPOINT_URL` config key, for running against moto or LocalStack (testing
-  only; fails closed when malformed). (#24)
-- End-to-end integration tests that run `plugin.wasm` against moto in CI, covering
-  S3 and SQS on GovCloud and commercial regions. (#24, #29)
-- SigV4 known-answer tests. (#28)
-- Dependabot for cargo and GitHub Actions. (#25, #28)
-- Documentation set under `docs/`. Rewritten README.
-
-### Changed
-- DB bootstrap Job images: `amazon/aws-cli:2.42.2`, `postgres:19-alpine`. (#25)
-- `hmac` 0.13 and `sha2` 0.11. Request signatures are byte-identical. (#28)
-- GitHub Actions moved to their Node 24 releases. (#25)
+- **Provisioning a resource now grants the workload access to it.** Before this,
+  S3, SQS and Secrets Manager provisioning attached no IAM policy. (#24, #31)
+- **GovCloud ARNs.** S3, SQS and AWS Backup ARNs were hardcoded to the `aws`
+  partition and matched nothing in GovCloud. (#24, #29)
+- **SQS queues are created.** A missing queue's HTTP 400 was treated as a hard
+  failure. (#29)
+- **AWS Backup snapshot schedules create a plan.** Requests used `POST`, a
+  `"BackupPlanData"` body and the JSON-RPC content type instead of REST-JSON. (#37)
+- **S3 bucket-configuration `PUT`s send `Content-MD5`**, which S3 requires. (#37)
+- **Secrets Manager and AWS Backup responses are parsed as JSON**, which fixes
+  responses containing whitespace and the numeric `DeletionDate`. Secret create
+  requests are escaped. (#31, #37)
+- **Deprovisioning lists a role's policies before deleting them.** With
+  path-scoped IAM grants, deleting a policy from an already-deleted role returned
+  AccessDenied. (#36)
 
 ### Removed
-- The `RDS_SKIP_FINAL_SNAPSHOT` config key. RDS deletion always takes a final
-  snapshot.
-- The `rds.deckwatch.io/region` annotation. It was parsed but never used; RDS always
-  uses `AWS_REGION`. (#29)
+- The `RDS_SKIP_FINAL_SNAPSHOT` config key. (#31)
+- The unused `rds.deckwatch.io/region` annotation. (#29)
 
 ## [0.7.2] - 2026-11-06
 ### Fixed
@@ -168,7 +180,8 @@ history.
 ### Added
 - Initial release: unified IAM role, RDS, S3, and AWS Backup snapshot scheduling. (#1)
 
-[Unreleased]: https://github.com/alexconrey/deckwatch-plugin-aws/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/alexconrey/deckwatch-plugin-aws/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/alexconrey/deckwatch-plugin-aws/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/alexconrey/deckwatch-plugin-aws/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/alexconrey/deckwatch-plugin-aws/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/alexconrey/deckwatch-plugin-aws/compare/v0.6.0...v0.7.0
