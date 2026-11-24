@@ -205,6 +205,20 @@ async fn iam_client(region: &str) -> aws_sdk_iam::Client {
     aws_sdk_iam::Client::new(&sdk_config(region).await)
 }
 
+async fn backup_client(region: &str) -> aws_sdk_backup::Client {
+    aws_sdk_backup::Client::new(&sdk_config(region).await)
+}
+
+/// Tag map from (key, value) pairs.
+fn tag_map<K: AsRef<str>, V: AsRef<str>>(
+    pairs: impl IntoIterator<Item = (K, V)>,
+) -> HashMap<String, String> {
+    pairs
+        .into_iter()
+        .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+        .collect()
+}
+
 async fn rds_client(region: &str) -> aws_sdk_rds::Client {
     aws_sdk_rds::Client::new(&sdk_config(region).await)
 }
@@ -1025,6 +1039,225 @@ async fn resource_name_prefix_scopes_queue_and_secret_names() {
         1,
         "no double-prefixed duplicate queue: {:?}",
         queues.queue_urls()
+    );
+}
+
+/// RESOURCE_TAGS (plus the managed ownership tags) reach every resource the
+/// plugin manages, existing S3 bucket tags survive the merge, and
+/// re-provisioning updates tags on resources that already exist.
+#[tokio::test]
+async fn resource_tags_are_applied_to_every_managed_resource() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("tagged-it", unique("tagged"));
+    let (bucket, queue, db) = (
+        unique("k2-tagged-assets"),
+        unique("tagged-q"),
+        unique("tagged-db"),
+    );
+    let role_name = format!("{ns}-{app}-rds");
+    let expect = |team: &str| {
+        tag_map([
+            ("Team", team),
+            ("CostCenter", "1234"),
+            ("deckwatch.io/managed-by", "deckwatch-plugin-aws"),
+            ("deckwatch.io/application", app),
+            ("deckwatch.io/namespace", ns),
+        ])
+    };
+    let contains = |actual: &HashMap<String, String>, wanted: &HashMap<String, String>| {
+        wanted.iter().all(|(k, v)| actual.get(k) == Some(v))
+    };
+
+    // A bucket that already carries someone else's tag.
+    let s3 = s3_client(region).await;
+    s3.create_bucket()
+        .bucket(bucket)
+        .create_bucket_configuration(
+            aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::from(region))
+                .build(),
+        )
+        .send()
+        .await
+        .expect("seed bucket");
+    s3.put_bucket_tagging()
+        .bucket(bucket)
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("Owner")
+                        .value("finance")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("seed bucket tag");
+
+    for team in ["platform", "data"] {
+        let tags_cfg = format!("Team={team},CostCenter=1234");
+        let mut plugin = load_plugin(region, &[("RESOURCE_TAGS", tags_cfg.as_str())]);
+        for req in [
+            s3_request(app, ns, bucket, region),
+            resource_request(app, ns, "sqs", &[("queue_name", queue)]),
+            resource_request(app, ns, "secretsmanager", &[]),
+            resource_request(app, ns, "rds", &[("identifier", db)]),
+        ] {
+            let result = call_provision(&mut plugin, &req);
+            assert!(
+                result.errors.is_empty(),
+                "{} errors: {:?}",
+                req.resource_id,
+                result.errors
+            );
+        }
+        let wanted = expect(team);
+
+        let iam = iam_client(region).await;
+        let role_tags = iam
+            .list_role_tags()
+            .role_name(&role_name)
+            .send()
+            .await
+            .expect("role tags");
+        let role_tags = tag_map(role_tags.tags().iter().map(|t| (t.key(), t.value())));
+        assert!(
+            contains(&role_tags, &wanted),
+            "IAM role tags ({team}): {role_tags:?}"
+        );
+
+        let bucket_tags = s3
+            .get_bucket_tagging()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("bucket tags");
+        let bucket_tags = tag_map(bucket_tags.tag_set().iter().map(|t| (t.key(), t.value())));
+        assert!(
+            contains(&bucket_tags, &wanted),
+            "S3 tags ({team}): {bucket_tags:?}"
+        );
+        assert_eq!(
+            bucket_tags.get("Owner").map(String::as_str),
+            Some("finance"),
+            "foreign tag kept"
+        );
+
+        let sqs = sqs_client(region).await;
+        let url = sqs
+            .get_queue_url()
+            .queue_name(queue)
+            .send()
+            .await
+            .expect("queue")
+            .queue_url()
+            .unwrap()
+            .to_string();
+        let queue_tags = sqs
+            .list_queue_tags()
+            .queue_url(&url)
+            .send()
+            .await
+            .expect("queue tags");
+        let queue_tags: HashMap<String, String> = queue_tags.tags().cloned().unwrap_or_default();
+        assert!(
+            contains(&queue_tags, &wanted),
+            "SQS tags ({team}): {queue_tags:?}"
+        );
+
+        let secret = secrets_client(region)
+            .await
+            .describe_secret()
+            .secret_id(format!("{ns}/{app}"))
+            .send()
+            .await
+            .expect("secret");
+        let secret_tags = tag_map(
+            secret
+                .tags()
+                .iter()
+                .map(|t| (t.key().unwrap_or(""), t.value().unwrap_or(""))),
+        );
+        assert!(
+            contains(&secret_tags, &wanted),
+            "secret tags ({team}): {secret_tags:?}"
+        );
+
+        let instance = db_instance(&rds_client(region).await, db).await;
+        let db_tags = tag_map(
+            instance
+                .tag_list()
+                .iter()
+                .map(|t| (t.key().unwrap_or(""), t.value().unwrap_or(""))),
+        );
+        assert!(
+            contains(&db_tags, &wanted),
+            "RDS tags ({team}): {db_tags:?}"
+        );
+    }
+}
+
+/// Annotation-scheduled AWS Backup snapshots create a tagged backup plan. The
+/// plugin used to call CreateBackupPlan as POST with a "BackupPlanData" body,
+/// which AWS Backup rejects, so no plan was ever created.
+#[tokio::test]
+async fn rds_snapshot_schedule_creates_a_tagged_backup_plan() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("backed-it", unique("backed"));
+    let identifier = unique("backed-db");
+    let mut plugin = load_plugin(region, &[("RESOURCE_TAGS", "Team=platform")]);
+    let ctx = PluginContext {
+        namespace: ns.into(),
+        deployment_name: "api".into(),
+        annotations: HashMap::from([
+            ("aws.deckwatch.io/app-name".into(), app.into()),
+            ("rds.deckwatch.io/enabled".into(), "true".into()),
+            ("rds.deckwatch.io/identifier".into(), identifier.into()),
+            (
+                "rds.deckwatch.io/snapshot-schedule".into(),
+                "cron(0 3 * * ? *)".into(),
+            ),
+            ("rds.deckwatch.io/snapshot-retention".into(), "30".into()),
+            (
+                "rds.deckwatch.io/backup-role-arn".into(),
+                "arn:aws-us-gov:iam::123456789012:role/aws-backup".into(),
+            ),
+        ]),
+        labels: HashMap::new(),
+        plugin_outputs: HashMap::new(),
+        provisioned_resources: HashMap::new(),
+    };
+    // First reconcile creates the instance; the next one configures backups.
+    call_apply(&mut plugin, &ctx);
+    call_apply(&mut plugin, &ctx);
+
+    let backup = backup_client(region).await;
+    let plans = backup.list_backup_plans().send().await.expect("list plans");
+    let plan_name = format!("{identifier}-backup");
+    let plan = plans
+        .backup_plans_list()
+        .iter()
+        .find(|p| p.backup_plan_name() == Some(plan_name.as_str()))
+        .unwrap_or_else(|| panic!("backup plan {plan_name} must exist"));
+    let tags = backup
+        .list_tags()
+        .resource_arn(plan.backup_plan_arn().unwrap())
+        .send()
+        .await
+        .expect("plan tags");
+    let tags: HashMap<String, String> = tags.tags().cloned().unwrap_or_default();
+    assert_eq!(
+        tags.get("Team").map(String::as_str),
+        Some("platform"),
+        "plan tags: {tags:?}"
+    );
+    assert_eq!(
+        tags.get("deckwatch.io/application").map(String::as_str),
+        Some(app)
     );
 }
 
