@@ -135,7 +135,6 @@ Set these keys in the plugin's `config`. Defaults come from the plugin's
 | `RDS_DEFAULT_SUBNET_GROUP` | *(none)* | DB subnet group for new instances. Needed to place them in the right VPC. |
 | `RDS_DEFAULT_SECURITY_GROUPS` | *(none)* | Comma-separated VPC security group IDs for new instances. |
 | `RDS_DEFAULT_IAM_AUTH` | `true` | Enables IAM database auth on new instances unless the resource or annotation says otherwise. |
-| `RDS_SKIP_FINAL_SNAPSHOT` | `false` | Deleting an RDS resource takes a final snapshot unless this is `true`. |
 | `DB_BOOTSTRAP_AWSCLI_IMAGE` | `amazon/aws-cli:2.42.2` | Init-container image for the [IAM database user bootstrap Job](identity.md#rds-iam-authentication). |
 | `DB_BOOTSTRAP_PSQL_IMAGE` | `postgres:19-alpine` | psql image for the bootstrap Job. Must be the same as, or newer than, the RDS engine major version. |
 
@@ -160,7 +159,10 @@ the permissions below. The list comes from the API calls in `src/`. Replace
     {
       "Sid": "WorkloadRoles",
       "Effect": "Allow",
-      "Action": ["iam:GetRole", "iam:CreateRole", "iam:UpdateAssumeRolePolicy", "iam:PutRolePolicy"],
+      "Action": [
+        "iam:GetRole", "iam:CreateRole", "iam:UpdateAssumeRolePolicy", "iam:PutRolePolicy",
+        "iam:ListRolePolicies", "iam:ListAttachedRolePolicies", "iam:DeleteRolePolicy", "iam:DeleteRole"
+      ],
       "Resource": "arn:<partition>:iam::<account>:role/deckwatch-plugin/*"
     },
     {
@@ -190,7 +192,7 @@ the permissions below. The list comes from the API calls in `src/`. Replace
     {
       "Sid": "Sqs",
       "Effect": "Allow",
-      "Action": ["sqs:CreateQueue", "sqs:GetQueueUrl", "sqs:DeleteQueue"],
+      "Action": ["sqs:CreateQueue", "sqs:GetQueueUrl", "sqs:GetQueueAttributes", "sqs:DeleteQueue"],
       "Resource": "arn:<partition>:sqs:*:<account>:*"
     },
     {

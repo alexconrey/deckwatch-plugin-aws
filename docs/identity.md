@@ -60,12 +60,15 @@ ServiceAccount**:
 |---|---|---|---|
 | `deckwatch-rds-connect` | RDS with IAM auth, once the instance exists | `rds-db:connect` | `arn:<partition>:rds-db:<region>:<account>:dbuser:<DbiResourceId>/<app>` |
 | `deckwatch-s3-access` | S3 | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` / `s3:ListBucket` | `arn:<partition>:s3:::<bucket>/*` / `arn:<partition>:s3:::<bucket>` |
-| `deckwatch-sqs-access` | `sqs.deckwatch.io/enabled` | Send, Receive, Delete, ChangeMessageVisibility, GetQueueUrl, GetQueueAttributes | `arn:<partition>:sqs:<region>:<account>:<queue>` |
-| `deckwatch-secretsmanager-access` | `secretsmanager.deckwatch.io/*` | `GetSecretValue`, `DescribeSecret` | the listed secret ARNs, plus any secret it created |
+| `deckwatch-sqs-access` | SQS (provisioned, or `sqs.deckwatch.io/enabled`) | Send, Receive, Delete, ChangeMessageVisibility, GetQueueUrl, GetQueueAttributes | `arn:<partition>:sqs:<region>:<account>:<queue>` |
+| `deckwatch-secretsmanager-access` | Secrets Manager (provisioned, or `secretsmanager.deckwatch.io/*`) | `GetSecretValue`, `DescribeSecret` | the listed secret ARNs, plus any secret it created |
 | `deckwatch-ecr-pull` | `ecr.deckwatch.io/enabled` | `GetAuthorizationToken`, `BatchCheckLayerAvailability`, `GetDownloadUrlForLayer`, `BatchGetImage` | `*` |
 
 `PutRolePolicy` replaces a policy of the same name, so the plugin can re-apply
-policies on every reconcile safely. If someone deletes a policy by hand, the next
+policies on every reconcile safely. deckwatch allows at most one resource of each
+type per application, so one fixed policy name per type never collides. Removing a
+resource deletes its policy, and the role is deleted with the last policy (see
+[Removing a resource](operations.md#removing-a-resource)). If someone deletes a policy by hand, the next
 reconcile restores it.
 
 ## GovCloud and partitions
