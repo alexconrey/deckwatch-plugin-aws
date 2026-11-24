@@ -1,151 +1,101 @@
 # Claude assistant instructions — deckwatch-plugin-aws
 
-## Project overview
+A deckwatch plugin (Rust → `wasm32-unknown-unknown`, run by extism) that provisions
+AWS resources (IAM, RDS, S3, SQS, Secrets Manager, ECR, AWS Backup) and wires them to
+an application through **one IAM role and one IRSA ServiceAccount per application**.
+It must work in commercial AWS **and GovCloud**.
 
-`deckwatch-plugin-aws` is a **unified** deckwatch plugin that provisions three
-categories of AWS infrastructure for a Kubernetes workload in a single WASM
-binary:
+User and operator documentation lives in [`docs/`](docs/). Keep it in sync, as
+described in [Documentation](#documentation) below.
 
-| Resource category | Annotation namespace |
+## Architecture in one screen
+
+| Export | When deckwatch calls it | Notes |
+|---|---|---|
+| `metadata()` | once, when the plugin loads | Config schema, resources, capabilities, version (`CARGO_PKG_VERSION`) |
+| `provision()` | resource added or refreshed | Returns `state` (env vars for every deployment), `deployment_annotations`, `kubernetes_resources` |
+| `apply()` | every deployment create and update | Reads `*.deckwatch.io/*` annotations; reconciles resources and IAM; returns env vars and `wants_service_account` |
+| `deprovision()` | resource removed | RDS deleted (final snapshot by default); S3 kept; SQS deleted; secret scheduled for deletion |
+
+`src/lib.rs` holds the exports, config parsing (`AwsConfig::from_context`) and pure
+helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
+`secretsmanager.rs`, `backup.rs` and `sts.rs`. Signing is in `aws_sign.rs`.
+`integration/` holds the moto end-to-end harness.
+
+## Rules that prevent the bugs we've actually had
+
+1. **Never hardcode `arn:aws:`.** Build every ARN with `aws_partition(region)`. A
+   policy with the wrong partition is accepted by IAM but matches nothing. The S3,
+   SQS and Backup ARNs all had this bug in GovCloud.
+2. **Put testable logic in `lib.rs` as pure functions.** The API modules are
+   `#[cfg(target_arch = "wasm32")]`, so **tests inside them never run** on the host
+   (the old SQS tests never ran). Gate helpers with
+   `#[cfg(any(target_arch = "wasm32", test))]` and call them as `crate::…`.
+3. **`provision()` must stamp the annotations `apply()` needs**
+   (`rds_apply_annotations`, `s3_apply_annotations`), or reconciliation never picks
+   the resource up. Stamp names *without* `BUCKET_PREFIX`; `apply()` adds it.
+4. **Grant IAM when you create a resource.** Creating a bucket or queue without
+   attaching the matching inline policy to the app role leaves the workload with
+   `AccessDenied`. The role is `rds_role_name(ns, app)` (`<ns>-<app>-rds`, a
+   historical name; don't rename it). Provisioned SQS and Secrets Manager still
+   don't grant access; that's a known gap.
+5. **"Not found" is often an HTTP 4xx.** Map it to `Ok(None)` before propagating
+   errors (IAM `NoSuchEntity`, SQS `NonExistentQueue`). Include the AWS error `Code`
+   in error strings so these checks have something to match.
+6. **Only request the ServiceAccount after the role exists.** `apply_inner` is the
+   no-AWS fallback and must not set `wants_service_account`.
+7. **No clock, no filesystem.** Time comes from the `CURRENT_TIMESTAMP` config value,
+   which deckwatch injects. Credentials come from config (IRSA token via
+   `inherit_env_file_keys`).
+8. **Every outgoing URL goes through `service_endpoint()`**, so `AWS_ENDPOINT_URL` can
+   redirect it in tests. A malformed override must fail, never fall back to AWS.
+
+## Testing
+
+| Command | What |
 |---|---|
-| IAM role + IRSA ServiceAccount | `aws.deckwatch.io/` |
-| RDS DB instance | `rds.deckwatch.io/` |
-| S3 bucket | `s3.deckwatch.io/` |
-| AWS Backup snapshot schedule | `rds.deckwatch.io/snapshot-*` |
+| `make test` | Unit tests on the host (`.cargo/config.toml` defaults to wasm32, so the Makefile passes the host triple) |
+| `make build` | `dist/plugin.wasm` |
+| `make integration` | Needs moto: `docker run --rm -d -p 5000:5000 motoserver/moto:5.2.6` |
 
-The key design decision is **one role per workload**. Rather than having three
-separate plugins each managing isolated IAM state, this plugin creates a single
-role and attaches inline policies to it for each enabled resource. This keeps
-IAM state minimal and makes it easy for operators to audit what a workload can
-access.
+- **Known-answer tests in `aws_sign.rs` are the only signing check**, because moto
+  doesn't verify signatures. The golden `Authorization` header must still match after
+  any crypto or dependency change; don't re-capture it to make a test pass.
+- **Integration tests** load the real `plugin.wasm` in extism, which may only reach
+  moto, and verify state through the AWS SDK. Name resources with `unique(…)`.
+- **Mutation-check new tests**: break the fix on purpose and confirm the test fails.
+- Run clippy for **both** targets: `cargo clippy --target <host> --all-targets -- -D warnings`
+  and `cargo clippy --target wasm32-unknown-unknown -- -D warnings`.
 
-### Why one plugin instead of three?
+## Dependencies
 
-A separate IAM plugin, RDS plugin, and S3 plugin would each need to create or
-reference IAM roles. Coordinating role ownership across plugins requires complex
-`plugin_outputs` handshakes and ordering guarantees. Merging them into one
-plugin avoids that coupling entirely: one binary owns the role lifecycle and
-attaches policies to it atomically.
+- `hmac`, `sha2` and `digest` must be upgraded **together**; Dependabot groups them.
+- Container images Dependabot can't see: moto (CI, Makefile, docs), and
+  `DEFAULT_BOOTSTRAP_AWSCLI_IMAGE` / `DEFAULT_BOOTSTRAP_PSQL_IMAGE` in `src/lib.rs`.
+- Lockfiles are git-ignored on purpose.
 
-The SDK's `PluginMetadata.provides` capability IDs allow downstream plugins to
-declare a dependency on `"aws:iam-role"` or `"aws:rds-connection"` without
-caring whether those came from this plugin or a future specialist one.
+## Releasing
 
-## Architecture
+Bump `Cargo.toml` `version` in its own PR (`chore: set version to X.Y.Z`); the
+plugin reports it to deckwatch. Move the CHANGELOG *Unreleased* entries under the new
+version, then tag `vX.Y.Z` on `main`. `release.yml` attaches `plugin.wasm` to the
+release. To test an unreleased build in deckwatch, upload the **raw bytes**:
+`curl -X POST -H 'Content-Type: application/wasm' --data-binary @dist/plugin.wasm https://<deckwatch>/api/plugins/AWS/upload`.
+Multipart form data is rejected.
 
-```
-src/
-├── lib.rs        orchestration; metadata() + apply() WASM exports; 13 unit tests
-├── aws_sign.rs   AWS Sig V4 signing + utc_now_iso8601 (pure Rust, no extism)
-├── iam.rs        IAM Query API — ensure_role, attach_*_policy  (WASM only)
-├── rds.rs        RDS Query API — ensure_instance               (WASM only)
-├── s3.rs         S3 REST API   — ensure_bucket                 (WASM only)
-└── backup.rs     AWS Backup REST-JSON — configure_backup       (WASM only)
-```
+## Documentation
 
-### extism-pdk WASM-only pattern
+When you change behaviour, update the page that describes it in the same PR:
 
-`extism-pdk` is declared under `[target.'cfg(target_arch = "wasm32")'.dependencies]`
-so it never links on host targets. All four API modules (`iam`, `rds`, `s3`,
-`backup`) are declared in `lib.rs` as `#[cfg(target_arch = "wasm32")] mod …;`,
-so they are invisible to the host compiler. The `#[plugin_fn]` macro and all
-`extism_pdk::*` imports are similarly gated.
-
-The pure orchestration (`apply_inner`) and SA YAML generation live in `lib.rs`
-with no cfg guard, making them available to host-side unit tests.
-
-### `metadata()` + `apply()` dual export
-
-`metadata()` is called once at plugin load time by deckwatch to build the
-dependency graph. `apply()` is called for every deployment create/update event.
-
-### AWS Backup for snapshots (not CronJob)
-
-Snapshot scheduling is implemented via **AWS Backup**, not a Kubernetes
-`CronJob`. The `backup.rs` module calls `CreateBackupPlan` and
-`CreateBackupSelection` against the `backup.<region>.amazonaws.com` REST-JSON
-endpoint. This produces no `kubernetes_resources`; all schedule state lives in
-AWS.
-
-### IAM database user bootstrap
-
-With IAM auth the workload connects as a Postgres user named after the app,
-which must exist and be granted `rds_iam`. RDS only creates the master user and
-WASM cannot open a Postgres connection, so once the instance is available
-`provision()` emits a ServiceAccount + one-shot Job (`<app>-db-bootstrap`) via
-`kubernetes_resources`:
-
-- The Job's IRSA role (`<ns>-<app>-rds-bootstrap`) can only read this
-  instance's RDS-managed master secret. The workload role never can.
-- An init container fetches the secret into a memory-backed emptyDir; the psql
-  container runs idempotent `CREATE ROLE … LOGIN` / `GRANT rds_iam` / database
-  and `public` schema grants, then deletes the file. The password never enters
-  plugin state, a Kubernetes Secret, or the Job spec.
-- Images default to `amazon/aws-cli` and `postgres:19-alpine`, overridable via
-  `DB_BOOTSTRAP_AWSCLI_IMAGE` / `DB_BOOTSTRAP_PSQL_IMAGE`.
-
-Postgres only. Requires deckwatch to apply `kubernetes_resources` from the
-pending-resource reconcile loop and RBAC `patch` on `batch/jobs`.
-
-## Annotation reference
-
-### Global (`aws.deckwatch.io/`)
-
-| Key | Value | Notes |
-|---|---|---|
-| `aws.deckwatch.io/enabled` | `"true"` | Master opt-in; also implied by any rds/s3 annotation |
-| `aws.deckwatch.io/role-name` | `"myapp-role"` | Optional; defaults to `<namespace>-<deployment>-role` |
-
-### RDS (`rds.deckwatch.io/`)
-
-| Key | Default | Notes |
-|---|---|---|
-| `rds.deckwatch.io/enabled` | — | Must be `"true"` to provision |
-| `rds.deckwatch.io/engine` | `"postgres"` | `"postgres"` or `"mysql"` |
-| `rds.deckwatch.io/instance-class` | `"db.t3.micro"` | |
-| `rds.deckwatch.io/allocated-storage` | `"20"` | GiB |
-| `rds.deckwatch.io/identifier` | `<ns>-<deploy>-db` | Max 63 chars |
-| `rds.deckwatch.io/db-name` | `"app"` | Initial database name |
-| `rds.deckwatch.io/multi-az` | `"false"` | |
-| `rds.deckwatch.io/subnet-group` | — | Optional |
-| `rds.deckwatch.io/security-groups` | — | Comma-separated SG IDs |
-| `rds.deckwatch.io/iam-auth` | `"false"` | IAM database auth; sets `DB_IAM_AUTH=true` |
-| `rds.deckwatch.io/snapshot-schedule` | — | AWS EventBridge cron, e.g. `"cron(0 3 * * ? *)"` |
-| `rds.deckwatch.io/snapshot-retention` | `"7"` | Backup retention in days |
-| `rds.deckwatch.io/backup-role-arn` | — | IAM role for `backup.amazonaws.com` |
-
-### S3 (`s3.deckwatch.io/`)
-
-| Key | Default | Notes |
-|---|---|---|
-| `s3.deckwatch.io/enabled` | — | Must be `"true"` to provision |
-| `s3.deckwatch.io/bucket-name` | — | Suffix after `BUCKET_PREFIX` extism config |
-| `s3.deckwatch.io/region` | `"us-east-1"` | |
-| `s3.deckwatch.io/versioning` | `"false"` | |
-| `s3.deckwatch.io/public-access-block` | `"true"` | |
-| `s3.deckwatch.io/lifecycle-days` | — | Expire objects after N days |
-
-## The `plugin_outputs` system
-
-This plugin sets the following keys in `result.outputs` (accessible to
-downstream plugins via `ctx.plugin_outputs["aws"]`):
-
-| Key | Value |
+| Change | Update |
 |---|---|
-| `role_arn` | The IAM role ARN created for this workload |
-| `service_account_name` | The SA name bound to the pod |
-| `rds_endpoint` | RDS instance hostname (empty while provisioning) |
-| `s3_bucket` | Full bucket name (prefix applied) |
-
-Example — a downstream plugin reading the role ARN:
-
-```rust
-if let Some(aws_out) = ctx.plugin_outputs.get("aws") {
-    if let Some(role_arn) = aws_out.get("role_arn") {
-        // attach additional policies to this role
-    }
-}
-```
+| Config key (`metadata().config_schema`) | `docs/configuration.md` |
+| AWS API call | `docs/configuration.md#plugin-iam-permissions`, and `allowed_hosts` if it's a new host |
+| Resource field, annotation, env var, output, naming | `docs/resources.md` |
+| Role, trust policy, inline policy, partition, bootstrap Job | `docs/identity.md` |
+| Refresh, deprovision or upgrade behaviour; limitations | `docs/operations.md` |
+| Build, test, CI, release process | `docs/development.md` |
+| Anything user-visible | `CHANGELOG.md` → *Unreleased* |
 
 ## Git workflow
 
@@ -153,11 +103,3 @@ if let Some(aws_out) = ctx.plugin_outputs.get("aws") {
 - **Never** merge a PR without CI passing.
 - All changes go through a feature branch and PR.
 - No Co-Authored-By lines in commits for this repo.
-
-## Building
-
-```bash
-make build   # cargo build --release --target wasm32-unknown-unknown
-make test    # cargo test --target <host>
-make clean   # remove build artefacts
-```
