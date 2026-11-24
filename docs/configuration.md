@@ -164,10 +164,16 @@ the permissions below. The list comes from the API calls in `src/`. Replace
       "Sid": "WorkloadRoles",
       "Effect": "Allow",
       "Action": [
-        "iam:GetRole", "iam:CreateRole", "iam:UpdateAssumeRolePolicy", "iam:PutRolePolicy",
-        "iam:ListRolePolicies", "iam:ListAttachedRolePolicies", "iam:DeleteRolePolicy", "iam:DeleteRole"
+        "iam:CreateRole", "iam:UpdateAssumeRolePolicy", "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy", "iam:DeleteRole"
       ],
       "Resource": "arn:<partition>:iam::<account>:role/deckwatch-plugin/*"
+    },
+    {
+      "Sid": "WorkloadRoleLookups",
+      "Effect": "Allow",
+      "Action": ["iam:GetRole", "iam:ListRolePolicies", "iam:ListAttachedRolePolicies"],
+      "Resource": "arn:<partition>:iam::<account>:role/*"
     },
     {
       "Sid": "Rds",
@@ -230,6 +236,13 @@ the permissions below. The list comes from the API calls in `src/`. Replace
 ```
 
 Notes:
+- **Why the lookups aren't path-scoped:** IAM authorizes calls on a role that
+  doesn't exist (yet, or any more) against `role/<name>`, without the path. A
+  `role/deckwatch-plugin/*` grant would therefore deny `GetRole` before the role is
+  created, and the `ListRolePolicies` checks that deprovisioning runs. Those three
+  are read-only, so they're granted on `role/*`. Everything that changes a role
+  stays path-scoped, and deprovisioning lists before it deletes, so it never calls
+  `DeleteRolePolicy` on a role that isn't there.
 - **Why `PutRolePolicy` on workload roles is enough:** every permission the plugin
   grants to workloads is an inline policy on a role under `ROLE_PATH`. The plugin
   never attaches managed policies and never touches other roles.
