@@ -9,6 +9,25 @@ on:
       - main
 
 jobs:
+  lockfiles:
+    name: Lockfiles match Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # --locked fails when a Cargo.lock is missing, or when resolving its
+      # Cargo.toml would change it: a Cargo.toml edited without updating the
+      # lockfile. Fix it with `cargo update --workspace` in that directory.
+      - name: Plugin
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Integration harness
+        working-directory: integration
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
   test:
     name: Unit tests (host target)
     runs-on: ubuntu-latest
@@ -30,7 +49,7 @@ jobs:
       - name: Run unit tests
         run: |
           HOST=$(rustc -vV | grep "^host:" | cut -d' ' -f2)
-          cargo test --target "$HOST"
+          cargo test --locked --target "$HOST"
 
   build-wasm:
     name: Build WASM artifact
@@ -53,7 +72,7 @@ jobs:
           key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build WASM
-        run: cargo build --release --target wasm32-unknown-unknown
+        run: cargo build --locked --release --target wasm32-unknown-unknown
 
       - name: Report artifact size
         run: ls -lh target/wasm32-unknown-unknown/release/deckwatch_plugin_aws.wasm
@@ -81,7 +100,7 @@ jobs:
       - name: Clippy
         run: |
           HOST=$(rustc -vV | grep "^host:" | cut -d' ' -f2)
-          cargo clippy --target "$HOST" -- -D warnings
+          cargo clippy --locked --target "$HOST" -- -D warnings
 
   fmt:
     name: Rustfmt check
@@ -124,7 +143,7 @@ jobs:
             ~/.cargo/git
             target/
             integration/target/
-          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('Cargo.toml', 'integration/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('Cargo.lock', 'integration/Cargo.lock') }}
 
       - name: Build plugin.wasm
         run: make build
@@ -143,10 +162,10 @@ jobs:
         run: |
           HOST=$(rustc -vV | grep "^host:" | cut -d' ' -f2)
           cargo fmt --check
-          cargo clippy --target "$HOST" --all-targets -- -D warnings
+          cargo clippy --locked --target "$HOST" --all-targets -- -D warnings
 
       - name: Run integration tests
         working-directory: integration
         run: |
           HOST=$(rustc -vV | grep "^host:" | cut -d' ' -f2)
-          cargo test --target "$HOST"
+          cargo test --locked --target "$HOST"

@@ -62,6 +62,10 @@ rustup target add wasm32-unknown-unknown
 make build          # → dist/plugin.wasm
 ```
 
+The Makefile builds with `--locked`, as CI does, so it fails if `Cargo.lock` is
+out of sync with `Cargo.toml`. See [Dependencies](#dependencies) for how to
+update the lockfile.
+
 `.cargo/config.toml` makes `wasm32-unknown-unknown` the default build target. That's
 why host test commands pass `--target <host triple>` explicitly.
 
@@ -113,11 +117,15 @@ cargo clippy --target wasm32-unknown-unknown -- -D warnings
 
 | Job | Runs |
 |---|---|
-| Unit tests | `cargo test --target <host>` |
-| Build WASM | `cargo build --release --target wasm32-unknown-unknown` |
-| Clippy | `cargo clippy --target <host> -- -D warnings` |
+| Lockfiles match Cargo.toml | `cargo metadata --locked` for the plugin and the harness. Fails if either lockfile is missing or out of sync with its `Cargo.toml` |
+| Unit tests | `cargo test --locked --target <host>` |
+| Build WASM | `cargo build --locked --release --target wasm32-unknown-unknown` |
+| Clippy | `cargo clippy --locked --target <host> -- -D warnings` |
 | Rustfmt | `cargo fmt --check` |
-| Integration | builds `plugin.wasm`, starts `motoserver/moto:5.2.6` as a service, lints the harness, runs `cargo test` in `integration/` |
+| Integration | builds `plugin.wasm`, starts `motoserver/moto:5.2.6` as a service, lints the harness, runs `cargo test --locked` in `integration/` |
+
+`release.yml` also builds with `--locked`, so the released `plugin.wasm` uses
+the same dependency versions CI tested.
 
 ## Pull requests
 
@@ -155,9 +163,17 @@ crate, the integration harness and the GitHub Actions:
   They share the `digest` trait crate, and upgrading only one fails to compile.
 - **Minor and patch updates are grouped** per ecosystem, and the `aws-*` harness
   crates move in lockstep.
-- **`deckwatch-plugin-sdk` is a git dependency on its `main` branch**, and
-  lockfiles aren't committed, so every build picks up the SDK's latest `main`.
-  deckwatch keeps its own hand-written copy of the SDK's types, so a new SDK type
+- **Lockfiles are committed**, for the plugin (`Cargo.lock`) and the harness
+  (`integration/Cargo.lock`). CI, `release.yml` and the Makefile build with
+  `--locked`, so a release uses exactly the versions CI tested. A lockfile that
+  doesn't match its `Cargo.toml` fails the *Lockfiles match Cargo.toml* CI job.
+  After editing a `Cargo.toml`, run `cargo update --workspace` in that directory
+  and commit the updated lockfile with it. A bare `cargo update` bumps every
+  dependency.
+- **`deckwatch-plugin-sdk` is pinned to a commit** (`rev`) in both `Cargo.toml`
+  and `integration/Cargo.toml`, and the two must match. Bump the pin in its own
+  PR so CI tests the new SDK before a release uses it.
+- deckwatch keeps its own hand-written copy of the SDK's types, so a new SDK type
   (such as the `key_value` config field type) does nothing until deckwatch
   supports it too.
 

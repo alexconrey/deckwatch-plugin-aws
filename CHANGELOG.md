@@ -80,6 +80,11 @@ history.
 - DB bootstrap Job images: `amazon/aws-cli:2.42.2`, `postgres:19-alpine`. (#25)
 - `hmac` 0.13 and `sha2` 0.11 (signatures byte-identical), plus `md-5` for S3
   `Content-MD5`. GitHub Actions moved to their Node 24 releases. (#25, #28, #37)
+- **Reproducible builds.** `Cargo.lock` is committed for the plugin and the
+  integration harness. CI, the release workflow and the Makefile build with
+  `--locked`, and CI fails if a lockfile is out of sync with its `Cargo.toml`.
+  `deckwatch-plugin-sdk` is pinned to a commit instead of following its `main`
+  branch. A release now builds exactly what CI tested. (#40)
 
 ### Fixed
 - **Provisioning a resource now grants the workload access to it.** Before this,

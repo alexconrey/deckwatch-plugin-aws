@@ -6,19 +6,22 @@ MOTO_ENDPOINT ?= http://localhost:5000
 
 .PHONY: build test integration clean
 
+# Every target builds with --locked, like CI: cargo fails instead of rewriting
+# Cargo.lock when it doesn't match Cargo.toml. After editing a Cargo.toml, run
+# `cargo update --workspace` in that directory and commit the lockfile.
 build:
-	cargo build --release --target $(WASM_TARGET)
+	cargo build --locked --release --target $(WASM_TARGET)
 	mkdir -p dist
 	cp $(OUT) $(DIST)
 	@echo "artifact: $(DIST) ($$(wc -c < $(DIST)) bytes)"
 
 test:
-	cargo test --target $$(rustc -vV | sed -n 's/host: //p')
+	cargo test --locked --target $$(rustc -vV | sed -n 's/host: //p')
 
 # Requires a moto server: docker run --rm -p 5000:5000 motoserver/moto:5.2.6
 integration: build
 	cd integration && MOTO_ENDPOINT=$(MOTO_ENDPOINT) \
-		cargo test --target $$(rustc -vV | sed -n 's/host: //p')
+		cargo test --locked --target $$(rustc -vV | sed -n 's/host: //p')
 
 clean:
 	cargo clean
