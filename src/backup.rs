@@ -45,7 +45,7 @@ pub fn configure_backup(
     creds: &AwsCredentials,
 ) -> Result<(), String> {
     // Derive account ID from the backup role ARN (field 4 in the colon-split).
-    // arn:aws:iam::<account-id>:role/<name>
+    // arn:<partition>:iam::<account-id>:role/<name>
     let account_id = backup_role_arn.split(':').nth(4).unwrap_or("*").to_string();
 
     let plan_name = format!("{rds_identifier}-backup");
@@ -74,7 +74,7 @@ pub fn configure_backup(
     };
 
     // ── 2. CreateBackupSelection (409 = already exists, safe to ignore) ───────
-    let rds_arn = format!("arn:aws:rds:{region}:{account_id}:db:{rds_identifier}");
+    let rds_arn = crate::rds_instance_arn(region, &account_id, rds_identifier);
     let selection_name = format!("{rds_identifier}-selection");
     let selection_body = format!(
         r#"{{"BackupSelection":{{"SelectionName":"{selection_name}","IamRoleArn":"{backup_role_arn}","Resources":["{rds_arn}"]}}}}"#
