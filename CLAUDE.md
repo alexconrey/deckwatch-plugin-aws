@@ -58,9 +58,17 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
    ever raised on reconcile, never lowered or disabled. Revoke IAM only for
    resources that were actually removed, and delete the role only when
    `role_is_disposable()` says nothing is left on it.
-10. **Parse JSON with `serde_json`** (`json_str_field`), never with `"key":"`
-    substring matching. AWS doesn't promise compact JSON, and some fields are
-    numbers.
+10. **Parse and build JSON with `serde_json`** (`json_str_field`, `json!`), never
+    with `"key":"` substring matching or `format!`. AWS doesn't promise compact
+    JSON, some fields are numbers, and values must be escaped.
+11. **Every create path passes `tags` and every SQS/secret name goes through
+    `prefixed_name`.** Tags come from `configured_resource_tags(app, ns)`; the
+    name prefix from `RESOURCE_NAME_PREFIX`. Both keep the operator's IAM scoping
+    and cost allocation intact; a resource created without them escapes both.
+12. **Match the AWS SDKs' wire format exactly**: method, path, body members and
+    Content-Type. Check `aws <service> <op> --debug` against moto when adding an
+    API; that's how the Backup client's POST/`BackupPlanData`/JSON-RPC
+    content-type bug was found.
 
 ## Testing
 

@@ -211,8 +211,12 @@ IAM token as the password.
 | Workload role | `<namespace>-<app>-rds` | `aws.deckwatch.io/role-name`, else `<namespace>-<app>-role` |
 | ServiceAccount | `<app>-aws-sa` | `<app>-aws-sa` |
 | RDS identifier | `<namespace>-<app>-db` | `<namespace>-<deployment>-db` |
-| SQS queue | `<namespace>-<app>-queue` | `<namespace>-<deployment>-queue` |
-| Secret | `<namespace>/<app>` | `<namespace>/<deployment>` |
+| SQS queue | `<RESOURCE_NAME_PREFIX><namespace>-<app>-queue` | `<RESOURCE_NAME_PREFIX><namespace>-<deployment>-queue` |
+| Secret | `<RESOURCE_NAME_PREFIX><namespace>/<app>` | `<RESOURCE_NAME_PREFIX><namespace>/<deployment>` |
+
+`RESOURCE_NAME_PREFIX` also applies to names chosen in the UI or set in
+annotations. All resources are tagged; see
+[Resource tags](configuration.md#resource-tags).
 
 The `-rds` role suffix is historical: RDS was the first resource to create the role.
 S3 attaches to the same role so that an application keeps a single identity.
