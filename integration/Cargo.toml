@@ -1,0 +1,26 @@
+# Integration tests: run the compiled plugin.wasm in an extism host against a
+# moto AWS emulator and verify the resulting AWS state with the AWS SDK.
+#
+# Kept out of the plugin crate so its WASM build never pulls in wasmtime or the
+# AWS SDK. See README.md in this directory for how to run it.
+[package]
+name = "deckwatch-plugin-aws-integration"
+version = "0.0.0"
+edition = "2021"
+# extism 1.41 → wasmtime 49 requires Rust 1.96.
+rust-version = "1.96"
+publish = false
+
+# Standalone: not a member of any parent workspace.
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+deckwatch-plugin-sdk = { git = "https://github.com/alexconrey/deckwatch-plugin-sdk", branch = "main" }
+extism = "1.41"
+aws-config = { version = "1.13", features = ["behavior-version-latest"] }
+aws-sdk-iam = "1.139"
+aws-sdk-s3 = "1.161"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }

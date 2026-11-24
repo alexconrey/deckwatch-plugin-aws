@@ -99,7 +99,8 @@ fn backup_post(
     body: &str,
     creds: &AwsCredentials,
 ) -> Result<String, String> {
-    let host = format!("backup.{region}.amazonaws.com");
+    let ep = crate::service_endpoint(&format!("backup.{region}.amazonaws.com"))?;
+    let host = ep.host.clone();
     let datetime = aws_sign::utc_now_iso8601(region);
 
     let (auth, payload_hash) = aws_sign::authorization_header(
@@ -117,7 +118,7 @@ fn backup_post(
         Some("application/x-amz-json-1.1"),
     );
 
-    let url = format!("https://{host}{path}");
+    let url = format!("{}{path}", ep.base_url);
     let mut req = HttpRequest::new(&url)
         .with_method("POST")
         .with_header("Content-Type", "application/x-amz-json-1.1")
@@ -177,7 +178,8 @@ fn find_plan_id_in_list(json: &str, plan_name: &str) -> Option<String> {
 }
 
 fn backup_get(region: &str, path: &str, creds: &AwsCredentials) -> Result<String, String> {
-    let host = format!("backup.{region}.amazonaws.com");
+    let ep = crate::service_endpoint(&format!("backup.{region}.amazonaws.com"))?;
+    let host = ep.host.clone();
     let datetime = aws_sign::utc_now_iso8601(region);
 
     let path_only = path.split('?').next().unwrap_or(path);
@@ -198,7 +200,7 @@ fn backup_get(region: &str, path: &str, creds: &AwsCredentials) -> Result<String
         None,
     );
 
-    let url = format!("https://{host}{path}");
+    let url = format!("{}{path}", ep.base_url);
     let mut req = HttpRequest::new(&url)
         .with_method("GET")
         .with_header("Host", &host)

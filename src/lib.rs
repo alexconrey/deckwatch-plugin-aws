@@ -254,6 +254,58 @@ fn aws_partition(region: &str) -> &'static str {
     }
 }
 
+/// Where requests for one AWS service are sent.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, PartialEq)]
+pub(crate) struct Endpoint {
+    /// Scheme and authority with no trailing slash,
+    /// e.g. `https://rds.us-east-1.amazonaws.com` or `http://localhost:5000`.
+    pub base_url: String,
+    /// Authority sent as the `Host` header and covered by the SigV4 signature.
+    pub host: String,
+    /// True when `AWS_ENDPOINT_URL` redirected the request. S3 then switches
+    /// to path-style addressing, since an emulator can't serve
+    /// `<bucket>.<host>` virtual hosts.
+    pub overridden: bool,
+}
+
+/// Resolve the endpoint for a service whose real hostname is `default_host`.
+///
+/// `override_url` is the `AWS_ENDPOINT_URL` plugin config value — the same
+/// name the AWS SDKs use — and sends every service to one URL (e.g. moto or
+/// LocalStack). A malformed override is an error rather than a silent
+/// fallback, so a misconfigured test can never reach real AWS.
+#[cfg(any(target_arch = "wasm32", test))]
+fn resolve_endpoint(override_url: Option<&str>, default_host: &str) -> Result<Endpoint, String> {
+    let Some(raw) = override_url.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Endpoint {
+            base_url: format!("https://{default_host}"),
+            host: default_host.to_string(),
+            overridden: false,
+        });
+    };
+    let invalid = || format!("AWS_ENDPOINT_URL {raw:?} must be http(s)://host[:port] with no path");
+    let (scheme, authority) = raw
+        .trim_end_matches('/')
+        .split_once("://")
+        .ok_or_else(invalid)?;
+    if !matches!(scheme, "http" | "https") || authority.is_empty() || authority.contains('/') {
+        return Err(invalid());
+    }
+    Ok(Endpoint {
+        base_url: format!("{scheme}://{authority}"),
+        host: authority.to_string(),
+        overridden: true,
+    })
+}
+
+/// [`resolve_endpoint`] using the `AWS_ENDPOINT_URL` plugin config value.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn service_endpoint(default_host: &str) -> Result<Endpoint, String> {
+    let raw = config::get("AWS_ENDPOINT_URL").ok().flatten();
+    resolve_endpoint(raw.as_deref(), default_host)
+}
+
 /// Inline policy granting object read/write/delete and listing on one bucket.
 ///
 /// `region` is the bucket's region and only selects the ARN partition — S3
@@ -1266,6 +1318,7 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
         config_schema: vec![
             ConfigField { key: "AWS_REGION".into(), label: "AWS Region".into(), description: "Region for provisioned resources.".into(), field_type: ConfigFieldType::String, default: Some("us-east-1".into()), required: true, options: vec![], env_source: Some("AWS_REGION".into()) },
             ConfigField { key: "OIDC_PROVIDER_ARN".into(), label: "OIDC Provider ARN".into(), description: "ARN of the EKS OIDC provider (arn:aws:iam::<account>:oidc-provider/<url>). Required for IRSA.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
+            ConfigField { key: "AWS_ENDPOINT_URL".into(), label: "AWS Endpoint URL".into(), description: "Send every AWS API call to this http(s)://host[:port] instead of AWS (e.g. moto or LocalStack for testing). S3 switches to path-style addressing. Leave empty in production.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "IAM_ENDPOINT".into(), label: "IAM Endpoint".into(), description: "Override IAM hostname. Auto-detected (iam.us-gov.amazonaws.com for GovCloud).".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "IAM_SIGNING_REGION".into(), label: "IAM Signing Region".into(), description: "Override Sig V4 region for IAM. Auto-detected from region.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "ROLE_PATH".into(), label: "IAM Role Path".into(), description: "Path prefix for created roles. Must start and end with /.".into(), field_type: ConfigFieldType::String, default: Some("/deckwatch-plugin/".into()), required: false, options: vec![], env_source: None },
@@ -2323,6 +2376,49 @@ mod tests {
         let result = apply_inner(&c, "");
         assert_eq!(find_env(&result, "POSTGRES_USER"), Some("radiation-db"));
         assert_eq!(find_env(&result, "DB_NAME"), Some("radiation"));
+    }
+
+    // ── AWS_ENDPOINT_URL override ─────────────────────────────────────────────
+
+    #[test]
+    fn endpoint_defaults_to_real_aws_over_https() {
+        let ep = resolve_endpoint(None, "rds.us-gov-west-1.amazonaws.com").unwrap();
+        assert_eq!(ep.base_url, "https://rds.us-gov-west-1.amazonaws.com");
+        assert_eq!(ep.host, "rds.us-gov-west-1.amazonaws.com");
+        assert!(!ep.overridden);
+        // An empty config value is treated as unset.
+        assert_eq!(
+            resolve_endpoint(Some("  "), "iam.amazonaws.com")
+                .unwrap()
+                .host,
+            "iam.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn endpoint_override_redirects_every_service() {
+        for raw in ["http://localhost:5000", "http://localhost:5000/"] {
+            let ep = resolve_endpoint(Some(raw), "s3.us-east-1.amazonaws.com").unwrap();
+            assert_eq!(ep.base_url, "http://localhost:5000");
+            assert_eq!(ep.host, "localhost:5000");
+            assert!(ep.overridden);
+        }
+    }
+
+    // A bad override must fail loudly, never fall back to real AWS.
+    #[test]
+    fn endpoint_override_rejects_malformed_urls() {
+        for raw in [
+            "localhost:5000",
+            "ftp://moto",
+            "http://",
+            "http://moto:5000/prefix",
+        ] {
+            assert!(
+                resolve_endpoint(Some(raw), "iam.amazonaws.com").is_err(),
+                "{raw:?} should be rejected"
+            );
+        }
     }
 
     // ── S3 IAM policy wiring ──────────────────────────────────────────────────

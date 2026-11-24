@@ -142,7 +142,8 @@ fn arn_from_queue_url(queue_url: &str, region: &str) -> Option<String> {
 }
 
 fn sqs_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
-    let host = format!("sqs.{}.amazonaws.com", creds.region);
+    let ep = crate::service_endpoint(&format!("sqs.{}.amazonaws.com", creds.region))?;
+    let host = ep.host.clone();
     let datetime = aws_sign::utc_now_iso8601(&creds.region);
     let (auth, payload_hash) = aws_sign::authorization_header(
         "POST",
@@ -159,7 +160,7 @@ fn sqs_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
         Some("application/x-www-form-urlencoded"),
     );
 
-    let url = format!("https://{host}/");
+    let url = format!("{}/", ep.base_url);
     let mut req = HttpRequest::new(&url)
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")
