@@ -254,56 +254,54 @@ const MANAGED_BY_VALUE: &str = "deckwatch-plugin-aws";
 #[cfg(any(target_arch = "wasm32", test))]
 const MAX_OPERATOR_TAGS: usize = 47;
 
-/// Parse `RESOURCE_TAGS`: `Key=Value` pairs separated by commas or newlines,
-/// e.g. `Team=platform,CostCenter=1234`. A later duplicate key wins.
+/// Parse `RESOURCE_TAGS`. Two forms are accepted:
+/// - `Key=Value` pairs separated by commas or newlines, e.g.
+///   `Team=platform,CostCenter=1234` (what the text field takes today);
+/// - a JSON object of string values, e.g. `{"Team":"platform"}`, which is how
+///   deckwatch stores a `key_value` config field. Accepting it now means the
+///   field can switch to the row-per-pair editor later without migrating
+///   saved values.
 ///
-/// Rejects anything AWS would refuse, rather than failing every API call
-/// later: empty or over-long keys (128) and values (256), characters outside
-/// AWS's tag character set, the reserved `aws:` prefix, keys under the
-/// plugin's own `deckwatch.io/` namespace, and more than 47 tags.
+/// A later duplicate key wins. Rejects anything AWS would refuse, rather than
+/// failing every API call later: empty or over-long keys (128) and values
+/// (256), characters outside AWS's tag character set, the reserved `aws:`
+/// prefix, keys under the plugin's own `deckwatch.io/` namespace, and more
+/// than 47 tags.
 #[cfg(any(target_arch = "wasm32", test))]
 fn parse_resource_tags(raw: &str) -> Result<Tags, String> {
-    fn valid_chars(s: &str) -> bool {
-        s.chars()
-            .all(|c| c.is_alphanumeric() || " _.:/=+-@".contains(c))
-    }
+    let pairs: Vec<(String, String)> = if raw.trim_start().starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| format!("RESOURCE_TAGS is not a valid JSON object: {e}"))?;
+        let object = value
+            .as_object()
+            .ok_or("RESOURCE_TAGS JSON must be an object of string values")?;
+        object
+            .iter()
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s) => Ok((k.trim().to_string(), s.trim().to_string())),
+                other => Err(format!(
+                    "RESOURCE_TAGS value for {k:?} must be a string, got {other}"
+                )),
+            })
+            .collect::<Result<_, _>>()?
+    } else {
+        raw.split([',', '\n'])
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(|entry| {
+                entry
+                    .split_once('=')
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                    .ok_or_else(|| format!("RESOURCE_TAGS entry {entry:?} is not Key=Value"))
+            })
+            .collect::<Result<_, _>>()?
+    };
+
     let mut tags: Tags = Vec::new();
-    for entry in raw
-        .split([',', '\n'])
-        .map(str::trim)
-        .filter(|e| !e.is_empty())
-    {
-        let (key, value) = entry
-            .split_once('=')
-            .map(|(k, v)| (k.trim(), v.trim()))
-            .ok_or_else(|| format!("RESOURCE_TAGS entry {entry:?} is not Key=Value"))?;
-        if key.is_empty() || key.chars().count() > 128 {
-            return Err(format!(
-                "RESOURCE_TAGS key {key:?} must be 1-128 characters"
-            ));
-        }
-        if value.chars().count() > 256 {
-            return Err(format!(
-                "RESOURCE_TAGS value for {key:?} is over 256 characters"
-            ));
-        }
-        if !valid_chars(key) || !valid_chars(value) {
-            return Err(format!(
-                "RESOURCE_TAGS entry {entry:?} uses characters AWS doesn't allow in tags"
-            ));
-        }
-        if key.to_ascii_lowercase().starts_with("aws:") {
-            return Err(format!(
-                "RESOURCE_TAGS key {key:?} uses the reserved aws: prefix"
-            ));
-        }
-        if key.starts_with("deckwatch.io/") {
-            return Err(format!(
-                "RESOURCE_TAGS key {key:?} is reserved for the plugin's own tags"
-            ));
-        }
-        tags.retain(|(k, _)| k != key);
-        tags.push((key.to_string(), value.to_string()));
+    for (key, value) in pairs {
+        validate_tag(&key, &value)?;
+        tags.retain(|(k, _)| *k != key);
+        tags.push((key, value));
     }
     if tags.len() > MAX_OPERATOR_TAGS {
         return Err(format!(
@@ -312,6 +310,41 @@ fn parse_resource_tags(raw: &str) -> Result<Tags, String> {
         ));
     }
     Ok(tags)
+}
+
+/// One configured tag against AWS's tag rules and the plugin's reserved keys.
+#[cfg(any(target_arch = "wasm32", test))]
+fn validate_tag(key: &str, value: &str) -> Result<(), String> {
+    fn valid_chars(s: &str) -> bool {
+        s.chars()
+            .all(|c| c.is_alphanumeric() || " _.:/=+-@".contains(c))
+    }
+    if key.is_empty() || key.chars().count() > 128 {
+        return Err(format!(
+            "RESOURCE_TAGS key {key:?} must be 1-128 characters"
+        ));
+    }
+    if value.chars().count() > 256 {
+        return Err(format!(
+            "RESOURCE_TAGS value for {key:?} is over 256 characters"
+        ));
+    }
+    if !valid_chars(key) || !valid_chars(value) {
+        return Err(format!(
+            "RESOURCE_TAGS tag {key:?}={value:?} uses characters AWS doesn't allow in tags"
+        ));
+    }
+    if key.to_ascii_lowercase().starts_with("aws:") {
+        return Err(format!(
+            "RESOURCE_TAGS key {key:?} uses the reserved aws: prefix"
+        ));
+    }
+    if key.starts_with("deckwatch.io/") {
+        return Err(format!(
+            "RESOURCE_TAGS key {key:?} is reserved for the plugin's own tags"
+        ));
+    }
+    Ok(())
 }
 
 /// Tags for one application's resources: the operator's tags plus the managed
@@ -3410,6 +3443,30 @@ mod tests {
                 ("Team".to_string(), "y".to_string()),
             ]
         );
+    }
+
+    // deckwatch stores a key_value config field as a JSON object; accepting it
+    // now lets RESOURCE_TAGS switch to the row editor without a migration.
+    #[test]
+    fn parse_resource_tags_accepts_the_key_value_json_form() {
+        let tags = parse_resource_tags(r#"{"Team":"platform","CostCenter":"1234"}"#).unwrap();
+        let map: std::collections::HashMap<_, _> = tags.into_iter().collect();
+        assert_eq!(map.get("Team").map(String::as_str), Some("platform"));
+        assert_eq!(map.get("CostCenter").map(String::as_str), Some("1234"));
+        assert!(parse_resource_tags("{}").unwrap().is_empty());
+        // The same AWS rules apply to the JSON form.
+        for bad in [
+            r#"{"aws:x":"y"}"#,
+            r#"{"deckwatch.io/application":"spoof"}"#,
+            r#"{"Count":3}"#,
+            r#"["Team"]"#,
+            "{broken",
+        ] {
+            assert!(
+                parse_resource_tags(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 
     // Fail at parse time, not on every AWS call later.

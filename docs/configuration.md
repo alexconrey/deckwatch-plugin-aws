@@ -113,7 +113,7 @@ Set these keys in the plugin's `config`. Defaults come from the plugin's
 | `ROLE_PATH` | `/deckwatch-plugin/` | IAM path for every role the plugin creates. Must start and end with `/`. Scope the plugin's IAM permissions to this path. |
 | `BUCKET_PREFIX` | *(empty)* | Prepended to every S3 bucket name, e.g. `myorg-` turns `uploads` into `myorg-uploads`. |
 | `RESOURCE_NAME_PREFIX` | *(empty)* | Prepended to every SQS queue and Secrets Manager secret name, both defaults and names chosen in the UI, e.g. `k2-dw-` produces `k2-dw-<namespace>-<app>-queue`. It's never added twice. Set it so the plugin's IAM policy can be [scoped to `<prefix>*`](#scoping-sqs-and-secrets-manager-to-a-prefix) instead of every queue and secret in the account. |
-| `RESOURCE_TAGS` | *(empty)* | Tags applied to every AWS resource the plugin manages: IAM roles, RDS instances (and their snapshots), S3 buckets, SQS queues, secrets and backup plans. Write them as `Key=Value` pairs separated by commas or newlines, e.g. `Team=platform,CostCenter=1234`. Validated against AWS's tag rules (at most 47 tags; no `aws:` or `deckwatch.io/` keys). See [Resource tags](#resource-tags). |
+| `RESOURCE_TAGS` | *(empty)* | Tags applied to every AWS resource the plugin manages: IAM roles, RDS instances (and their snapshots), S3 buckets, SQS queues, secrets and backup plans. Write them as `Key=Value` pairs separated by commas or newlines, e.g. `Team=platform,CostCenter=1234`. A JSON object of string values (`{"Team":"platform"}`) is also accepted; that's how deckwatch will store the field once its row-per-tag editor ships. Validated against AWS's tag rules (at most 47 tags; no `aws:` or `deckwatch.io/` keys). See [Resource tags](#resource-tags). |
 
 ### Credentials
 
