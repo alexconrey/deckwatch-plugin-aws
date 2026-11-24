@@ -21,6 +21,7 @@ deckwatch-plugin-sdk = { git = "https://github.com/alexconrey/deckwatch-plugin-s
 extism = "1.41"
 aws-config = { version = "1.13", features = ["behavior-version-latest"] }
 aws-sdk-iam = "1.139"
+aws-sdk-rds = "1"
 aws-sdk-s3 = "1.161"
 aws-sdk-secretsmanager = "1"
 aws-sdk-sqs = "1"
