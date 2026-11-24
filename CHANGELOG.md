@@ -7,7 +7,18 @@ history.
 
 ## [Unreleased]
 
+### Added
+- `RDS_BACKUP_RETENTION_DAYS` (default **14**, range 1–35) and `RDS_BACKUP_WINDOW`
+  config keys.
+
 ### Changed
+- **RDS instances keep 14 days of automated backups by default**, instead of RDS's
+  API default of 1 day. Existing instances below the setting are raised on
+  reconcile (no outage between non-zero values). Retention is never lowered, and
+  disabled backups are reported rather than re-enabled automatically. Snapshots
+  copy instance tags.
+- Deleting an RDS instance keeps its automated backups until they expire
+  (`DeleteAutomatedBackups=false`), in addition to the final snapshot.
 - **Removing a resource never destroys data without a recovery path.**
   - RDS always takes a final snapshot, now timestamped
     (`<identifier>-final-YYYYMMDD-HHMMSS`) so repeat deletions can't collide.

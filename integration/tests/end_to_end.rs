@@ -205,6 +205,22 @@ async fn iam_client(region: &str) -> aws_sdk_iam::Client {
     aws_sdk_iam::Client::new(&sdk_config(region).await)
 }
 
+async fn rds_client(region: &str) -> aws_sdk_rds::Client {
+    aws_sdk_rds::Client::new(&sdk_config(region).await)
+}
+
+async fn db_instance(rds: &aws_sdk_rds::Client, id: &str) -> aws_sdk_rds::types::DbInstance {
+    rds.describe_db_instances()
+        .db_instance_identifier(id)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("RDS instance {id} must exist: {e:?}"))
+        .db_instances()
+        .first()
+        .cloned()
+        .expect("instance in response")
+}
+
 async fn sqs_client(region: &str) -> aws_sdk_sqs::Client {
     aws_sdk_sqs::Client::new(&sdk_config(region).await)
 }
@@ -821,6 +837,123 @@ async fn deprovision_keeps_sqs_queue_that_still_has_messages() {
         role_policies(&iam, &role_name).await,
         Some(vec!["deckwatch-sqs-access".to_string()]),
         "access is kept so the queue can be drained"
+    );
+}
+
+/// RDS's API default is 1 day of automated backups. Instances the plugin
+/// creates must get the plugin's retention (14 days by default) and copy tags
+/// to snapshots.
+#[tokio::test]
+async fn provisioned_rds_gets_14_day_backup_retention() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("ledger-it", unique("ledger"));
+    let identifier = unique("ledger-db");
+    let mut plugin = load_plugin(region, &[]);
+
+    let req = resource_request(app, ns, "rds", &[("identifier", identifier)]);
+    let result = call_provision(&mut plugin, &req);
+    assert!(
+        result.errors.is_empty(),
+        "provision errors: {:?}",
+        result.errors
+    );
+
+    let db = db_instance(&rds_client(region).await, identifier).await;
+    assert_eq!(db.backup_retention_period(), Some(14));
+    assert_eq!(db.copy_tags_to_snapshot(), Some(true));
+    assert_eq!(db.deletion_protection(), Some(true));
+}
+
+/// Instances created with RDS's 1-day default (all five plugin-created
+/// instances on zeus) are raised to the configured retention on the next
+/// reconcile, without being lowered or recreated.
+#[tokio::test]
+async fn existing_rds_backup_retention_is_raised_on_reconcile() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("legacy-it", unique("legacy"));
+    let identifier = unique("legacy-db");
+    let rds = rds_client(region).await;
+    rds.create_db_instance()
+        .db_instance_identifier(identifier)
+        .db_instance_class("db.t3.micro")
+        .engine("postgres")
+        .allocated_storage(20)
+        .master_username("dbadmin")
+        .master_user_password("not-a-real-password-1")
+        .backup_retention_period(1)
+        .send()
+        .await
+        .expect("seed a 1-day-retention instance");
+    assert_eq!(
+        db_instance(&rds, identifier)
+            .await
+            .backup_retention_period(),
+        Some(1)
+    );
+
+    let mut plugin = load_plugin(region, &[("RDS_BACKUP_RETENTION_DAYS", "21")]);
+    let req = resource_request(app, ns, "rds", &[("identifier", identifier)]);
+    let result = call_provision(&mut plugin, &req);
+    assert!(
+        result.errors.is_empty(),
+        "provision errors: {:?}",
+        result.errors
+    );
+
+    assert_eq!(
+        db_instance(&rds, identifier)
+            .await
+            .backup_retention_period(),
+        Some(21),
+        "retention must be raised to RDS_BACKUP_RETENTION_DAYS"
+    );
+}
+
+/// Removing an RDS resource always leaves a timestamped final snapshot.
+#[tokio::test]
+async fn rds_deprovision_always_takes_a_final_snapshot() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("archive-it", unique("archive"));
+    let identifier = unique("archive-db");
+    let rds = rds_client(region).await;
+    let mut plugin = load_plugin(region, &[]);
+
+    let req = resource_request(app, ns, "rds", &[("identifier", identifier)]);
+    let provisioned = call_provision(&mut plugin, &req);
+    assert!(
+        provisioned.errors.is_empty(),
+        "provision errors: {:?}",
+        provisioned.errors
+    );
+
+    let removed = call_deprovision(&mut plugin, &deprovision_request(&req, &provisioned));
+    assert!(
+        removed.errors.is_empty(),
+        "deprovision errors: {:?}",
+        removed.errors
+    );
+
+    let snapshots = rds
+        .describe_db_snapshots()
+        .db_instance_identifier(identifier)
+        .snapshot_type("manual")
+        .send()
+        .await
+        .expect("describe snapshots");
+    let names: Vec<&str> = snapshots
+        .db_snapshots()
+        .iter()
+        .filter_map(|s| s.db_snapshot_identifier())
+        .collect();
+    let prefix = format!("{identifier}-final-");
+    assert!(
+        names.iter().any(|n| n.starts_with(&prefix)),
+        "expected a final snapshot named {prefix}YYYYMMDD-HHMMSS, got {names:?}"
+    );
+    assert!(
+        removed.message.contains("final snapshot"),
+        "message: {}",
+        removed.message
     );
 }
 

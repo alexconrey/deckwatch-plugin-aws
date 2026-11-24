@@ -135,6 +135,8 @@ Set these keys in the plugin's `config`. Defaults come from the plugin's
 | `RDS_DEFAULT_SUBNET_GROUP` | *(none)* | DB subnet group for new instances. Needed to place them in the right VPC. |
 | `RDS_DEFAULT_SECURITY_GROUPS` | *(none)* | Comma-separated VPC security group IDs for new instances. |
 | `RDS_DEFAULT_IAM_AUTH` | `true` | Enables IAM database auth on new instances unless the resource or annotation says otherwise. |
+| `RDS_BACKUP_RETENTION_DAYS` | `14` | Days of automated backups (point-in-time recovery) to keep, 1–35. Existing instances below this are **raised** on reconcile and never lowered. `0` and invalid values fall back to 14; the plugin never disables backups. See [Operations → Backups](operations.md#backups). |
+| `RDS_BACKUP_WINDOW` | *(RDS chooses)* | Daily backup window for new instances, `hh24:mi-hh24:mi` in UTC, at least 30 minutes. |
 | `DB_BOOTSTRAP_AWSCLI_IMAGE` | `amazon/aws-cli:2.42.2` | Init-container image for the [IAM database user bootstrap Job](identity.md#rds-iam-authentication). |
 | `DB_BOOTSTRAP_PSQL_IMAGE` | `postgres:19-alpine` | psql image for the bootstrap Job. Must be the same as, or newer than, the RDS engine major version. |
 

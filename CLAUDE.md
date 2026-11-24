@@ -52,8 +52,10 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
 8. **Every outgoing URL goes through `service_endpoint()`**, so `AWS_ENDPOINT_URL` can
    redirect it in tests. A malformed override must fail, never fall back to AWS.
 9. **Deprovisioning never destroys data without a recovery path.** RDS always takes a
-   final snapshot (there's no skip option), S3 buckets are kept, SQS queues with
-   messages are kept, and secrets keep their recovery window. Revoke IAM only for
+   final snapshot (there's no skip option) and keeps its automated backups, S3
+   buckets are kept, SQS queues with messages are kept, and secrets keep their
+   recovery window. RDS automated-backup retention defaults to 14 days and is only
+   ever raised on reconcile, never lowered or disabled. Revoke IAM only for
    resources that were actually removed, and delete the role only when
    `role_is_disposable()` says nothing is left on it.
 10. **Parse JSON with `serde_json`** (`json_str_field`), never with `"key":"`
