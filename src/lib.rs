@@ -411,6 +411,77 @@ fn role_is_disposable(inline_policies: &[String], attached_policy_arns: &[String
     inline_policies.is_empty() && attached_policy_arns.is_empty()
 }
 
+// ── RDS automated backups ─────────────────────────────────────────────────────
+
+/// Automated-backup retention for RDS instances when `RDS_BACKUP_RETENTION_DAYS`
+/// is unset. Without an explicit value, RDS defaults to 1 day, which allows only
+/// a 24-hour point-in-time recovery window.
+#[cfg(any(target_arch = "wasm32", test))]
+const DEFAULT_RDS_BACKUP_RETENTION_DAYS: u32 = 14;
+
+/// The longest automated-backup retention RDS allows.
+#[cfg(any(target_arch = "wasm32", test))]
+const MAX_RDS_BACKUP_RETENTION_DAYS: u32 = 35;
+
+/// Parse `RDS_BACKUP_RETENTION_DAYS` into 1–35 days.
+///
+/// Empty, invalid or `0` values fall back to the default: the plugin never
+/// disables automated backups. Values above the RDS maximum are capped.
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_backup_retention_days(raw: Option<&str>) -> u32 {
+    match raw.map(str::trim).and_then(|v| v.parse::<u32>().ok()) {
+        Some(0) | None => DEFAULT_RDS_BACKUP_RETENTION_DAYS,
+        Some(days) => days.min(MAX_RDS_BACKUP_RETENTION_DAYS),
+    }
+}
+
+/// What to do about an existing instance's automated-backup retention.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, PartialEq)]
+enum RetentionAction {
+    /// Already at or above the configured retention. Never lowered.
+    Keep,
+    /// Raise to the configured retention. Changing between non-zero values
+    /// takes effect without an outage.
+    Raise(u32),
+    /// Automated backups are disabled (`0`). Re-enabling them can cause a brief
+    /// outage, so warn instead of changing it during a reconcile.
+    WarnDisabled,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn retention_action(current_days: u32, configured_days: u32) -> RetentionAction {
+    if current_days == 0 {
+        RetentionAction::WarnDisabled
+    } else if current_days < configured_days {
+        RetentionAction::Raise(configured_days)
+    } else {
+        RetentionAction::Keep
+    }
+}
+
+/// `RDS_BACKUP_RETENTION_DAYS` from plugin config (see [`parse_backup_retention_days`]).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn configured_backup_retention_days() -> u32 {
+    parse_backup_retention_days(
+        config::get("RDS_BACKUP_RETENTION_DAYS")
+            .ok()
+            .flatten()
+            .as_deref(),
+    )
+}
+
+/// `RDS_BACKUP_WINDOW` from plugin config: `hh24:mi-hh24:mi` in UTC, or `None`
+/// to let RDS choose a window.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn configured_backup_window() -> Option<String> {
+    config::get("RDS_BACKUP_WINDOW")
+        .ok()
+        .flatten()
+        .map(|w| w.trim().to_string())
+        .filter(|w| !w.is_empty())
+}
+
 /// Final snapshot name for a deleted RDS instance: `<identifier>-final-YYYYMMDD-HHMMSS`.
 ///
 /// The timestamp keeps the name unique, so deleting an instance that was
@@ -1310,6 +1381,9 @@ fn apply_with_aws(
     let rds_endpoint = if let Some(ref rds_cfg) = cfg.rds {
         match rds::ensure_instance(rds_cfg, creds) {
             Ok(instance) => {
+                for warning in &instance.warnings {
+                    log!(LogLevel::Warn, "deckwatch-plugin-aws: {warning}");
+                }
                 // rds-db:connect is scoped to the DbiResourceId, which is only
                 // known once the instance exists; the next reconcile attaches it.
                 if rds_cfg.iam_auth && !instance.resource_id.is_empty() {
@@ -1541,6 +1615,8 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "RDS_DEFAULT_SUBNET_GROUP".into(), label: "RDS Default Subnet Group".into(), description: "DB subnet group name for all provisioned RDS instances. Required to place instances in the correct VPC.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "RDS_DEFAULT_SECURITY_GROUPS".into(), label: "RDS Default Security Groups".into(), description: "Comma-separated VPC security group IDs applied to all provisioned RDS instances.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "RDS_DEFAULT_IAM_AUTH".into(), label: "RDS IAM Auth by Default".into(), description: "Enable IAM database authentication on all provisioned RDS instances. Default: true.".into(), field_type: ConfigFieldType::Bool, default: Some("true".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "RDS_BACKUP_RETENTION_DAYS".into(), label: "RDS Backup Retention (days)".into(), description: "Days of automated backups (point-in-time recovery) to keep for RDS instances, 1-35. Existing instances below this are raised on reconcile; never lowered. Default: 14.".into(), field_type: ConfigFieldType::String, default: Some("14".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "RDS_BACKUP_WINDOW".into(), label: "RDS Backup Window".into(), description: "Daily automated-backup window for new RDS instances, hh24:mi-hh24:mi in UTC (at least 30 minutes). Empty lets RDS choose.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "DB_BOOTSTRAP_AWSCLI_IMAGE".into(), label: "DB Bootstrap AWS CLI Image".into(), description: "Image for the init container that reads the RDS master secret when creating the IAM database user.".into(), field_type: ConfigFieldType::String, default: Some(DEFAULT_BOOTSTRAP_AWSCLI_IMAGE.into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "DB_BOOTSTRAP_PSQL_IMAGE".into(), label: "DB Bootstrap psql Image".into(), description: "Image with psql used to create the IAM database user. Match or exceed the RDS engine major version.".into(), field_type: ConfigFieldType::String, default: Some(DEFAULT_BOOTSTRAP_PSQL_IMAGE.into()), required: false, options: vec![], env_source: None },
         ],
@@ -1916,6 +1992,7 @@ pub fn provision(
 
             match rds::ensure_instance(&cfg, &creds) {
                 Ok(instance) => {
+                    result.warnings.extend(instance.warnings.iter().cloned());
                     let port = engine_port(&engine).to_string();
                     let endpoint = instance.endpoint.clone();
                     let resource_id = instance.resource_id.clone();
@@ -3051,6 +3128,38 @@ mod tests {
             &none,
             &["arn:aws:iam::aws:policy/ReadOnlyAccess".into()]
         ));
+    }
+
+    // RDS's API default is 1 day of automated backups. The plugin's default
+    // is 14 days, and it can never be configured to disable backups.
+    #[test]
+    fn backup_retention_defaults_to_14_days_and_is_clamped() {
+        assert_eq!(parse_backup_retention_days(None), 14);
+        assert_eq!(parse_backup_retention_days(Some("")), 14);
+        assert_eq!(parse_backup_retention_days(Some("garbage")), 14);
+        assert_eq!(
+            parse_backup_retention_days(Some("0")),
+            14,
+            "never disable backups"
+        );
+        assert_eq!(parse_backup_retention_days(Some(" 7 ")), 7);
+        assert_eq!(parse_backup_retention_days(Some("35")), 35);
+        assert_eq!(parse_backup_retention_days(Some("90")), 35, "RDS maximum");
+    }
+
+    // Existing instances are only ever raised; disabled backups are surfaced
+    // rather than re-enabled mid-reconcile (that can cause an outage).
+    #[test]
+    fn retention_action_only_raises_nonzero_retention() {
+        assert_eq!(retention_action(1, 14), RetentionAction::Raise(14));
+        assert_eq!(retention_action(13, 14), RetentionAction::Raise(14));
+        assert_eq!(retention_action(14, 14), RetentionAction::Keep);
+        assert_eq!(
+            retention_action(30, 14),
+            RetentionAction::Keep,
+            "never lowered"
+        );
+        assert_eq!(retention_action(0, 14), RetentionAction::WarnDisabled);
     }
 
     #[test]

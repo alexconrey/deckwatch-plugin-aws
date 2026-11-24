@@ -25,10 +25,12 @@ pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<RdsIns
                 cfg.identifier,
                 info.status
             );
+            let warnings = reconcile_backup_retention(&cfg.identifier, &info, creds);
             Ok(RdsInstance {
                 endpoint: info.endpoint_address,
                 resource_id: info.resource_id,
                 master_secret_arn: info.master_secret_arn,
+                warnings,
             })
         }
         None => {
@@ -55,6 +57,52 @@ pub struct RdsInstance {
     /// ARN of the Secrets Manager secret holding the master credentials
     /// (`ManageMasterUserPassword`). Empty when RDS does not manage it.
     pub master_secret_arn: String,
+    /// Problems the caller should surface (e.g. automated backups disabled).
+    pub warnings: Vec<String>,
+}
+
+/// Bring an existing instance's automated-backup retention up to
+/// `RDS_BACKUP_RETENTION_DAYS`. Only raises it, and only while the instance is
+/// `available` (RDS rejects modifications otherwise; the next reconcile retries).
+fn reconcile_backup_retention(
+    identifier: &str,
+    info: &DbInstanceInfo,
+    creds: &AwsCredentials,
+) -> Vec<String> {
+    let Some(current) = info.backup_retention_days else {
+        return vec![];
+    };
+    if info.status != "available" {
+        return vec![];
+    }
+    let configured = crate::configured_backup_retention_days();
+    match crate::retention_action(current, configured) {
+        crate::RetentionAction::Keep => vec![],
+        crate::RetentionAction::Raise(days) => {
+            let body = format!(
+                "Action=ModifyDBInstance&Version=2014-10-31&DBInstanceIdentifier={}\
+                 &BackupRetentionPeriod={days}&ApplyImmediately=true",
+                url_encode(identifier)
+            );
+            match rds_query(&body, creds) {
+                Ok(_) => {
+                    log!(
+                        LogLevel::Info,
+                        "deckwatch-plugin-aws: RDS {identifier} backup retention raised from {current} to {days} days"
+                    );
+                    vec![]
+                }
+                Err(e) => vec![format!(
+                    "RDS {identifier}: could not raise backup retention from {current} to {days} days: {e}"
+                )],
+            }
+        }
+        crate::RetentionAction::WarnDisabled => vec![format!(
+            "RDS {identifier} has automated backups disabled (retention 0). Re-enabling them \
+             can cause a brief outage, so the plugin won't do it automatically; set \
+             BackupRetentionPeriod to {configured} during a maintenance window."
+        )],
+    }
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +111,8 @@ struct DbInstanceInfo {
     endpoint_address: String,
     resource_id: String,
     master_secret_arn: String,
+    /// `BackupRetentionPeriod` in days, if present in the response.
+    backup_retention_days: Option<u32>,
 }
 
 fn describe_db_instance(
@@ -90,12 +140,16 @@ fn describe_db_instance(
         endpoint_address: extract_tag(&xml, "Address").unwrap_or_default(),
         resource_id: extract_tag(&xml, "DbiResourceId").unwrap_or_default(),
         master_secret_arn: extract_tag(&xml, "SecretArn").unwrap_or_default(),
+        backup_retention_days: extract_tag(&xml, "BackupRetentionPeriod")
+            .and_then(|v| v.parse().ok()),
     }))
 }
 
 fn create_db_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<(), String> {
     let multi_az = cfg.multi_az.to_string();
     let iam_auth = cfg.iam_auth.to_string();
+    let retention = crate::configured_backup_retention_days().to_string();
+    let backup_window = crate::configured_backup_window();
 
     let mut params: Vec<(&str, &str)> = vec![
         ("DBInstanceIdentifier", &cfg.identifier),
@@ -110,6 +164,9 @@ fn create_db_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<(), Str
         // credential appears in the API call or plugin state.
         ("ManageMasterUserPassword", "true"),
         ("StorageEncrypted", "true"),
+        // Explicit retention: the API default is only 1 day of automated backups.
+        ("BackupRetentionPeriod", &retention),
+        ("CopyTagsToSnapshot", "true"),
         ("StorageType", "gp3"),
         ("PubliclyAccessible", "false"),
         ("DeletionProtection", "true"),
@@ -117,6 +174,9 @@ fn create_db_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<(), Str
 
     if let Some(ref sg) = cfg.subnet_group {
         params.push(("DBSubnetGroupName", sg));
+    }
+    if let Some(ref window) = backup_window {
+        params.push(("PreferredBackupWindow", window));
     }
 
     // Build repeated VPC security group parameters.
@@ -250,9 +310,12 @@ pub fn delete_instance(
 
     // 2. Delete the instance.
     // A final snapshot is always taken; there is deliberately no way to skip it.
+    // Automated backups are retained too (until their retention period ends),
+    // instead of RDS's default of deleting them with the instance.
     let delete_body = format!(
         "Action=DeleteDBInstance&Version=2014-10-31&DBInstanceIdentifier={}\
-         &SkipFinalSnapshot=false&FinalDBSnapshotIdentifier={}",
+         &SkipFinalSnapshot=false&FinalDBSnapshotIdentifier={}\
+         &DeleteAutomatedBackups=false",
         url_encode(identifier),
         url_encode(final_snapshot_id),
     );
