@@ -40,8 +40,9 @@ pub fn try_assume_role_with_web_identity(region: &str) -> Result<Option<AwsCrede
 fn call_sts(token: &str, role_arn: &str, region: &str) -> Result<AwsCredentials, String> {
     // GovCloud uses regional STS endpoints; standard regions accept the global
     // endpoint. We always use the regional form for consistency.
-    let host = format!("sts.{region}.amazonaws.com");
-    let url = format!("https://{host}/");
+    let ep = crate::service_endpoint(&format!("sts.{region}.amazonaws.com"))?;
+    let host = ep.host.clone();
+    let url = format!("{}/", ep.base_url);
 
     let body = format!(
         "Action=AssumeRoleWithWebIdentity\

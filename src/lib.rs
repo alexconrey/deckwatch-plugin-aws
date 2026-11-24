@@ -228,11 +228,119 @@ fn workload_sa_name(deployment: &str) -> String {
     format!("{deployment}-aws-sa")
 }
 
-/// IAM role name `provision()` creates for an application's RDS IRSA binding.
+/// IAM role name `provision()` creates for an application's IRSA binding.
 /// Stamped as `aws.deckwatch.io/role-name` so `apply()` reuses the same role.
-#[cfg(target_arch = "wasm32")]
+///
+/// The `-rds` suffix is historical: RDS was the first resource to create the
+/// role, and S3 now attaches its policy to the same role so an application has
+/// a single workload identity. Renaming it would orphan existing roles.
+#[cfg(any(target_arch = "wasm32", test))]
 fn rds_role_name(namespace: &str, app: &str) -> String {
     format!("{namespace}-{app}-rds")
+}
+
+/// AWS partition for a region, used to build ARNs.
+///
+/// GovCloud and China resources live in separate partitions; an ARN with the
+/// wrong partition never matches, so a policy using it grants nothing.
+#[cfg(any(target_arch = "wasm32", test))]
+fn aws_partition(region: &str) -> &'static str {
+    if region.starts_with("us-gov-") {
+        "aws-us-gov"
+    } else if region.starts_with("cn-") {
+        "aws-cn"
+    } else {
+        "aws"
+    }
+}
+
+/// Where requests for one AWS service are sent.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, PartialEq)]
+pub(crate) struct Endpoint {
+    /// Scheme and authority with no trailing slash,
+    /// e.g. `https://rds.us-east-1.amazonaws.com` or `http://localhost:5000`.
+    pub base_url: String,
+    /// Authority sent as the `Host` header and covered by the SigV4 signature.
+    pub host: String,
+    /// True when `AWS_ENDPOINT_URL` redirected the request. S3 then switches
+    /// to path-style addressing, since an emulator can't serve
+    /// `<bucket>.<host>` virtual hosts.
+    pub overridden: bool,
+}
+
+/// Resolve the endpoint for a service whose real hostname is `default_host`.
+///
+/// `override_url` is the `AWS_ENDPOINT_URL` plugin config value — the same
+/// name the AWS SDKs use — and sends every service to one URL (e.g. moto or
+/// LocalStack). A malformed override is an error rather than a silent
+/// fallback, so a misconfigured test can never reach real AWS.
+#[cfg(any(target_arch = "wasm32", test))]
+fn resolve_endpoint(override_url: Option<&str>, default_host: &str) -> Result<Endpoint, String> {
+    let Some(raw) = override_url.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Endpoint {
+            base_url: format!("https://{default_host}"),
+            host: default_host.to_string(),
+            overridden: false,
+        });
+    };
+    let invalid = || format!("AWS_ENDPOINT_URL {raw:?} must be http(s)://host[:port] with no path");
+    let (scheme, authority) = raw
+        .trim_end_matches('/')
+        .split_once("://")
+        .ok_or_else(invalid)?;
+    if !matches!(scheme, "http" | "https") || authority.is_empty() || authority.contains('/') {
+        return Err(invalid());
+    }
+    Ok(Endpoint {
+        base_url: format!("{scheme}://{authority}"),
+        host: authority.to_string(),
+        overridden: true,
+    })
+}
+
+/// [`resolve_endpoint`] using the `AWS_ENDPOINT_URL` plugin config value.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn service_endpoint(default_host: &str) -> Result<Endpoint, String> {
+    let raw = config::get("AWS_ENDPOINT_URL").ok().flatten();
+    resolve_endpoint(raw.as_deref(), default_host)
+}
+
+/// Inline policy granting object read/write/delete and listing on one bucket.
+///
+/// `region` is the bucket's region and only selects the ARN partition — S3
+/// bucket ARNs carry no region or account.
+#[cfg(any(target_arch = "wasm32", test))]
+fn s3_access_policy_document(bucket: &str, region: &str) -> String {
+    let partition = aws_partition(region);
+    format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":"arn:{partition}:s3:::{bucket}/*"}},{{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:{partition}:s3:::{bucket}"}}]}}"#
+    )
+}
+
+/// Deployment annotations `provision()` stamps for an S3 resource so `apply()`
+/// treats S3 as enabled on reconcile and re-attaches the bucket policy to the
+/// same role the application's ServiceAccount is bound to.
+///
+/// `bucket_name` is the name *without* `BUCKET_PREFIX`: `apply()` prepends the
+/// prefix itself, so stamping the full name would double it.
+#[cfg(any(target_arch = "wasm32", test))]
+fn s3_apply_annotations(
+    app: &str,
+    bucket_name: &str,
+    region: &str,
+    role_name: &str,
+) -> std::collections::HashMap<String, String> {
+    [
+        ("s3.deckwatch.io/enabled", "true"),
+        ("s3.deckwatch.io/bucket-name", bucket_name),
+        ("s3.deckwatch.io/region", region),
+        ("aws.deckwatch.io/app-name", app),
+        ("aws.deckwatch.io/role-name", role_name),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
 }
 
 /// Database user the workload connects as. With IAM auth this is the app name
@@ -1041,7 +1149,9 @@ fn apply_with_aws(
         let full_bucket = format!("{}{}", bucket_prefix, s3_cfg.bucket_name);
         match s3::ensure_bucket(s3_cfg, &full_bucket, creds) {
             Ok(()) => {
-                if let Err(e) = iam::attach_s3_policy(&cfg.role_name, &full_bucket, creds) {
+                if let Err(e) =
+                    iam::attach_s3_policy(&cfg.role_name, &full_bucket, &s3_cfg.region, creds)
+                {
                     log!(
                         LogLevel::Warn,
                         "deckwatch-plugin-aws: attach_s3_policy: {e}"
@@ -1208,6 +1318,7 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
         config_schema: vec![
             ConfigField { key: "AWS_REGION".into(), label: "AWS Region".into(), description: "Region for provisioned resources.".into(), field_type: ConfigFieldType::String, default: Some("us-east-1".into()), required: true, options: vec![], env_source: Some("AWS_REGION".into()) },
             ConfigField { key: "OIDC_PROVIDER_ARN".into(), label: "OIDC Provider ARN".into(), description: "ARN of the EKS OIDC provider (arn:aws:iam::<account>:oidc-provider/<url>). Required for IRSA.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
+            ConfigField { key: "AWS_ENDPOINT_URL".into(), label: "AWS Endpoint URL".into(), description: "Send every AWS API call to this http(s)://host[:port] instead of AWS (e.g. moto or LocalStack for testing). S3 switches to path-style addressing. Leave empty in production.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "IAM_ENDPOINT".into(), label: "IAM Endpoint".into(), description: "Override IAM hostname. Auto-detected (iam.us-gov.amazonaws.com for GovCloud).".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "IAM_SIGNING_REGION".into(), label: "IAM Signing Region".into(), description: "Override Sig V4 region for IAM. Auto-detected from region.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "ROLE_PATH".into(), label: "IAM Role Path".into(), description: "Path prefix for created roles. Must start and end with /.".into(), field_type: ConfigFieldType::String, default: Some("/deckwatch-plugin/".into()), required: false, options: vec![], env_source: None },
@@ -1679,6 +1790,43 @@ pub fn provision(
 
             match s3::ensure_bucket(&cfg, &full_bucket, &creds) {
                 Ok(()) => {
+                    // Grant the application's workload role access to the bucket.
+                    // This is the same role (and ServiceAccount) RDS provisioning
+                    // uses, so an application has one identity for all resources.
+                    let role_name = rds_role_name(&req.namespace, &req.application_name);
+                    let sa_name = workload_sa_name(&req.application_name);
+                    match iam::ensure_role(&role_name, &req.namespace, &sa_name, &creds) {
+                        Ok(role_arn) => {
+                            if let Err(e) =
+                                iam::attach_s3_policy(&role_name, &full_bucket, &region, &creds)
+                            {
+                                log!(
+                                    LogLevel::Warn,
+                                    "deckwatch-plugin-aws: attach_s3_policy: {e}"
+                                );
+                                result.warnings.push(format!(
+                                    "attach S3 access policy for {full_bucket} to {role_name}: {e}"
+                                ));
+                            }
+                            result.state.insert("S3_ROLE_ARN".into(), role_arn.clone());
+                            result.state.insert("S3_SA_NAME".into(), sa_name.clone());
+                            result.kubernetes_resources.push(service_account_yaml(
+                                &sa_name,
+                                &role_arn,
+                                &req.namespace,
+                            ));
+                        }
+                        Err(e) => {
+                            log!(
+                                LogLevel::Warn,
+                                "deckwatch-plugin-aws: ensure_role for S3: {e}"
+                            );
+                            result.warnings.push(format!(
+                                "IAM role {role_name} not created; pods cannot access {full_bucket} until it exists: {e}"
+                            ));
+                        }
+                    }
+
                     result.state.insert("S3_BUCKET".into(), full_bucket.clone());
                     result.state.insert("S3_REGION".into(), region.clone());
                     result.state.insert("AWS_REGION".into(), region.clone());
@@ -1689,7 +1837,15 @@ pub fn provision(
                         .insert("deckwatch.io/aws-s3-bucket".into(), full_bucket);
                     result
                         .deployment_annotations
-                        .insert("deckwatch.io/aws-s3-region".into(), region);
+                        .insert("deckwatch.io/aws-s3-region".into(), region.clone());
+                    // Enable S3 for apply() so every reconcile re-asserts the
+                    // bucket policy on the same role and binds pods to the SA.
+                    result.deployment_annotations.extend(s3_apply_annotations(
+                        &req.application_name,
+                        &bucket_name,
+                        &region,
+                        &role_name,
+                    ));
                 }
                 Err(e) => {
                     result.errors.push(format!("S3 provisioning error: {e}"));
@@ -2220,6 +2376,219 @@ mod tests {
         let result = apply_inner(&c, "");
         assert_eq!(find_env(&result, "POSTGRES_USER"), Some("radiation-db"));
         assert_eq!(find_env(&result, "DB_NAME"), Some("radiation"));
+    }
+
+    // ── AWS_ENDPOINT_URL override ─────────────────────────────────────────────
+
+    #[test]
+    fn endpoint_defaults_to_real_aws_over_https() {
+        let ep = resolve_endpoint(None, "rds.us-gov-west-1.amazonaws.com").unwrap();
+        assert_eq!(ep.base_url, "https://rds.us-gov-west-1.amazonaws.com");
+        assert_eq!(ep.host, "rds.us-gov-west-1.amazonaws.com");
+        assert!(!ep.overridden);
+        // An empty config value is treated as unset.
+        assert_eq!(
+            resolve_endpoint(Some("  "), "iam.amazonaws.com")
+                .unwrap()
+                .host,
+            "iam.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn endpoint_override_redirects_every_service() {
+        for raw in ["http://localhost:5000", "http://localhost:5000/"] {
+            let ep = resolve_endpoint(Some(raw), "s3.us-east-1.amazonaws.com").unwrap();
+            assert_eq!(ep.base_url, "http://localhost:5000");
+            assert_eq!(ep.host, "localhost:5000");
+            assert!(ep.overridden);
+        }
+    }
+
+    // A bad override must fail loudly, never fall back to real AWS.
+    #[test]
+    fn endpoint_override_rejects_malformed_urls() {
+        for raw in [
+            "localhost:5000",
+            "ftp://moto",
+            "http://",
+            "http://moto:5000/prefix",
+        ] {
+            assert!(
+                resolve_endpoint(Some(raw), "iam.amazonaws.com").is_err(),
+                "{raw:?} should be rejected"
+            );
+        }
+    }
+
+    // ── S3 IAM policy wiring ──────────────────────────────────────────────────
+
+    /// Resource ARNs from an IAM policy document, in statement order.
+    fn policy_resources(doc: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(doc).expect("policy must be valid JSON");
+        v["Statement"]
+            .as_array()
+            .expect("Statement array")
+            .iter()
+            .map(|s| s["Resource"].as_str().expect("string Resource").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn aws_partition_by_region() {
+        assert_eq!(aws_partition("us-gov-west-1"), "aws-us-gov");
+        assert_eq!(aws_partition("us-gov-east-1"), "aws-us-gov");
+        assert_eq!(aws_partition("cn-north-1"), "aws-cn");
+        assert_eq!(aws_partition("us-east-1"), "aws");
+        assert_eq!(aws_partition("eu-west-1"), "aws");
+    }
+
+    // A GovCloud bucket ARN is arn:aws-us-gov:s3:::<bucket>. The policy used to
+    // hardcode arn:aws:s3:::, which never matches a GovCloud bucket.
+    #[test]
+    fn s3_policy_uses_govcloud_partition() {
+        let doc = s3_access_policy_document("k2-ampere-artifacts", "us-gov-west-1");
+        assert_eq!(
+            policy_resources(&doc),
+            vec![
+                "arn:aws-us-gov:s3:::k2-ampere-artifacts/*",
+                "arn:aws-us-gov:s3:::k2-ampere-artifacts",
+            ]
+        );
+        assert!(!doc.contains("arn:aws:s3:::"));
+    }
+
+    #[test]
+    fn s3_policy_commercial_partition_unchanged() {
+        let doc = s3_access_policy_document("assets", "us-east-1");
+        assert_eq!(
+            policy_resources(&doc),
+            vec!["arn:aws:s3:::assets/*", "arn:aws:s3:::assets"]
+        );
+        let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(
+            v["Statement"][0]["Action"],
+            json!(["s3:GetObject", "s3:PutObject", "s3:DeleteObject"])
+        );
+        assert_eq!(v["Statement"][1]["Action"], json!("s3:ListBucket"));
+    }
+
+    /// Annotations on the zeus `ampere/backend` deployment after its RDS and S3
+    /// resources were provisioned by plugin v0.7.x (taken from the live cluster).
+    fn zeus_ampere_backend_annotations() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("aws.deckwatch.io/app-name", "ampere"),
+            ("aws.deckwatch.io/role-name", "ampere-ampere-rds"),
+            ("deckwatch.io/aws-rds-db-name", "ampere"),
+            (
+                "deckwatch.io/aws-rds-endpoint",
+                "ampere-db.czwkxlpc6i5c.us-gov-west-1.rds.amazonaws.com",
+            ),
+            ("deckwatch.io/aws-rds-engine", "postgres"),
+            ("deckwatch.io/aws-s3-bucket", "k2-ampere-artifacts"),
+            ("deckwatch.io/aws-s3-region", "us-gov-west-1"),
+            ("rds.deckwatch.io/db-name", "ampere"),
+            ("rds.deckwatch.io/enabled", "true"),
+            ("rds.deckwatch.io/engine", "postgres"),
+            ("rds.deckwatch.io/iam-auth", "true"),
+            ("rds.deckwatch.io/identifier", "ampere-db"),
+            ("rds.deckwatch.io/instance-class", "db.t3.micro"),
+        ]
+    }
+
+    fn ampere_ctx(annotations: &[(&str, &str)]) -> PluginContext {
+        PluginContext {
+            namespace: "ampere".into(),
+            deployment_name: "backend".into(),
+            annotations: annotations
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            labels: [("app".to_string(), "backend".to_string())].into(),
+            plugin_outputs: HashMap::new(),
+            provisioned_resources: HashMap::new(),
+        }
+    }
+
+    // Regression for zeus ampere: S3 was provisioned but the workload role never
+    // got an S3 policy.
+    //
+    // Before: provision("s3") stamped only informational annotations, so apply()
+    // saw S3 as disabled and never called attach_s3_policy.
+    // After: provision("s3") also stamps s3_apply_annotations, so apply() attaches
+    // a GovCloud-correct policy for the bucket to the role the pods' SA uses.
+    #[test]
+    fn zeus_ampere_s3_policy_reaches_workload_role() {
+        // Before the fix: the live annotations leave S3 disabled for apply().
+        let before = AwsConfig::from_context(&ampere_ctx(&zeus_ampere_backend_annotations()));
+        assert!(
+            before.s3.is_none(),
+            "pre-fix annotations must reproduce the bug: apply() sees no S3 config"
+        );
+
+        // After the fix: provision("s3") additionally stamps these. The provision
+        // request had bucket_name=k2-ampere-artifacts with an empty BUCKET_PREFIX.
+        let role = rds_role_name("ampere", "ampere");
+        let stamped = s3_apply_annotations("ampere", "k2-ampere-artifacts", "us-gov-west-1", &role);
+        let mut anns: HashMap<&str, &str> = zeus_ampere_backend_annotations().into_iter().collect();
+        anns.extend(stamped.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let pairs: Vec<(&str, &str)> = anns.into_iter().collect();
+        let c = ampere_ctx(&pairs);
+        let cfg = AwsConfig::from_context(&c);
+
+        // Same role and SA the pods already use — no second identity is created.
+        assert_eq!(cfg.role_name, "ampere-ampere-rds");
+        assert_eq!(workload_sa_name(&cfg.app_name), "ampere-aws-sa");
+
+        let s3 = cfg.s3.expect("apply() must now see S3 as enabled");
+        assert_eq!(s3.region, "us-gov-west-1");
+
+        // apply_with_aws calls attach_s3_policy(role, BUCKET_PREFIX + bucket, s3.region).
+        let bucket_prefix = "";
+        let full_bucket = format!("{bucket_prefix}{}", s3.bucket_name);
+        assert_eq!(full_bucket, "k2-ampere-artifacts");
+        assert_eq!(
+            policy_resources(&s3_access_policy_document(&full_bucket, &s3.region)),
+            vec![
+                "arn:aws-us-gov:s3:::k2-ampere-artifacts/*",
+                "arn:aws-us-gov:s3:::k2-ampere-artifacts",
+            ]
+        );
+
+        let result = apply_inner(&c, bucket_prefix);
+        assert_eq!(find_env(&result, "S3_BUCKET"), Some("k2-ampere-artifacts"));
+        assert_eq!(find_env(&result, "S3_REGION"), Some("us-gov-west-1"));
+        // RDS config is unaffected by the merged annotations.
+        assert_eq!(find_env(&result, "POSTGRES_USER"), Some("ampere"));
+    }
+
+    // provision() stamps the bucket name without BUCKET_PREFIX; apply() adds it.
+    #[test]
+    fn s3_apply_annotations_do_not_double_bucket_prefix() {
+        let anns = s3_apply_annotations("ampere", "ampere-artifacts", "us-gov-west-1", "r");
+        let pairs: Vec<(&str, &str)> = anns.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let result = apply_inner(&ctx(&pairs), "k2-");
+        assert_eq!(find_env(&result, "S3_BUCKET"), Some("k2-ampere-artifacts"));
+    }
+
+    // RDS and S3 provisioning stamp the same app/role annotations, so the merge
+    // order deckwatch applies them in cannot point apply() at a different role.
+    #[test]
+    fn rds_and_s3_annotations_agree_on_role() {
+        let role = rds_role_name("ampere", "ampere");
+        let rds = rds_apply_annotations(
+            "ampere",
+            "ampere-db",
+            "postgres",
+            "db.t3.micro",
+            "ampere",
+            true,
+            &role,
+        );
+        let s3 = s3_apply_annotations("ampere", "k2-ampere-artifacts", "us-gov-west-1", &role);
+        for key in ["aws.deckwatch.io/app-name", "aws.deckwatch.io/role-name"] {
+            assert_eq!(rds.get(key), s3.get(key), "{key} must match");
+        }
     }
 
     // 12. MySQL engine → DB_PORT=3306.

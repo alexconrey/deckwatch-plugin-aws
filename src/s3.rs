@@ -70,11 +70,28 @@ pub fn ensure_bucket(
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
+/// Endpoint and canonical path for a bucket-level request.
+///
+/// Real AWS uses virtual-hosted style (`<bucket>.s3.<region>.amazonaws.com`,
+/// path `/`), which GovCloud requires. Under `AWS_ENDPOINT_URL` the request
+/// goes path-style (`<endpoint>/<bucket>`) because emulators cannot serve
+/// per-bucket virtual hosts.
+fn s3_target(bucket: &str, region: &str) -> Result<(crate::Endpoint, String), String> {
+    let ep = crate::service_endpoint(&format!("{bucket}.s3.{region}.amazonaws.com"))?;
+    let path = if ep.overridden {
+        format!("/{bucket}")
+    } else {
+        "/".to_string()
+    };
+    Ok((ep, path))
+}
+
 /// Create the bucket using virtual-hosted-style addressing.
 /// `us-east-1` must not send a `CreateBucketConfiguration` body.
 fn create_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(), String> {
-    let host = format!("{bucket}.s3.{region}.amazonaws.com");
-    let path = "/";
+    let (ep, path) = s3_target(bucket, region)?;
+    let host = ep.host.clone();
+    let path = path.as_str();
     let datetime = aws_sign::utc_now_iso8601(region);
 
     let (body, content_type) = if region == "us-east-1" {
@@ -101,7 +118,7 @@ fn create_bucket(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<(
         content_type,
     );
 
-    let url = format!("https://{host}{path}");
+    let url = format!("{}{path}", ep.base_url);
     let mut req = HttpRequest::new(&url)
         .with_method("PUT")
         .with_header("Host", &host)
@@ -185,8 +202,9 @@ fn s3_put(
     creds: &AwsCredentials,
     op: &str,
 ) -> Result<(), String> {
-    let host = format!("{bucket}.s3.{region}.amazonaws.com");
-    let path = "/";
+    let (ep, path) = s3_target(bucket, region)?;
+    let host = ep.host.clone();
+    let path = path.as_str();
     let datetime = aws_sign::utc_now_iso8601(region);
 
     let (auth, payload_hash) = aws_sign::authorization_header(
@@ -204,7 +222,7 @@ fn s3_put(
         Some("application/xml"),
     );
 
-    let url = format!("https://{host}{path}?{sub_resource}");
+    let url = format!("{}{path}?{sub_resource}", ep.base_url);
     let mut req = HttpRequest::new(&url)
         .with_method("PUT")
         .with_header("Content-Type", "application/xml")

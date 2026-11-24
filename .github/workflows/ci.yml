@@ -96,3 +96,57 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+  integration:
+    name: Integration tests (plugin.wasm vs moto)
+    runs-on: ubuntu-latest
+    services:
+      moto:
+        image: motoserver/moto:5.2.6
+        ports:
+          - 5000:5000
+    env:
+      MOTO_ENDPOINT: http://localhost:5000
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+            integration/target/
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('Cargo.toml', 'integration/Cargo.toml') }}
+
+      - name: Build plugin.wasm
+        run: make build
+
+      - name: Wait for moto
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf "$MOTO_ENDPOINT/moto-api/" >/dev/null && exit 0
+            sleep 1
+          done
+          echo "moto did not become ready" >&2
+          exit 1
+
+      - name: Lint integration harness
+        working-directory: integration
+        run: |
+          HOST=$(rustc -vV | grep "^host:" | cut -d' ' -f2)
+          cargo fmt --check
+          cargo clippy --target "$HOST" --all-targets -- -D warnings
+
+      - name: Run integration tests
+        working-directory: integration
+        run: |
+          HOST=$(rustc -vV | grep "^host:" | cut -d' ' -f2)
+          cargo test --target "$HOST"

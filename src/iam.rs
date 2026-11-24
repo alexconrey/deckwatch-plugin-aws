@@ -33,19 +33,27 @@ use extism_pdk::*;
 
 use crate::{aws_sign, AwsCredentials};
 
-/// Returns `(iam_host, iam_signing_region)` for the given workload region.
-fn iam_endpoint(region: &str) -> (String, String) {
-    let host = config::get("IAM_ENDPOINT")
+/// Returns `(endpoint, iam_signing_region)` for the given workload region.
+///
+/// Precedence: `IAM_ENDPOINT` (hostname, HTTPS) → `AWS_ENDPOINT_URL` →
+/// the partition's global IAM endpoint.
+fn iam_endpoint(region: &str) -> Result<(crate::Endpoint, String), String> {
+    let endpoint = match config::get("IAM_ENDPOINT")
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            if region.starts_with("us-gov-") {
-                "iam.us-gov.amazonaws.com".to_string()
-            } else {
-                "iam.amazonaws.com".to_string()
-            }
-        });
+    {
+        Some(host) => crate::Endpoint {
+            base_url: format!("https://{host}"),
+            host,
+            overridden: true,
+        },
+        None => crate::service_endpoint(if region.starts_with("us-gov-") {
+            "iam.us-gov.amazonaws.com"
+        } else {
+            "iam.amazonaws.com"
+        })?,
+    };
 
     let signing_region = config::get("IAM_SIGNING_REGION")
         .ok()
@@ -59,7 +67,7 @@ fn iam_endpoint(region: &str) -> (String, String) {
             }
         });
 
-    (host, signing_region)
+    Ok((endpoint, signing_region))
 }
 
 // ── Trust policy builder ──────────────────────────────────────────────────────
@@ -155,13 +163,7 @@ pub fn attach_rds_policy(
     region: &str,
     creds: &AwsCredentials,
 ) -> Result<(), String> {
-    let partition = if region.starts_with("us-gov-") {
-        "aws-us-gov"
-    } else if region.starts_with("cn-") {
-        "aws-cn"
-    } else {
-        "aws"
-    };
+    let partition = crate::aws_partition(region);
     let account = config::get("AWS_ROLE_ARN")
         .ok()
         .flatten()
@@ -180,14 +182,16 @@ pub fn attach_rds_policy(
 }
 
 /// Attach an inline policy granting standard S3 object operations on the bucket.
+///
+/// `region` is the bucket's region; it selects the ARN partition so GovCloud
+/// buckets get `arn:aws-us-gov:s3:::` resources rather than `arn:aws:s3:::`.
 pub fn attach_s3_policy(
     role_name: &str,
     bucket_name: &str,
+    region: &str,
     creds: &AwsCredentials,
 ) -> Result<(), String> {
-    let policy = format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::{bucket_name}/*"}},{{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::{bucket_name}"}}]}}"#
-    );
+    let policy = crate::s3_access_policy_document(bucket_name, region);
     let body = format!(
         "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-s3-access&PolicyDocument={}",
         url_encode(role_name),
@@ -284,7 +288,8 @@ fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<String>, S
 }
 
 fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
-    let (iam_host, iam_region) = iam_endpoint(&creds.region);
+    let (ep, iam_region) = iam_endpoint(&creds.region)?;
+    let iam_host = ep.host.clone();
     let datetime = aws_sign::utc_now_iso8601(&creds.region);
     let (auth, payload_hash) = aws_sign::authorization_header(
         "POST",
@@ -301,7 +306,7 @@ fn iam_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
         Some("application/x-www-form-urlencoded"),
     );
 
-    let url = format!("https://{iam_host}/");
+    let url = format!("{}/", ep.base_url);
     let mut req = HttpRequest::new(&url)
         .with_method("POST")
         .with_header("Content-Type", "application/x-www-form-urlencoded")

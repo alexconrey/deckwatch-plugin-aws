@@ -90,7 +90,8 @@ fn create_secret(
 
 /// POST to the Secrets Manager JSON API with the given target and body.
 fn sm_call(target: &str, body: &str, creds: &AwsCredentials) -> Result<String, String> {
-    let host = format!("secretsmanager.{}.amazonaws.com", creds.region);
+    let ep = crate::service_endpoint(&format!("secretsmanager.{}.amazonaws.com", creds.region))?;
+    let host = ep.host.clone();
     let datetime = aws_sign::utc_now_iso8601(&creds.region);
     let (auth, payload_hash) = aws_sign::authorization_header(
         "POST",
@@ -107,7 +108,7 @@ fn sm_call(target: &str, body: &str, creds: &AwsCredentials) -> Result<String, S
         Some("application/x-amz-json-1.1"),
     );
 
-    let url = format!("https://{host}/");
+    let url = format!("{}/", ep.base_url);
     let mut req = HttpRequest::new(&url)
         .with_method("POST")
         .with_header("Content-Type", "application/x-amz-json-1.1")
