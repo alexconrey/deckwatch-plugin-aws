@@ -292,9 +292,9 @@ fn rds_apply_annotations(
 // the workload's role.
 
 #[cfg(target_arch = "wasm32")]
-const DEFAULT_BOOTSTRAP_AWSCLI_IMAGE: &str = "amazon/aws-cli:2.39.6";
+const DEFAULT_BOOTSTRAP_AWSCLI_IMAGE: &str = "amazon/aws-cli:2.42.2";
 #[cfg(target_arch = "wasm32")]
-const DEFAULT_BOOTSTRAP_PSQL_IMAGE: &str = "postgres:18-alpine";
+const DEFAULT_BOOTSTRAP_PSQL_IMAGE: &str = "postgres:19-alpine";
 
 #[cfg(any(target_arch = "wasm32", test))]
 fn bootstrap_name(app: &str) -> String {
