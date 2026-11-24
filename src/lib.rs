@@ -162,8 +162,6 @@ pub struct RdsConfig {
     pub snapshot_retention: i64,
     /// IAM role ARN granted to the AWS Backup service (`backup.amazonaws.com`).
     pub backup_role_arn: String,
-    /// AWS region for this RDS instance. Defaults to `"us-east-1"`.
-    pub region: String,
 }
 
 pub struct S3Config {
@@ -845,14 +843,6 @@ impl AwsConfig {
                     .parse::<i64>()
                     .unwrap_or(7),
                 backup_role_arn: ann_str(ctx, "rds.deckwatch.io/backup-role-arn"),
-                region: {
-                    let raw = ann_str(ctx, "rds.deckwatch.io/region");
-                    if raw.is_empty() {
-                        "us-east-1".to_string()
-                    } else {
-                        raw
-                    }
-                },
             })
         } else {
             None
@@ -1642,7 +1632,6 @@ pub fn provision(
                 snapshot_schedule: None,
                 snapshot_retention: 7,
                 backup_role_arn: String::new(),
-                region: creds.region.clone(),
             };
 
             let db_user = rds_db_user(iam_auth, &req.application_name);
