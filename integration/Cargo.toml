@@ -17,8 +17,8 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
-# Same commit as the plugin's Cargo.toml.
-deckwatch-plugin-sdk = { git = "https://github.com/alexconrey/deckwatch-plugin-sdk", rev = "889d739976c7f0bb4f55f5e578133af69dea33f8" }
+# Same SDK release as the plugin's Cargo.toml.
+deckwatch-plugin-sdk = { git = "https://github.com/alexconrey/deckwatch-plugin-sdk", rev = "7262a0dc5f610d5331afe237d4197469f9702f37" }
 extism = "1.41"
 aws-config = { version = "1.13", features = ["behavior-version-latest"] }
 aws-sdk-backup = "1"

@@ -120,11 +120,14 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
   that's the point of the PR. Ignored lockfiles are how the first v0.8.0
   release build broke minutes after CI passed: it re-resolved the SDK's moved
   `main`.
-- **`deckwatch-plugin-sdk` is pinned to a commit (`rev`)** in both `Cargo.toml`
-  and `integration/Cargo.toml`; keep the two identical, and never go back to
-  `branch = "main"`. Bump the rev (or switch to a tag once the SDK publishes
-  one) in its own PR, with CI. v0.10.0's `delete_kubernetes_resources` needs a
-  bump past the current pin.
+- **`deckwatch-plugin-sdk` is pinned to a release tag** (`tag = "v0.10.0"`) in
+  both `Cargo.toml` and `integration/Cargo.toml`; keep the two identical, and
+  never use `branch = "main"`. Bump it in its own PR, with CI. `Cargo.lock`
+  records the exact commit, so even a moved tag can't change a build.
+- **Build SDK structs with `..Default::default()`.** Since SDK 0.10.0 every
+  struct derives `Default`, and new fields would otherwise break the build
+  (`E0063`). When bumping, read the SDK CHANGELOG for new fields worth setting
+  explicitly, such as `min_deckwatch_version`, which the plugin leaves unset.
 - deckwatch mirrors the SDK types by hand, so a new SDK type (e.g.
   `ConfigFieldType::KeyValue`) only works once deckwatch supports it. That's why
   `RESOURCE_TAGS` is still a `String` field that also accepts `key_value`'s JSON.

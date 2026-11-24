@@ -10,9 +10,9 @@ license = "Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Pinned to a commit, not a branch, so the SDK only changes in a reviewed PR
-# (Cargo.lock records it too). Keep in step with integration/Cargo.toml.
-deckwatch-plugin-sdk = { git = "https://github.com/alexconrey/deckwatch-plugin-sdk", rev = "889d739976c7f0bb4f55f5e578133af69dea33f8" }
+# Pinned to a release, never a branch, so the SDK only changes in a reviewed PR
+# (Cargo.lock records the exact commit). Keep in step with integration/Cargo.toml.
+deckwatch-plugin-sdk = { git = "https://github.com/alexconrey/deckwatch-plugin-sdk", rev = "7262a0dc5f610d5331afe237d4197469f9702f37" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # AWS Signature V4 signing — pure Rust, compiles to wasm32-unknown-unknown

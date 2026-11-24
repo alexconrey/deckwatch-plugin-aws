@@ -2058,6 +2058,10 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
                 default: None,
             },
         ],
+        // Everything else keeps the SDK default. That leaves
+        // min_deckwatch_version unset (no constraint, and the field is
+        // omitted from the JSON), so deckwatch sees the same metadata as before.
+        ..Default::default()
     }))
 }
 
