@@ -61,7 +61,7 @@ ServiceAccount**:
 | `deckwatch-rds-connect` | RDS with IAM auth, once the instance exists | `rds-db:connect` | `arn:<partition>:rds-db:<region>:<account>:dbuser:<DbiResourceId>/<app>` |
 | `deckwatch-s3-access` | S3 | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` / `s3:ListBucket` | `arn:<partition>:s3:::<bucket>/*` / `arn:<partition>:s3:::<bucket>` |
 | `deckwatch-sqs-access` | SQS (provisioned, or `sqs.deckwatch.io/enabled`) | Send, Receive, Delete, ChangeMessageVisibility, GetQueueUrl, GetQueueAttributes | `arn:<partition>:sqs:<region>:<account>:<queue>` |
-| `deckwatch-secretsmanager-access` | Secrets Manager (provisioned, or `secretsmanager.deckwatch.io/*`) | `GetSecretValue`, `DescribeSecret` | the listed secret ARNs, plus any secret it created |
+| `deckwatch-secretsmanager-access` | Secrets Manager (provisioned, or `secretsmanager.deckwatch.io/*`) | `GetSecretValue`, `DescribeSecret`; plus `PutSecretValue` on secrets the plugin created for the app | read: the listed secret ARNs and the app's own secrets; write: only the app's own secrets, and only under `RESOURCE_NAME_PREFIX` when it's set |
 | `deckwatch-ecr-pull` | `ecr.deckwatch.io/enabled` | `GetAuthorizationToken`, `BatchCheckLayerAvailability`, `GetDownloadUrlForLayer`, `BatchGetImage` | `*` |
 
 `PutRolePolicy` replaces a policy of the same name, so the plugin can re-apply

@@ -698,10 +698,16 @@ async fn secretsmanager_provision_grants_and_deprovision_cleans_up() {
 
     let policy = inline_policy(&iam, &role_name, "deckwatch-secretsmanager-access").await;
     assert_eq!(policy["Statement"][0]["Resource"], serde_json::json!([arn]));
+    // The workload can write values to the secret the plugin created for it.
+    assert_eq!(
+        policy["Statement"][1]["Action"],
+        serde_json::json!(["secretsmanager:PutSecretValue"])
+    );
+    assert_eq!(policy["Statement"][1]["Resource"], serde_json::json!([arn]));
     assert_eq!(
         provisioned
             .deployment_annotations
-            .get("secretsmanager.deckwatch.io/secret-arns"),
+            .get("secretsmanager.deckwatch.io/owned-secret-arns"),
         Some(&arn)
     );
     assert!(
