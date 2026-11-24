@@ -16,7 +16,11 @@ use crate::{aws_sign, AwsCredentials, RdsConfig};
 /// All fields are empty when the instance was just created and is not yet in
 /// the `available` state — callers should treat an empty endpoint as
 /// "provisioning in progress" and not block the deployment.
-pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<RdsInstance, String> {
+pub fn ensure_instance(
+    cfg: &RdsConfig,
+    tags: &[(String, String)],
+    creds: &AwsCredentials,
+) -> Result<RdsInstance, String> {
     match describe_db_instance(&cfg.identifier, creds)? {
         Some(info) => {
             log!(
@@ -25,7 +29,8 @@ pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<RdsIns
                 cfg.identifier,
                 info.status
             );
-            let warnings = reconcile_backup_retention(&cfg.identifier, &info, creds);
+            let mut warnings = reconcile_backup_retention(&cfg.identifier, &info, creds);
+            warnings.extend(apply_instance_tags(&cfg.identifier, &info, tags, creds));
             Ok(RdsInstance {
                 endpoint: info.endpoint_address,
                 resource_id: info.resource_id,
@@ -34,7 +39,7 @@ pub fn ensure_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<RdsIns
             })
         }
         None => {
-            create_db_instance(cfg, creds)?;
+            create_db_instance(cfg, tags, creds)?;
             log!(
                 LogLevel::Info,
                 "deckwatch-plugin-aws: RDS instance {} creation initiated",
@@ -105,12 +110,36 @@ fn reconcile_backup_retention(
     }
 }
 
+/// Add or update the plugin's tags on an existing instance. AddTagsToResource
+/// only touches the given keys; other tags are kept.
+fn apply_instance_tags(
+    identifier: &str,
+    info: &DbInstanceInfo,
+    tags: &[(String, String)],
+    creds: &AwsCredentials,
+) -> Vec<String> {
+    if tags.is_empty() || info.db_instance_arn.is_empty() {
+        return vec![];
+    }
+    let body = format!(
+        "Action=AddTagsToResource&Version=2014-10-31&ResourceName={}{}",
+        url_encode(&info.db_instance_arn),
+        crate::query_tag_params(tags, "Tags.Tag"),
+    );
+    match rds_query(&body, creds) {
+        Ok(_) => vec![],
+        Err(e) => vec![format!("RDS {identifier}: could not apply tags: {e}")],
+    }
+}
+
 #[derive(Debug, Default)]
 struct DbInstanceInfo {
     status: String,
     endpoint_address: String,
     resource_id: String,
     master_secret_arn: String,
+    /// `DBInstanceArn`, used to tag an existing instance.
+    db_instance_arn: String,
     /// `BackupRetentionPeriod` in days, if present in the response.
     backup_retention_days: Option<u32>,
 }
@@ -140,12 +169,17 @@ fn describe_db_instance(
         endpoint_address: extract_tag(&xml, "Address").unwrap_or_default(),
         resource_id: extract_tag(&xml, "DbiResourceId").unwrap_or_default(),
         master_secret_arn: extract_tag(&xml, "SecretArn").unwrap_or_default(),
+        db_instance_arn: extract_tag(&xml, "DBInstanceArn").unwrap_or_default(),
         backup_retention_days: extract_tag(&xml, "BackupRetentionPeriod")
             .and_then(|v| v.parse().ok()),
     }))
 }
 
-fn create_db_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<(), String> {
+fn create_db_instance(
+    cfg: &RdsConfig,
+    tags: &[(String, String)],
+    creds: &AwsCredentials,
+) -> Result<(), String> {
     let multi_az = cfg.multi_az.to_string();
     let iam_auth = cfg.iam_auth.to_string();
     let retention = crate::configured_backup_retention_days().to_string();
@@ -201,6 +235,8 @@ fn create_db_instance(cfg: &RdsConfig, creds: &AwsCredentials) -> Result<(), Str
         body.push('=');
         body.push_str(&url_encode(v));
     }
+
+    body.push_str(&crate::query_tag_params(tags, "Tags.Tag"));
 
     let xml = rds_query(&body, creds)?;
     if xml.contains("Error") && !xml.contains("DBInstanceIdentifier") {

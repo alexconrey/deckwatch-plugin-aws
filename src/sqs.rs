@@ -25,7 +25,11 @@ pub struct SqsInfo {
 ///
 /// Returns the queue URL and ARN. For FIFO queues the name is automatically
 /// suffixed with `.fifo` if not already present.
-pub fn ensure_queue(cfg: &SqsConfig, creds: &AwsCredentials) -> Result<SqsInfo, String> {
+pub fn ensure_queue(
+    cfg: &SqsConfig,
+    tags: &[(String, String)],
+    creds: &AwsCredentials,
+) -> Result<SqsInfo, String> {
     let name = crate::canonical_queue_name(&cfg.queue_name, cfg.fifo);
 
     if let Some(info) = get_queue_url(&name, creds)? {
@@ -33,10 +37,24 @@ pub fn ensure_queue(cfg: &SqsConfig, creds: &AwsCredentials) -> Result<SqsInfo, 
             LogLevel::Info,
             "deckwatch-plugin-aws: SQS queue {name} already exists"
         );
+        // TagQueue adds or updates only these keys; other tags are kept.
+        if !tags.is_empty() {
+            let body = format!(
+                "Action=TagQueue&Version=2012-11-05&QueueUrl={}{}",
+                url_encode(&info.queue_url),
+                crate::query_tag_params(tags, "Tag"),
+            );
+            if let Err(e) = sqs_query(&body, creds) {
+                log!(
+                    LogLevel::Warn,
+                    "deckwatch-plugin-aws: TagQueue for {name}: {e}"
+                );
+            }
+        }
         return Ok(info);
     }
 
-    create_queue(&name, cfg, creds)
+    create_queue(&name, cfg, tags, creds)
 }
 
 /// Delete an SQS queue by URL.
@@ -102,7 +120,12 @@ fn get_queue_url(name: &str, creds: &AwsCredentials) -> Result<Option<SqsInfo>, 
     }
 }
 
-fn create_queue(name: &str, cfg: &SqsConfig, creds: &AwsCredentials) -> Result<SqsInfo, String> {
+fn create_queue(
+    name: &str,
+    cfg: &SqsConfig,
+    tags: &[(String, String)],
+    creds: &AwsCredentials,
+) -> Result<SqsInfo, String> {
     let visibility = cfg.visibility_timeout.to_string();
     // SQS MessageRetentionPeriod is in seconds.
     let retention_secs = (cfg.retention_days as u64 * 86_400).to_string();
@@ -122,6 +145,8 @@ fn create_queue(name: &str, cfg: &SqsConfig, creds: &AwsCredentials) -> Result<S
              &Attribute.4.Name=ContentBasedDeduplication&Attribute.4.Value=true",
         );
     }
+
+    body.push_str(&crate::query_tag_params(tags, "Tag"));
 
     let xml = sqs_query(&body, creds)?;
 

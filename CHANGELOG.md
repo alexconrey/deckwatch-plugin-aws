@@ -10,6 +10,14 @@ history.
 ### Added
 - `RDS_BACKUP_RETENTION_DAYS` (default **14**, range 1–35) and `RDS_BACKUP_WINDOW`
   config keys.
+- `RESOURCE_NAME_PREFIX`: prepended to every SQS queue and Secrets Manager secret
+  name, so the plugin's IAM policy can be scoped to `<prefix>*` instead of every
+  queue and secret in the account.
+- `RESOURCE_TAGS`: `Key=Value` tags applied to every managed resource (IAM roles,
+  RDS, S3, SQS, secrets, backup plans) on create and on every reconcile. Also
+  adds the managed `deckwatch.io/managed-by`, `deckwatch.io/application` and
+  `deckwatch.io/namespace` tags. S3 tags are merged, so existing bucket tags are
+  kept.
 
 ### Changed
 - **RDS instances keep 14 days of automated backups by default**, instead of RDS's
@@ -30,6 +38,15 @@ history.
   once nothing is left on it.
 
 ### Fixed
+- **AWS Backup snapshot schedules now create a backup plan.** The plugin sent
+  `CreateBackupPlan` and `CreateBackupSelection` as `POST`, with a
+  `"BackupPlanData"` body and the JSON-RPC content type. AWS Backup's REST-JSON
+  API expects `PUT`, `"BackupPlan"` and `application/json`, so no plan was ever
+  created.
+- S3 bucket-configuration `PUT`s (tagging, lifecycle, versioning, public access
+  block) now send `Content-MD5`, the message integrity header S3 requires on
+  these operations.
+- Secret names and descriptions are JSON-escaped when creating secrets.
 - **Provisioned SQS queues and Secrets Manager secrets now grant the workload
   access.** They attach `deckwatch-sqs-access` / `deckwatch-secretsmanager-access`
   to the app role, emit the ServiceAccount, and stamp annotations so every reconcile

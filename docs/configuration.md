@@ -112,6 +112,8 @@ Set these keys in the plugin's `config`. Defaults come from the plugin's
 | `OIDC_PROVIDER_ARN` | *(none)* | ARN of the cluster's IAM OIDC provider, e.g. `arn:aws-us-gov:iam::<account>:oidc-provider/oidc.eks.us-gov-west-1.amazonaws.com/id/<id>`. **Required for IRSA:** without it, workload roles get an empty trust policy and pods can't assume them. |
 | `ROLE_PATH` | `/deckwatch-plugin/` | IAM path for every role the plugin creates. Must start and end with `/`. Scope the plugin's IAM permissions to this path. |
 | `BUCKET_PREFIX` | *(empty)* | Prepended to every S3 bucket name, e.g. `myorg-` turns `uploads` into `myorg-uploads`. |
+| `RESOURCE_NAME_PREFIX` | *(empty)* | Prepended to every SQS queue and Secrets Manager secret name, both defaults and names chosen in the UI, e.g. `k2-dw-` produces `k2-dw-<namespace>-<app>-queue`. It's never added twice. Set it so the plugin's IAM policy can be [scoped to `<prefix>*`](#scoping-sqs-and-secrets-manager-to-a-prefix) instead of every queue and secret in the account. |
+| `RESOURCE_TAGS` | *(empty)* | Tags applied to every AWS resource the plugin manages: IAM roles, RDS instances (and their snapshots), S3 buckets, SQS queues, secrets and backup plans. Write them as `Key=Value` pairs separated by commas or newlines, e.g. `Team=platform,CostCenter=1234`. A JSON object of string values (`{"Team":"platform"}`) is also accepted; that's how deckwatch will store the field once its row-per-tag editor ships. Validated against AWS's tag rules (at most 47 tags; no `aws:` or `deckwatch.io/` keys). See [Resource tags](#resource-tags). |
 
 ### Credentials
 
@@ -187,21 +189,28 @@ the permissions below. The list comes from the API calls in `src/`. Replace
       "Effect": "Allow",
       "Action": [
         "s3:CreateBucket", "s3:PutBucketVersioning",
-        "s3:PutBucketPublicAccessBlock", "s3:PutLifecycleConfiguration"
+        "s3:PutBucketPublicAccessBlock", "s3:PutLifecycleConfiguration",
+        "s3:GetBucketTagging", "s3:PutBucketTagging"
       ],
       "Resource": "arn:<partition>:s3:::*"
     },
     {
       "Sid": "Sqs",
       "Effect": "Allow",
-      "Action": ["sqs:CreateQueue", "sqs:GetQueueUrl", "sqs:GetQueueAttributes", "sqs:DeleteQueue"],
-      "Resource": "arn:<partition>:sqs:*:<account>:*"
+      "Action": [
+        "sqs:CreateQueue", "sqs:GetQueueUrl", "sqs:GetQueueAttributes",
+        "sqs:DeleteQueue", "sqs:TagQueue"
+      ],
+      "Resource": "arn:<partition>:sqs:*:<account>:<RESOURCE_NAME_PREFIX>*"
     },
     {
       "Sid": "SecretsManager",
       "Effect": "Allow",
-      "Action": ["secretsmanager:CreateSecret", "secretsmanager:DescribeSecret", "secretsmanager:DeleteSecret"],
-      "Resource": "arn:<partition>:secretsmanager:*:<account>:secret:*"
+      "Action": [
+        "secretsmanager:CreateSecret", "secretsmanager:DescribeSecret",
+        "secretsmanager:DeleteSecret", "secretsmanager:TagResource"
+      ],
+      "Resource": "arn:<partition>:secretsmanager:*:<account>:secret:<RESOURCE_NAME_PREFIX>*"
     },
     {
       "Sid": "Backup",
@@ -233,3 +242,47 @@ Notes:
   it to the role in `rds.deckwatch.io/backup-role-arn`.
 - **Trust for `AssumeRoleWithWebIdentity`** goes on the plugin role's trust policy,
   for deckwatch's ServiceAccount, not in this permissions policy.
+- **Tagging permissions:** `iam:TagRole`, `rds:AddTagsToResource`,
+  `s3:Get/PutBucketTagging`, `sqs:TagQueue`, `secretsmanager:TagResource` and
+  `backup:TagResource` are needed when [resource tags](#resource-tags) are applied.
+  The managed `deckwatch.io/*` tags are always applied. AWS also requires the
+  tagging permission for tags passed *at creation*, e.g. `sqs:TagQueue` for
+  `CreateQueue` with tags.
+
+### Scoping SQS and Secrets Manager to a prefix
+
+Granting the SQS and Secrets Manager actions on every queue or secret would let
+deckwatch change unrelated ones, such as a Karpenter interruption queue or
+application credentials. Set `RESOURCE_NAME_PREFIX` (for example `k2-dw-`)
+instead, and scope those statements to `…:<prefix>*` as shown above. Every
+queue and secret the plugin creates carries the prefix, including names entered
+in the UI.
+
+Changing the prefix after queues or secrets exist makes reconciles create *new*
+prefixed resources for annotation-based queues, so choose it before first use.
+
+## Resource tags
+
+Every AWS resource the plugin manages gets `RESOURCE_TAGS` plus three managed
+tags, which configuration can't override:
+
+| Tag | Value |
+|---|---|
+| `deckwatch.io/managed-by` | `deckwatch-plugin-aws` |
+| `deckwatch.io/application` | the application name |
+| `deckwatch.io/namespace` | the application's namespace |
+
+| Resource | On create | Existing resources (every reconcile) |
+|---|---|---|
+| IAM role | `CreateRole` tags | `TagRole` |
+| RDS instance | `CreateDBInstance` tags (copied to snapshots) | `AddTagsToResource` |
+| S3 bucket | merged into the bucket's tag set | merged; tags set by others are kept |
+| SQS queue | `CreateQueue` tags | `TagQueue` |
+| Secret | `CreateSecret` tags | `TagResource` |
+| AWS Backup plan | `CreateBackupPlan` tags | (not re-tagged) |
+
+Tagging only adds or updates the plugin's keys. Other tags on a resource are left
+alone, and removing a key from `RESOURCE_TAGS` doesn't remove it from existing
+resources. If `RESOURCE_TAGS` is invalid, the plugin applies only the managed
+tags and reports the problem as a provisioning warning. Tagging failures are
+warnings too; they never block provisioning.

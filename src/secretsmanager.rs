@@ -26,6 +26,7 @@ use crate::{aws_sign, AwsCredentials};
 pub fn ensure_secret(
     secret_name: &str,
     description: &str,
+    tags: &[(String, String)],
     creds: &AwsCredentials,
 ) -> Result<String, String> {
     if let Some(arn) = describe_secret(secret_name, creds)? {
@@ -33,10 +34,21 @@ pub fn ensure_secret(
             LogLevel::Info,
             "deckwatch-plugin-aws: Secrets Manager secret '{secret_name}' already exists"
         );
+        // TagResource adds or updates only these keys; other tags are kept.
+        if !tags.is_empty() {
+            let body = serde_json::json!({ "SecretId": arn, "Tags": crate::json_tag_list(tags) })
+                .to_string();
+            if let Err(e) = sm_call("secretsmanager.TagResource", &body, creds) {
+                log!(
+                    LogLevel::Warn,
+                    "deckwatch-plugin-aws: TagResource for secret '{secret_name}': {e}"
+                );
+            }
+        }
         return Ok(arn);
     }
 
-    create_secret(secret_name, description, creds)
+    create_secret(secret_name, description, tags, creds)
 }
 
 /// Schedule a secret for deletion with a recovery window.
@@ -79,9 +91,15 @@ fn describe_secret(secret_name: &str, creds: &AwsCredentials) -> Result<Option<S
 fn create_secret(
     secret_name: &str,
     description: &str,
+    tags: &[(String, String)],
     creds: &AwsCredentials,
 ) -> Result<String, String> {
-    let body = format!(r#"{{"Name":"{secret_name}","Description":"{description}"}}"#);
+    // Built with serde so names and descriptions are JSON-escaped.
+    let mut request = serde_json::json!({ "Name": secret_name, "Description": description });
+    if !tags.is_empty() {
+        request["Tags"] = crate::json_tag_list(tags);
+    }
+    let body = request.to_string();
     let json = sm_call("secretsmanager.CreateSecret", &body, creds)?;
 
     crate::json_str_field(&json, "ARN").ok_or_else(|| {

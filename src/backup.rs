@@ -8,7 +8,7 @@
 //!
 //! AWS Backup uses a REST-JSON API at `backup.<region>.amazonaws.com`.
 //! Sig V4 service name: `"backup"`.
-//! Content-Type: `application/x-amz-json-1.1`.
+//! Content-Type: `application/json` (REST-JSON, like the AWS SDKs send).
 //!
 //! ## Required IAM on `backup_role_arn`
 //!
@@ -42,6 +42,7 @@ pub fn configure_backup(
     schedule: &str,
     retention_days: i64,
     backup_role_arn: &str,
+    tags: &[(String, String)],
     creds: &AwsCredentials,
 ) -> Result<(), String> {
     // Derive account ID from the backup role ARN (field 4 in the colon-split).
@@ -63,10 +64,28 @@ pub fn configure_backup(
             id
         }
         None => {
-            let plan_body = format!(
-                r#"{{"BackupPlanData":{{"BackupPlanName":"{plan_name}","Rules":[{{"RuleName":"scheduled-snapshot","TargetBackupVaultName":"Default","ScheduleExpression":"{schedule}","Lifecycle":{{"DeleteAfterDays":{retention}}}}}]}}}}"#
-            );
-            let resp = backup_post(region, "/backup/plans", &plan_body, creds)?;
+            // AWS Backup is a REST-JSON API: CreateBackupPlan is
+            // `PUT /backup/plans/` with a "BackupPlan" member and
+            // Content-Type application/json. (It was previously sent as POST,
+            // with "BackupPlanData" and the JSON-RPC content type.)
+            let plan_tags: serde_json::Map<String, serde_json::Value> = tags
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            let plan_body = serde_json::json!({
+                "BackupPlan": {
+                    "BackupPlanName": plan_name,
+                    "Rules": [{
+                        "RuleName": "scheduled-snapshot",
+                        "TargetBackupVaultName": "Default",
+                        "ScheduleExpression": schedule,
+                        "Lifecycle": { "DeleteAfterDays": retention },
+                    }],
+                },
+                "BackupPlanTags": plan_tags,
+            })
+            .to_string();
+            let resp = backup_put(region, "/backup/plans/", &plan_body, creds)?;
             crate::json_str_field(&resp, "BackupPlanId").ok_or_else(|| {
                 format!("configure_backup: could not parse BackupPlanId from response: {resp}")
             })?
@@ -80,8 +99,8 @@ pub fn configure_backup(
         r#"{{"BackupSelection":{{"SelectionName":"{selection_name}","IamRoleArn":"{backup_role_arn}","Resources":["{rds_arn}"]}}}}"#
     );
 
-    let selection_path = format!("/backup/plans/{plan_id}/selections");
-    backup_post(region, &selection_path, &selection_body, creds)?;
+    let selection_path = format!("/backup/plans/{plan_id}/selections/");
+    backup_put(region, &selection_path, &selection_body, creds)?;
 
     log!(
         LogLevel::Info,
@@ -93,7 +112,7 @@ pub fn configure_backup(
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-fn backup_post(
+fn backup_put(
     region: &str,
     path: &str,
     body: &str,
@@ -104,7 +123,7 @@ fn backup_post(
     let datetime = aws_sign::utc_now_iso8601(region);
 
     let (auth, payload_hash) = aws_sign::authorization_header(
-        "POST",
+        "PUT",
         &host,
         path,
         "",
@@ -115,13 +134,13 @@ fn backup_post(
         &creds.access_key,
         &creds.secret_key,
         creds.session_token.as_deref(),
-        Some("application/x-amz-json-1.1"),
+        Some("application/json"),
     );
 
     let url = format!("{}{path}", ep.base_url);
     let mut req = HttpRequest::new(&url)
-        .with_method("POST")
-        .with_header("Content-Type", "application/x-amz-json-1.1")
+        .with_method("PUT")
+        .with_header("Content-Type", "application/json")
         .with_header("Host", &host)
         .with_header("X-Amz-Content-Sha256", &payload_hash)
         .with_header("X-Amz-Date", &datetime)

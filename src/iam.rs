@@ -113,6 +113,7 @@ pub fn ensure_role(
     role_name: &str,
     namespace: &str,
     sa_name: &str,
+    tags: &[(String, String)],
     creds: &AwsCredentials,
 ) -> Result<String, String> {
     let trust = trust_policy_document(namespace, sa_name);
@@ -128,6 +129,20 @@ pub fn ensure_role(
                 "deckwatch-plugin-aws: UpdateAssumeRolePolicy for {role_name}: {e}"
             );
         }
+        // TagRole adds or updates only these keys; other tags are untouched.
+        if !tags.is_empty() {
+            let body = format!(
+                "Action=TagRole&Version=2010-05-08&RoleName={}{}",
+                url_encode(role_name),
+                crate::query_tag_params(tags, "Tags.member"),
+            );
+            if let Err(e) = iam_query(&body, creds) {
+                log!(
+                    LogLevel::Warn,
+                    "deckwatch-plugin-aws: TagRole for {role_name}: {e}"
+                );
+            }
+        }
         return Ok(arn);
     }
 
@@ -138,10 +153,11 @@ pub fn ensure_role(
         .unwrap_or_else(|| "/deckwatch-plugin/".to_string());
 
     let body = format!(
-        "Action=CreateRole&Version=2010-05-08&Path={}&RoleName={}&AssumeRolePolicyDocument={}",
+        "Action=CreateRole&Version=2010-05-08&Path={}&RoleName={}&AssumeRolePolicyDocument={}{}",
         url_encode(&role_path),
         url_encode(role_name),
         url_encode(&trust),
+        crate::query_tag_params(tags, "Tags.member"),
     );
     let xml = iam_query(&body, creds)?;
 
