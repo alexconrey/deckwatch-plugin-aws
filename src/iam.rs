@@ -251,23 +251,18 @@ pub fn attach_sqs_policy(
     Ok(())
 }
 
-/// Attach an inline policy granting `secretsmanager:GetSecretValue` on the given secret ARNs.
+/// Attach the workload's Secrets Manager policy: read on `read_arns` and
+/// `write_arns`, plus `PutSecretValue` on `write_arns` (secrets the plugin
+/// created for the app). See [`crate::secrets_policy_document`].
 pub fn attach_secretsmanager_policy(
     role_name: &str,
-    secret_arns: &[String],
+    read_arns: &[String],
+    write_arns: &[String],
     creds: &AwsCredentials,
 ) -> Result<(), String> {
-    if secret_arns.is_empty() {
+    let Some(policy) = crate::secrets_policy_document(read_arns, write_arns) else {
         return Ok(());
-    }
-    let arns_json: String = secret_arns
-        .iter()
-        .map(|a| format!("\"{a}\""))
-        .collect::<Vec<_>>()
-        .join(",");
-    let policy = format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["secretsmanager:GetSecretValue","secretsmanager:DescribeSecret"],"Resource":[{arns_json}]}}]}}"#
-    );
+    };
     let body = format!(
         "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
         url_encode(role_name),

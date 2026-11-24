@@ -180,8 +180,13 @@ pub struct SqsConfig {
 }
 
 pub struct SecretsMgrConfig {
-    /// ARNs of pre-existing secrets to grant `GetSecretValue` access to.
+    /// ARNs of pre-existing secrets to grant read access to
+    /// (`secretsmanager.deckwatch.io/secret-arns`).
     pub secret_arns: Vec<String>,
+    /// ARNs of secrets the plugin created for this application
+    /// (`secretsmanager.deckwatch.io/owned-secret-arns`, stamped by provision()).
+    /// The workload can read them and write new values (`PutSecretValue`).
+    pub owned_arns: Vec<String>,
     /// When true, create a managed (empty) secret for this workload.
     pub create_secret: bool,
     pub secret_name: String,
@@ -891,10 +896,62 @@ fn sqs_apply_annotations(
     .collect()
 }
 
+/// Inline policy for the workload's secrets: read (`GetSecretValue`,
+/// `DescribeSecret`) on every secret in `read_arns` or `write_arns`, and
+/// `PutSecretValue` on `write_arns` only, so the app can set the values of
+/// secrets the plugin created for it. `None` when there's nothing to grant.
+#[cfg(any(target_arch = "wasm32", test))]
+fn secrets_policy_document(read_arns: &[String], write_arns: &[String]) -> Option<String> {
+    let mut readable: Vec<&String> = Vec::new();
+    for arn in read_arns.iter().chain(write_arns) {
+        if !readable.contains(&arn) {
+            readable.push(arn);
+        }
+    }
+    if readable.is_empty() {
+        return None;
+    }
+    let mut statements = vec![json!({
+        "Effect": "Allow",
+        "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+        "Resource": readable,
+    })];
+    if !write_arns.is_empty() {
+        statements.push(json!({
+            "Effect": "Allow",
+            "Action": ["secretsmanager:PutSecretValue"],
+            "Resource": write_arns,
+        }));
+    }
+    Some(json!({ "Version": "2012-10-17", "Statement": statements }).to_string())
+}
+
+/// The owned secret ARNs the workload may write to.
+///
+/// With `RESOURCE_NAME_PREFIX` set, only secrets named under the prefix (the
+/// plugin's own namespace) qualify. That way a hand-added
+/// `owned-secret-arns` annotation can't give an app write access to some
+/// other secret in the account. With no prefix configured there's nothing to
+/// check against, so all owned ARNs qualify.
+#[cfg(any(target_arch = "wasm32", test))]
+fn writable_secret_arns(owned_arns: &[String], resource_prefix: &str) -> Vec<String> {
+    owned_arns
+        .iter()
+        .filter(|arn| {
+            resource_prefix.is_empty()
+                || arn
+                    .split_once(":secret:")
+                    .is_some_and(|(_, name)| name.starts_with(resource_prefix))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Deployment annotations `provision()` stamps for a Secrets Manager secret.
 ///
-/// Grants access by ARN (`secret-arns`) rather than `enabled`, so `apply()`
-/// re-asserts `deckwatch-secretsmanager-access` without ever creating a secret.
+/// Grants access by ARN (`owned-secret-arns`) rather than `enabled`, so `apply()`
+/// re-asserts `deckwatch-secretsmanager-access`, including write access, without
+/// ever creating a secret.
 #[cfg(any(target_arch = "wasm32", test))]
 fn secretsmanager_apply_annotations(
     app: &str,
@@ -902,7 +959,7 @@ fn secretsmanager_apply_annotations(
     role_name: &str,
 ) -> std::collections::HashMap<String, String> {
     [
-        ("secretsmanager.deckwatch.io/secret-arns", secret_arn),
+        ("secretsmanager.deckwatch.io/owned-secret-arns", secret_arn),
         ("aws.deckwatch.io/app-name", app),
         ("aws.deckwatch.io/role-name", role_name),
     ]
@@ -1219,6 +1276,7 @@ fn db_user_bootstrap(
     iam::attach_secretsmanager_policy(
         &role_name,
         std::slice::from_ref(&instance.master_secret_arn),
+        &[],
         creds,
     )
     .map_err(|e| format!("grant {role_name} read on master secret: {e}"))?;
@@ -1310,8 +1368,15 @@ impl AwsConfig {
         let sqs_enabled = ann_bool(ctx, "sqs.deckwatch.io/enabled", false);
         let ecr_enabled = ann_bool(ctx, "ecr.deckwatch.io/enabled", false);
         let sm_arns_raw = ann_str(ctx, "secretsmanager.deckwatch.io/secret-arns");
+        let sm_owned_raw = ann_str(ctx, "secretsmanager.deckwatch.io/owned-secret-arns");
         let sm_create = ann_bool(ctx, "secretsmanager.deckwatch.io/enabled", false);
-        let sm_enabled = sm_create || !sm_arns_raw.is_empty();
+        let sm_enabled = sm_create || !sm_arns_raw.is_empty() || !sm_owned_raw.is_empty();
+        let split_arns = |raw: &str| -> Vec<String> {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
 
         let aws_enabled = ann_bool(ctx, "aws.deckwatch.io/enabled", false)
             || rds_enabled
@@ -1503,15 +1568,8 @@ impl AwsConfig {
 
         let secretsmanager = if sm_enabled {
             Some(SecretsMgrConfig {
-                secret_arns: if sm_arns_raw.is_empty() {
-                    vec![]
-                } else {
-                    sm_arns_raw
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                },
+                secret_arns: split_arns(&sm_arns_raw),
+                owned_arns: split_arns(&sm_owned_raw),
                 create_secret: sm_create,
                 secret_name: {
                     let raw = ann_str(ctx, "secretsmanager.deckwatch.io/secret-name");
@@ -1821,7 +1879,11 @@ fn apply_with_aws(
 
     // ── 6. Secrets Manager ────────────────────────────────────────────────────
     let sm_secret_arn = if let Some(ref sm_cfg) = cfg.secretsmanager {
+        // Read: referenced, owned and created secrets. Write: only secrets the
+        // plugin created for this app, and only under RESOURCE_NAME_PREFIX.
         let mut all_arns = sm_cfg.secret_arns.clone();
+        all_arns.extend(sm_cfg.owned_arns.iter().cloned());
+        let mut owned = sm_cfg.owned_arns.clone();
 
         let created_arn = if sm_cfg.create_secret {
             let desc = format!(
@@ -1831,6 +1893,7 @@ fn apply_with_aws(
             match secretsmanager::ensure_secret(&sm_cfg.secret_name, &desc, &tags, creds) {
                 Ok(arn) => {
                     all_arns.push(arn.clone());
+                    owned.push(arn.clone());
                     arn
                 }
                 Err(e) => {
@@ -1843,7 +1906,10 @@ fn apply_with_aws(
         };
 
         if !all_arns.is_empty() {
-            if let Err(e) = iam::attach_secretsmanager_policy(&cfg.role_name, &all_arns, creds) {
+            let writable = writable_secret_arns(&owned, resource_prefix);
+            if let Err(e) =
+                iam::attach_secretsmanager_policy(&cfg.role_name, &all_arns, &writable, creds)
+            {
                 log!(
                     LogLevel::Warn,
                     "deckwatch-plugin-aws: attach_secretsmanager_policy: {e}"
@@ -2612,6 +2678,7 @@ pub fn provision(
                         |role| {
                             iam::attach_secretsmanager_policy(
                                 role,
+                                std::slice::from_ref(&arn),
                                 std::slice::from_ref(&arn),
                                 &creds,
                             )
@@ -3665,11 +3732,87 @@ mod tests {
         let sm = cfg
             .secretsmanager
             .expect("apply() must see Secrets Manager access");
-        assert_eq!(sm.secret_arns, vec![arn.to_string()]);
+        // Stamped as owned, so reconciles keep the workload's write access.
+        assert_eq!(sm.owned_arns, vec![arn.to_string()]);
+        assert!(sm.secret_arns.is_empty());
         assert!(
             !sm.create_secret,
             "grant-only annotations must not create a secret"
         );
+    }
+
+    // Provisioned (owned) secrets are readable and writable; referenced
+    // secrets are read-only.
+    #[test]
+    fn secrets_policy_grants_write_only_on_owned_secrets() {
+        let owned = "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:k2-dw-shop/shop-AbCdEf".to_string();
+        let shared =
+            "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:shared/db-ZyXwVu"
+                .to_string();
+        let doc: serde_json::Value = serde_json::from_str(
+            &secrets_policy_document(std::slice::from_ref(&shared), std::slice::from_ref(&owned))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc["Statement"][0]["Action"],
+            json!([
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret"
+            ])
+        );
+        assert_eq!(doc["Statement"][0]["Resource"], json!([shared, owned]));
+        assert_eq!(
+            doc["Statement"][1]["Action"],
+            json!(["secretsmanager:PutSecretValue"])
+        );
+        assert_eq!(doc["Statement"][1]["Resource"], json!([owned]));
+
+        // Read-only when nothing is owned (e.g. the RDS bootstrap role).
+        let ro: serde_json::Value = serde_json::from_str(
+            &secrets_policy_document(std::slice::from_ref(&shared), &[]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ro["Statement"].as_array().unwrap().len(), 1);
+        // An ARN in both lists is listed once for read.
+        let both: serde_json::Value = serde_json::from_str(
+            &secrets_policy_document(std::slice::from_ref(&owned), std::slice::from_ref(&owned))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(both["Statement"][0]["Resource"], json!([owned]));
+        assert_eq!(secrets_policy_document(&[], &[]), None);
+    }
+
+    // With a prefix, write access is limited to the plugin's own namespace, so
+    // a hand-added owned-secret-arns annotation can't reach other secrets.
+    #[test]
+    fn writable_secret_arns_respects_resource_prefix() {
+        let ours = "arn:aws-us-gov:secretsmanager:us-gov-west-1:1:secret:k2-dw-shop/shop-AbCdEf"
+            .to_string();
+        let theirs =
+            "arn:aws-us-gov:secretsmanager:us-gov-west-1:1:secret:gitlab/runner-AbCdEf".to_string();
+        let owned = vec![ours.clone(), theirs.clone()];
+        assert_eq!(writable_secret_arns(&owned, "k2-dw-"), vec![ours]);
+        assert_eq!(
+            writable_secret_arns(&owned, ""),
+            owned,
+            "no prefix: nothing to check"
+        );
+        assert!(writable_secret_arns(&["not-an-arn".to_string()], "k2-dw-").is_empty());
+    }
+
+    // Referenced and owned annotations can coexist on one deployment.
+    #[test]
+    fn owned_and_referenced_secret_annotations_parse_separately() {
+        let cfg = AwsConfig::from_context(&ctx(&[
+            ("secretsmanager.deckwatch.io/secret-arns", "arn:a, arn:b"),
+            ("secretsmanager.deckwatch.io/owned-secret-arns", "arn:c"),
+        ]));
+        let sm = cfg.secretsmanager.expect("enabled by either annotation");
+        assert_eq!(sm.secret_arns, vec!["arn:a", "arn:b"]);
+        assert_eq!(sm.owned_arns, vec!["arn:c"]);
+        assert!(cfg.enabled);
     }
 
     #[test]
