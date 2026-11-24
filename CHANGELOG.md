@@ -10,6 +10,11 @@ history.
 ## [0.8.0] - 2026-11-24
 
 ### Upgrade notes
+- **Back up before upgrading.** 0.8.0 changes existing resources on reconcile:
+  it raises RDS backup retention, tags every resource and rewrites inline
+  policies. Take a manual snapshot of each plugin-managed RDS instance, and
+  record the loaded binary's `sha256` and the plugin config so you can roll
+  back. See [docs/operations.md](docs/operations.md#upgrading-the-plugin).
 - **New plugin IAM permissions.** Grant these before relying on the new
   behaviour; [docs/configuration.md](docs/configuration.md#plugin-iam-permissions)
   has the full policy:
