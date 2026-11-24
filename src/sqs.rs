@@ -43,6 +43,24 @@ pub fn ensure_queue(cfg: &SqsConfig, creds: &AwsCredentials) -> Result<SqsInfo, 
 ///
 /// The queue name cannot be reused for 60 seconds after deletion.
 /// Messages in the queue at the time of deletion are lost.
+/// Total messages in the queue: visible, in flight, and delayed.
+///
+/// SQS has no snapshot, so deprovisioning uses this to refuse deleting a queue
+/// that still holds messages. An unparseable response is an error, so callers
+/// never mistake "unknown" for "empty".
+pub fn queue_message_count(queue_url: &str, creds: &AwsCredentials) -> Result<u64, String> {
+    let body = format!(
+        "Action=GetQueueAttributes&Version=2012-11-05&QueueUrl={}\
+         &AttributeName.1=ApproximateNumberOfMessages\
+         &AttributeName.2=ApproximateNumberOfMessagesNotVisible\
+         &AttributeName.3=ApproximateNumberOfMessagesDelayed",
+        url_encode(queue_url)
+    );
+    let xml = sqs_query(&body, creds)?;
+    crate::queue_message_count(&xml)
+        .ok_or_else(|| format!("SQS GetQueueAttributes: no message counts in response: {xml}"))
+}
+
 pub fn delete_queue(queue_url: &str, creds: &AwsCredentials) -> Result<(), String> {
     let body = format!(
         "Action=DeleteQueue&Version=2012-11-05&QueueUrl={}",

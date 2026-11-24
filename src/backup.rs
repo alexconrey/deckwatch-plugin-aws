@@ -67,7 +67,7 @@ pub fn configure_backup(
                 r#"{{"BackupPlanData":{{"BackupPlanName":"{plan_name}","Rules":[{{"RuleName":"scheduled-snapshot","TargetBackupVaultName":"Default","ScheduleExpression":"{schedule}","Lifecycle":{{"DeleteAfterDays":{retention}}}}}]}}}}"#
             );
             let resp = backup_post(region, "/backup/plans", &plan_body, creds)?;
-            extract_json_str(&resp, "BackupPlanId").ok_or_else(|| {
+            crate::json_str_field(&resp, "BackupPlanId").ok_or_else(|| {
                 format!("configure_backup: could not parse BackupPlanId from response: {resp}")
             })?
         }
@@ -146,8 +146,8 @@ fn backup_post(
             );
             return Ok(text);
         }
-        let msg = extract_json_str(&text, "message")
-            .or_else(|| extract_json_str(&text, "Message"))
+        let msg = crate::json_str_field(&text, "message")
+            .or_else(|| crate::json_str_field(&text, "Message"))
             .unwrap_or_else(|| text.clone());
         return Err(format!("AWS Backup API error {status}: {msg}"));
     }
@@ -162,19 +162,7 @@ fn find_backup_plan_id(
     creds: &AwsCredentials,
 ) -> Result<Option<String>, String> {
     let json = backup_get(region, "/backup/plans?MaxResults=100", creds)?;
-    Ok(find_plan_id_in_list(&json, plan_name))
-}
-
-/// Scan a `ListBackupPlans` JSON response for `plan_name` and return its ID.
-fn find_plan_id_in_list(json: &str, plan_name: &str) -> Option<String> {
-    let name_needle = format!("\"BackupPlanName\":\"{plan_name}\"");
-    let pos = json.find(&name_needle)?;
-    let obj_start = json[..pos].rfind('{').unwrap_or(0);
-    let obj_end = json[pos..]
-        .find('}')
-        .map(|i| pos + i + 1)
-        .unwrap_or(json.len());
-    extract_json_str(&json[obj_start..obj_end], "BackupPlanId")
+    Ok(crate::backup_plan_id(&json, plan_name))
 }
 
 fn backup_get(region: &str, path: &str, creds: &AwsCredentials) -> Result<String, String> {
@@ -219,57 +207,11 @@ fn backup_get(region: &str, path: &str, creds: &AwsCredentials) -> Result<String
     let text = String::from_utf8_lossy(&resp.body()).to_string();
 
     if status >= 400 {
-        let msg = extract_json_str(&text, "message")
-            .or_else(|| extract_json_str(&text, "Message"))
+        let msg = crate::json_str_field(&text, "message")
+            .or_else(|| crate::json_str_field(&text, "Message"))
             .unwrap_or_else(|| text.clone());
         return Err(format!("AWS Backup GET error {status}: {msg}"));
     }
 
     Ok(text)
-}
-
-/// Extract a string value from a flat JSON object by key (no serde dependency).
-fn extract_json_str(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = json.find(&needle)? + needle.len();
-    let end = json[start..].find('"')?;
-    Some(json[start..start + end].to_string())
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn find_plan_id_finds_matching_plan() {
-        let json = r#"{"BackupPlansList":[{"BackupPlanId":"aaa","BackupPlanName":"other-backup"},{"BackupPlanId":"bbb111","BackupPlanName":"mydb-backup","VersionId":"v1"}]}"#;
-        assert_eq!(
-            find_plan_id_in_list(json, "mydb-backup"),
-            Some("bbb111".to_string())
-        );
-    }
-
-    #[test]
-    fn find_plan_id_returns_none_when_not_found() {
-        let json =
-            r#"{"BackupPlansList":[{"BackupPlanId":"aaa","BackupPlanName":"other-backup"}]}"#;
-        assert_eq!(find_plan_id_in_list(json, "mydb-backup"), None);
-    }
-
-    #[test]
-    fn find_plan_id_empty_list() {
-        let json = r#"{"BackupPlansList":[]}"#;
-        assert_eq!(find_plan_id_in_list(json, "mydb-backup"), None);
-    }
-
-    #[test]
-    fn extract_json_str_basic() {
-        let json = r#"{"BackupPlanId":"abc123","Other":"val"}"#;
-        assert_eq!(
-            extract_json_str(json, "BackupPlanId"),
-            Some("abc123".to_string())
-        );
-    }
 }

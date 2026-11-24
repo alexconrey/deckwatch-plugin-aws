@@ -7,7 +7,25 @@ history.
 
 ## [Unreleased]
 
+### Changed
+- **Removing a resource never destroys data without a recovery path.**
+  - RDS always takes a final snapshot, now timestamped
+    (`<identifier>-final-YYYYMMDD-HHMMSS`) so repeat deletions can't collide.
+  - SQS queues that still hold messages are kept, along with the app's access.
+  - S3 buckets are kept.
+  - Secrets keep a 30-day recovery window.
+- **Removing a resource cleans up IAM.** Its inline policy is removed from the
+  workload role, and the role (and, for RDS, the bootstrap Job's role) is deleted
+  once nothing is left on it.
+
 ### Fixed
+- **Provisioned SQS queues and Secrets Manager secrets now grant the workload
+  access.** They attach `deckwatch-sqs-access` / `deckwatch-secretsmanager-access`
+  to the app role, emit the ServiceAccount, and stamp annotations so every reconcile
+  re-asserts the grant.
+- **Secrets Manager and AWS Backup responses are parsed as JSON**, instead of by
+  `"key":"` substring matching. Responses with whitespace previously failed, and
+  Secrets Manager's numeric `DeletionDate` showed as "unknown".
 - **Provisioning an S3 bucket now grants the workload access to it.** `provision("s3")`
   never attached an IAM policy, and the S3 policy used `arn:aws:s3:::` ARNs, which
   never match GovCloud buckets. It now attaches `deckwatch-s3-access` with the
@@ -33,6 +51,8 @@ history.
 - GitHub Actions moved to their Node 24 releases. (#25)
 
 ### Removed
+- The `RDS_SKIP_FINAL_SNAPSHOT` config key. RDS deletion always takes a final
+  snapshot.
 - The `rds.deckwatch.io/region` annotation. It was parsed but never used; RDS always
   uses `AWS_REGION`. (#29)
 
