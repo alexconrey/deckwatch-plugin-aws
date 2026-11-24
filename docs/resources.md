@@ -36,7 +36,9 @@ listed with their defaults.
 
 What gets created:
 - **An instance** that is encrypted (gp3), not publicly accessible, has **deletion
-  protection** on, uses 20 GiB of storage and is single-AZ. Its master user is
+  protection** on, uses 20 GiB of storage and is single-AZ. It has **daily automated
+  backups kept for `RDS_BACKUP_RETENTION_DAYS`** (default 14) with point-in-time
+  recovery, and snapshots copy the instance's tags. Its master user is
   `dbadmin`, with a password managed by RDS in Secrets Manager. It's placed using
   `RDS_DEFAULT_SUBNET_GROUP` and `RDS_DEFAULT_SECURITY_GROUPS`.
 - **Polling while it starts:** while the instance is being created, the state is
