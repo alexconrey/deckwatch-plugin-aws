@@ -15,7 +15,7 @@ described in [Documentation](#documentation) below.
 | `metadata()` | once, when the plugin loads | Config schema, resources, capabilities, version (`CARGO_PKG_VERSION`) |
 | `provision()` | resource added or refreshed | Returns `state` (env vars for every deployment), `deployment_annotations`, `kubernetes_resources` |
 | `apply()` | every deployment create and update | Reads `*.deckwatch.io/*` annotations; reconciles resources and IAM; returns env vars and `wants_service_account` |
-| `deprovision()` | resource removed | RDS deleted (final snapshot by default); S3 kept; SQS deleted; secret scheduled for deletion |
+| `deprovision()` | resource removed | RDS: final snapshot (always), automated backups kept; S3 kept; SQS deleted only if empty; secret scheduled for deletion (30-day window). Then the resource's inline policy is removed and the role deleted once nothing is left on it |
 
 `src/lib.rs` holds the exports, config parsing (`AwsConfig::from_context`) and pure
 helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
@@ -43,7 +43,11 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
    `POLICY_*` constants, one per resource type.
 5. **"Not found" is often an HTTP 4xx.** Map it to `Ok(None)` before propagating
    errors (IAM `NoSuchEntity`, SQS `NonExistentQueue`). Include the AWS error `Code`
-   in error strings so these checks have something to match.
+   in error strings so these checks have something to match. **Under path-scoped
+   IAM grants, a call on a missing role returns `AccessDenied`, not
+   `NoSuchEntity`** (IAM authorizes it against `role/<name>` without the path), so
+   look before you delete: deprovisioning lists a role's policies and only deletes
+   what's there.
 6. **Only request the ServiceAccount after the role exists.** `apply_inner` is the
    no-AWS fallback and must not set `wants_service_account`.
 7. **No clock, no filesystem.** Time comes from the `CURRENT_TIMESTAMP` config value,
@@ -69,6 +73,16 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
     Content-Type. Check `aws <service> <op> --debug` against moto when adding an
     API; that's how the Backup client's POST/`BackupPlanData`/JSON-RPC
     content-type bug was found.
+13. **Grant write access only to secrets the plugin created.** `PutSecretValue`
+    goes on `secretsmanager.deckwatch.io/owned-secret-arns` (stamped by
+    provisioning), filtered by `writable_secret_arns()` to names under
+    `RESOURCE_NAME_PREFIX`. Secrets referenced with `secret-arns` stay read-only.
+14. **moto doesn't check IAM, so nothing tests the plugin's own policy.** When you
+    add an AWS call, or add tags to a create call (AWS checks tag-on-create
+    against the tagging action: `CreateRole` with tags needs `iam:TagRole`),
+    update `docs/configuration.md#plugin-iam-permissions` and the CHANGELOG
+    *Upgrade notes* in the same PR. Tagging was merged with a documented policy
+    that lacked `iam:TagRole`, which blocks role creation, and no test caught it.
 
 ## Testing
 
@@ -85,23 +99,58 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
   moto, and verify state through the AWS SDK. Name resources with `unique(…)`.
 - **Mutation-check new tests**: break the fix on purpose and confirm the test fails.
 - Run clippy for **both** targets: `cargo clippy --target <host> --all-targets -- -D warnings`
-  and `cargo clippy --target wasm32-unknown-unknown -- -D warnings`.
+  and `cargo clippy --target wasm32-unknown-unknown -- -D warnings`. CI only lints
+  the host build.
+- moto 5.2.6 returns HTTP 500 for `CreateBackupSelection` (the AWS CLI gets the
+  same), so the Backup integration test checks the plan and its tags only.
 
 ## Dependencies
 
-- `hmac`, `sha2` and `digest` must be upgraded **together**; Dependabot groups them.
+- `hmac`, `sha2`, `md-5` and `digest` must be upgraded **together**; Dependabot's
+  `rustcrypto` group keeps them in one PR.
 - Container images Dependabot can't see: moto (CI, Makefile, docs), and
   `DEFAULT_BOOTSTRAP_AWSCLI_IMAGE` / `DEFAULT_BOOTSTRAP_PSQL_IMAGE` in `src/lib.rs`.
 - Lockfiles are git-ignored on purpose.
+- `deckwatch-plugin-sdk` is a git dependency on `main`, so SDK changes reach the
+  next build without a bump. Pin it to a tag once one exists with what the plugin
+  needs (v0.10.0 adds `delete_kubernetes_resources`). deckwatch mirrors the SDK
+  types by hand, so a new SDK type (e.g. `ConfigFieldType::KeyValue`) only works
+  once deckwatch supports it. That's why `RESOURCE_TAGS` is still a `String`
+  field that also accepts `key_value`'s JSON.
 
 ## Releasing
 
-Bump `Cargo.toml` `version` in its own PR (`chore: set version to X.Y.Z`); the
-plugin reports it to deckwatch. Move the CHANGELOG *Unreleased* entries under the new
-version, then tag `vX.Y.Z` on `main`. `release.yml` attaches `plugin.wasm` to the
-release. To test an unreleased build in deckwatch, upload the **raw bytes**:
+1. Bump `Cargo.toml` `version` in its own PR (`chore: set version to X.Y.Z`); the
+   plugin reports it to deckwatch. Move the CHANGELOG *Unreleased* entries under
+   the new version, with *Upgrade notes* for anything operators must do first
+   (new plugin IAM actions above all).
+2. After CI passes and the user merges, tag `vX.Y.Z` on `main`. Never tag before
+   the merge. `release.yml` attaches `plugin.wasm` to the release.
+3. Rolling it out (pointing deckwatch at the tag, or uploading) is a live change;
+   see [Live environments](#live-environments). Afterwards, compare the loaded
+   `sha256` from `GET /api/plugins` with the release asset.
+
+To test an unreleased build in deckwatch, upload the **raw bytes**:
 `curl -X POST -H 'Content-Type: application/wasm' --data-binary @dist/plugin.wasm https://<deckwatch>/api/plugins/AWS/upload`.
 Multipart form data is rejected.
+
+## Live environments
+
+Work on this plugin often means investigating a deployed deckwatch (its MCP
+server) and the AWS account behind it.
+
+- **Ask before every live change**, and name the exact change: AWS writes
+  (`put-role-policy`, `create-secret`, …), plugin uploads, plugin config changes,
+  and refreshing or deprovisioning resources. Approval for one change doesn't
+  cover the next. Read-only calls (`describe-*`, `get-*`, `list-*`, deckwatch
+  `get_*`/`list_*`) are fine.
+- **Hand-made grants get their own policy name** (`manual-<purpose>`), never a
+  `deckwatch-*` one, which the next reconcile would overwrite. Remove them once
+  the plugin covers the access. Until then they keep the role from being deleted.
+  See `docs/operations.md#granting-access-by-hand`.
+- **This repo is public.** Keep account IDs, hostnames, and cluster or customer
+  names out of commits, docs and PR text. Use placeholders such as `<account>`
+  and `<deckwatch-host>`.
 
 ## Documentation
 
@@ -110,11 +159,12 @@ When you change behaviour, update the page that describes it in the same PR:
 | Change | Update |
 |---|---|
 | Config key (`metadata().config_schema`) | `docs/configuration.md` |
-| AWS API call | `docs/configuration.md#plugin-iam-permissions`, and `allowed_hosts` if it's a new host |
+| AWS API call, or tags on a create call | `docs/configuration.md#plugin-iam-permissions` (and `allowed_hosts` if it's a new host), plus CHANGELOG *Upgrade notes* |
 | Resource field, annotation, env var, output, naming | `docs/resources.md` |
 | Role, trust policy, inline policy, partition, bootstrap Job | `docs/identity.md` |
 | Refresh, deprovision or upgrade behaviour; limitations | `docs/operations.md` |
 | Build, test, CI, release process | `docs/development.md` |
+| Integration test coverage, moto caveats | `integration/README.md` |
 | Anything user-visible | `CHANGELOG.md` → *Unreleased* |
 
 ## Git workflow
@@ -122,4 +172,9 @@ When you change behaviour, update the page that describes it in the same PR:
 - **Never** push or commit directly to `main`.
 - **Never** merge a PR without CI passing.
 - All changes go through a feature branch and PR.
-- No Co-Authored-By lines in commits for this repo.
+- **Branch every PR from `main`; don't stack PRs.** GitHub merges a PR into its
+  base branch, so a stacked PR lands on the other feature branch, not `main`
+  (#31 and #32 had to be re-landed through #35). Wait for the first PR to merge,
+  then rebase onto `main`.
+- No Co-Authored-By lines or other AI attribution in commits or PR descriptions
+  for this repo.

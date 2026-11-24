@@ -15,11 +15,21 @@ history.
   has the full policy:
   - `iam:ListRolePolicies`, `iam:ListAttachedRolePolicies` (on `role/*`),
     `iam:DeleteRolePolicy`, `iam:DeleteRole` (on the role path);
-  - `s3:GetBucketTagging`;
+  - tagging: `iam:TagRole`, `rds:AddTagsToResource`, `s3:GetBucketTagging`,
+    `s3:PutBucketTagging`, `sqs:TagQueue`, `secretsmanager:TagResource`,
+    `backup:TagResource`. **These are required.** Every create call now
+    carries tags, and AWS denies a create whose tags the caller can't apply.
+    Without `iam:TagRole`, workload roles aren't created at all;
   - SQS and Secrets Manager actions scoped to `RESOURCE_NAME_PREFIX`, including
-    `sqs:TagQueue` and `secretsmanager:TagResource`.
+    `sqs:GetQueueAttributes` for the empty-queue check.
+- **Refresh S3, SQS and Secrets Manager resources provisioned by earlier
+  versions** once after upgrading. That attaches the IAM policy they were
+  missing (see *Fixed*) and stamps the annotations that keep it in place.
 - **Set `RESOURCE_NAME_PREFIX` before provisioning any SQS queue or secret.**
-  Changing it later makes reconciles create new, prefixed resources.
+  Existing queues and secrets aren't renamed. Once a prefix is set, the next
+  refresh or reconcile creates a new, prefixed one, points the app at it and
+  moves its access. The old one is left in place, so drain the queue or copy the
+  secret's value first.
 - **RDS deletion always takes a final snapshot.** `RDS_SKIP_FINAL_SNAPSHOT` is
   gone, and existing settings for it are ignored.
 - **Existing RDS instances below `RDS_BACKUP_RETENTION_DAYS` (default 14) are

@@ -5,10 +5,16 @@
 - [Refreshing a resource](#refreshing-a-resource)
 - [Backups](#backups)
 - [Removing a resource](#removing-a-resource)
+- [Granting access by hand](#granting-access-by-hand)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
 
 ## Upgrading the plugin
+
+**Read the new version's *Upgrade notes* in the [CHANGELOG](../CHANGELOG.md)
+first.** They list the IAM permissions and settings the plugin's role and config
+need before the new binary runs. 0.8.0, for example, can't create workload roles
+without `iam:TagRole`.
 
 1. **Release builds:** bump the release `ref` in the plugin's GitHub source. deckwatch
    fetches the new `plugin.wasm` and reloads it.
@@ -32,6 +38,17 @@
 
 Upgrading the plugin changes nothing in AWS by itself. New behaviour applies the next
 time a resource is provisioned or refreshed, or a deployment is reconciled.
+
+**Upgrading from a version before 0.8.0:**
+- Refresh each S3, SQS and Secrets Manager resource once. Those versions attached
+  no IAM policy when provisioning them, so the application got `AccessDenied`.
+  Refreshing attaches the policy and stamps the annotations that keep it in place.
+- Queues and secrets that already exist keep their names. If you set
+  `RESOURCE_NAME_PREFIX`, refreshing one creates a **new**, prefixed queue or secret
+  and points the application at it. The application loses access to the old one,
+  which is left in place, so drain the queue or copy the secret's value across.
+  To keep the existing names, leave the prefix empty. The plugin's SQS and Secrets
+  Manager permissions then can't be scoped to a prefix.
 
 ## Verifying the loaded binary
 
@@ -126,6 +143,34 @@ Then the plugin cleans up IAM:
 The removal message lists every snapshot taken, everything kept, and every IAM
 change.
 
+## Granting access by hand
+
+Sometimes an application needs access before the plugin can grant it, for example
+while new plugin permissions are still being rolled out. Add your own inline policy
+to the application's workload role, `<namespace>-<app>-rds`:
+
+- **Use your own policy name**, such as `manual-<purpose>`. Never use one of the
+  plugin's `deckwatch-*` names: the plugin replaces those on every reconcile.
+- **Create the resource under the name the plugin will use**, including
+  `RESOURCE_NAME_PREFIX` (see [naming](resources.md#naming-defaults)).
+  Provisioning then adopts it instead of creating another one. An existing secret
+  is adopted as is, value included.
+- **Grant only what the plugin would.** For a secret the plugin will own, that's
+  `secretsmanager:GetSecretValue`, `DescribeSecret` and `PutSecretValue` on
+  `arn:<partition>:secretsmanager:<region>:<account>:secret:<name>-??????`. Secrets
+  Manager adds six random characters to every secret ARN.
+- **Remove the policy once the plugin's policy covers the access**, after the
+  resource is provisioned or refreshed. While the policy exists, the role isn't
+  empty, so removing the application's last resource keeps the role.
+
+```bash
+aws secretsmanager create-secret --name '<prefix><namespace>/<app>'
+aws iam put-role-policy --role-name <namespace>-<app>-rds \
+  --policy-name manual-<purpose> --policy-document file://policy.json
+# Once the plugin has provisioned the resource:
+aws iam delete-role-policy --role-name <namespace>-<app>-rds --policy-name manual-<purpose>
+```
+
 ## Troubleshooting
 
 ### `AccessDenied` from the application
@@ -135,13 +180,37 @@ change.
    `default`, it has no AWS identity at all; see the next section.
 2. **Check the role's policies:**
    `aws iam list-role-policies --role-name <role>`. Each resource should have its
-   policy from [the table](identity.md#inline-policies).
+   policy from [the table](identity.md#inline-policies). If an S3, SQS or Secrets
+   Manager resource has none, it was probably provisioned by a version before
+   0.8.0. Refresh it.
 3. **Check the ARNs:** `aws iam get-role-policy …`. In GovCloud every ARN must start
    with `arn:aws-us-gov:`.
 4. **Confirm what's allowed:**
    `aws iam simulate-principal-policy --policy-source-arn <role-arn> --action-names s3:GetObject --resource-arns arn:<partition>:s3:::<bucket>/x`
    shows whether the role itself allows the action. If it does, look at the resource
    side next: bucket policies, KMS key policies, VPC endpoint policies.
+
+### Provisioning fails with `AccessDenied` for the plugin's own role
+
+If the error names deckwatch's role (`AWS_ROLE_ARN`) rather than the
+application's, the plugin's own permissions are missing something. Compare the
+action and resource in the message with
+[Plugin IAM permissions](configuration.md#plugin-iam-permissions):
+
+- **A queue or secret name without your prefix:** `RESOURCE_NAME_PREFIX` isn't set,
+  or doesn't match the `<prefix>*` the policy is scoped to.
+- **A tagging action** (`iam:TagRole`, `rds:AddTagsToResource`, `sqs:TagQueue`,
+  `secretsmanager:TagResource`): grant it. Every create call carries tags, so
+  without it the create fails.
+- **`iam:GetRole` or `iam:ListRolePolicies` on `role/<name>`, without the path:**
+  these lookups must be granted on `role/*`. IAM authorizes calls on a role that
+  doesn't exist without its path.
+
+### `can't find the specified secret value for staging label: AWSCURRENT`
+
+The secret exists but has no value yet. The plugin creates secrets empty. Set the
+first value from a pod that runs as the application's ServiceAccount, as shown in
+[Secrets Manager secret](resources.md#secrets-manager-secret-secretsmanager).
 
 ### The pod runs as `default` instead of `<app>-aws-sa`
 
@@ -185,12 +254,20 @@ The endpoint is missing from the plugin's `allowed_hosts`. See
   plugins delete Kubernetes objects; `deprovision()` can only return errors and a
   message. When the last resource's removal deletes the role, the message tells you
   to delete `<app>-aws-sa` with `kubectl`. The DB bootstrap Job and its
-  ServiceAccount stay as well.
+  ServiceAccount stay as well. The SDK's `delete_kubernetes_resources` (merged for
+  SDK v0.10.0) and
+  [alexconrey/deckwatch#235](https://github.com/alexconrey/deckwatch/pull/235)
+  (in review) add this, and the plugin will use it once both are released.
 - **Removing an application's last resource leaves its annotations on the
   deployments.** deckwatch only re-applies resource annotations to applications
-  that still have resources. Until then, `apply()` still sees the old
-  `*.deckwatch.io/*` annotations, and could, for example, re-create an empty SQS
+  that still have resources, so `apply()` keeps seeing the old
+  `*.deckwatch.io/*` annotations and could, for example, re-create an empty SQS
   queue. Remove the annotations, or redeploy without them.
+  [alexconrey/deckwatch#229](https://github.com/alexconrey/deckwatch/pull/229)
+  (in review) fixes this in deckwatch.
+- **`RESOURCE_TAGS` is a single text field in the deckwatch UI.** A row-per-tag
+  editor needs deckwatch support for the SDK's `key_value` field type. The plugin
+  already accepts the JSON form that field will store.
 - **The workload role keeps the `-rds` suffix** even when it carries other
   resources' policies. Renaming it would orphan existing roles.
 - **Annotation-only roles aren't cleaned up.** Roles created purely from

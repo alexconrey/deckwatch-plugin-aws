@@ -69,7 +69,7 @@ What gets created:
 
 | Field | Default | Notes |
 |---|---|---|
-| `queue_name` | `<namespace>-<app>-queue` | `.fifo` is appended for FIFO queues. |
+| `queue_name` | `<namespace>-<app>-queue` | `RESOURCE_NAME_PREFIX` is prepended, and `.fifo` is appended for FIFO queues. |
 | `fifo` | `false` | FIFO with content-based deduplication. |
 | `visibility_timeout` | `30` | Seconds. |
 | `retention_days` | `4` | Days, at most 14. |
@@ -85,7 +85,7 @@ What gets created:
 
 | Field | Default | Notes |
 |---|---|---|
-| `secret_name` | `<namespace>/<app>` | Name or path. |
+| `secret_name` | `<namespace>/<app>` | Name or path. `RESOURCE_NAME_PREFIX` is prepended. |
 
 What gets created:
 - An **empty** secret. If a secret with that name already exists, it's adopted
@@ -106,7 +106,8 @@ aws secretsmanager put-secret-value --secret-id "$SM_SECRET_ARN" \
   --secret-string '{"API_KEY":"…"}'
 ```
 
-Reads fail until the first value is set.
+Reads fail until the first value is set, with `can't find the specified secret
+value for staging label: AWSCURRENT`.
 
 ## Annotation reference
 

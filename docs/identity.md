@@ -17,7 +17,7 @@ policies.
 
 | | Name | Created by |
 |---|---|---|
-| IAM role | `<namespace>-<app>-rds` when provisioned (see [naming](resources.md#naming-defaults)), under `ROLE_PATH` (default `/deckwatch-plugin/`) | `provision()` for RDS (IAM auth) and S3; `apply()` on reconcile |
+| IAM role | `<namespace>-<app>-rds` when provisioned (see [naming](resources.md#naming-defaults)), under `ROLE_PATH` (default `/deckwatch-plugin/`), tagged like every [managed resource](configuration.md#resource-tags) | `provision()` for RDS (IAM auth), S3, SQS and Secrets Manager; `apply()` on reconcile |
 | ServiceAccount | `<app>-aws-sa`, annotated `eks.amazonaws.com/role-arn: <role ARN>` | `provision()` returns it as a Kubernetes resource; `apply()` asks deckwatch for it with `wants_service_account` |
 
 - **The ServiceAccount is only requested once the role exists.** If role creation
@@ -68,8 +68,10 @@ ServiceAccount**:
 policies on every reconcile safely. deckwatch allows at most one resource of each
 type per application, so one fixed policy name per type never collides. Removing a
 resource deletes its policy, and the role is deleted with the last policy (see
-[Removing a resource](operations.md#removing-a-resource)). If someone deletes a policy by hand, the next
-reconcile restores it.
+[Removing a resource](operations.md#removing-a-resource)). If someone deletes a
+policy by hand, the next reconcile restores it. Policies added by hand under other
+names are left alone, and they keep the role from being deleted (see
+[Granting access by hand](operations.md#granting-access-by-hand)).
 
 ## GovCloud and partitions
 
