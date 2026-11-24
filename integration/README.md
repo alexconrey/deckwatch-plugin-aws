@@ -77,3 +77,6 @@ key unset in production.
   plugin's own output alone. `inline_policy` and `policy_resources` read a role's
   policy back.
 - Mutation-check a new test: break the fix on purpose and confirm the test fails.
+- After changing `Cargo.toml` here, run `cargo update --workspace` in this
+  directory and commit `Cargo.lock`. CI and `make integration` build with
+  `--locked` and fail on a stale lockfile.

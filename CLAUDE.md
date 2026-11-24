@@ -110,14 +110,21 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
   `rustcrypto` group keeps them in one PR.
 - Container images Dependabot can't see: moto (CI, Makefile, docs), and
   `DEFAULT_BOOTSTRAP_AWSCLI_IMAGE` / `DEFAULT_BOOTSTRAP_PSQL_IMAGE` in `src/lib.rs`.
-- Lockfiles are git-ignored on purpose.
+- **Lockfiles are committed** (`Cargo.lock` and `integration/Cargo.lock`), and
+  every cargo build, test and clippy run in CI, `release.yml` and the Makefile
+  uses `--locked`. So a release builds exactly the dependency versions CI
+  tested, and the *Lockfiles match Cargo.toml* CI job fails if either lockfile
+  is out of sync with its `Cargo.toml`. After editing a `Cargo.toml`, run
+  `cargo update --workspace` in that directory and commit the lockfile in the
+  same PR. A bare `cargo update` bumps every dependency, so only run it when
+  that's the point of the PR. Ignored lockfiles are how the first v0.8.0
+  release build broke minutes after CI passed: it re-resolved the SDK's moved
+  `main`.
 - **`deckwatch-plugin-sdk` is pinned to a commit (`rev`)** in both `Cargo.toml`
-  and `integration/Cargo.toml`; keep the two identical. Never go back to
-  `branch = "main"`. Without a lockfile, every build, including the release
-  build of a tag, compiles whatever the SDK's `main` is at that moment. That's
-  how the first v0.8.0 release build broke minutes after CI passed. Bump the rev
-  (or switch to a tag once the SDK publishes one) in its own PR, with CI.
-  v0.10.0's `delete_kubernetes_resources` needs a bump past the current pin.
+  and `integration/Cargo.toml`; keep the two identical, and never go back to
+  `branch = "main"`. Bump the rev (or switch to a tag once the SDK publishes
+  one) in its own PR, with CI. v0.10.0's `delete_kubernetes_resources` needs a
+  bump past the current pin.
 - deckwatch mirrors the SDK types by hand, so a new SDK type (e.g.
   `ConfigFieldType::KeyValue`) only works once deckwatch supports it. That's why
   `RESOURCE_TAGS` is still a `String` field that also accepts `key_value`'s JSON.
