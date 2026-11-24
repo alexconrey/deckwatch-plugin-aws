@@ -1,0 +1,46 @@
+# Dependabot version updates.
+# https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+#
+# Not covered — Dependabot can't see these, so bump them by hand:
+#   - motoserver/moto service image in .github/workflows/ci.yml
+#   - bootstrap Job images in src/lib.rs (DEFAULT_BOOTSTRAP_*_IMAGE)
+version: 2
+
+updates:
+  # The plugin crate (compiled to plugin.wasm).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      rust-minor-patch:
+        update-types: [minor, patch]
+
+  # The integration-test harness (extism host + AWS SDK); separate workspace.
+  - package-ecosystem: cargo
+    directory: /integration
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # The AWS SDK crates release together and must move in lockstep.
+      aws-sdk:
+        patterns: ["aws-*"]
+      integration-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      github-actions:
+        patterns: ["*"]
