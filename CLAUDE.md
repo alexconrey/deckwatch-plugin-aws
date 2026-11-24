@@ -81,7 +81,7 @@ WASM cannot open a Postgres connection, so once the instance is available
   container runs idempotent `CREATE ROLE … LOGIN` / `GRANT rds_iam` / database
   and `public` schema grants, then deletes the file. The password never enters
   plugin state, a Kubernetes Secret, or the Job spec.
-- Images default to `amazon/aws-cli` and `postgres:18-alpine`, overridable via
+- Images default to `amazon/aws-cli` and `postgres:19-alpine`, overridable via
   `DB_BOOTSTRAP_AWSCLI_IMAGE` / `DB_BOOTSTRAP_PSQL_IMAGE`.
 
 Postgres only. Requires deckwatch to apply `kubernetes_resources` from the
