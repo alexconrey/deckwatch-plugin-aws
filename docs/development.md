@@ -155,9 +155,12 @@ crate, the integration harness and the GitHub Actions:
   They share the `digest` trait crate, and upgrading only one fails to compile.
 - **Minor and patch updates are grouped** per ecosystem, and the `aws-*` harness
   crates move in lockstep.
-- **`deckwatch-plugin-sdk` is a git dependency on its `main` branch**, and
-  lockfiles aren't committed, so every build picks up the SDK's latest `main`.
-  deckwatch keeps its own hand-written copy of the SDK's types, so a new SDK type
+- **`deckwatch-plugin-sdk` is pinned to a commit** (`rev`) in both `Cargo.toml`
+  and `integration/Cargo.toml`, and the two must match. Lockfiles aren't
+  committed, so a branch dependency would make every build, including a
+  release build, compile whatever the SDK's `main` is at that moment. Bump the
+  pin in its own PR so CI tests the new SDK before a release uses it.
+- deckwatch keeps its own hand-written copy of the SDK's types, so a new SDK type
   (such as the `key_value` config field type) does nothing until deckwatch
   supports it too.
 

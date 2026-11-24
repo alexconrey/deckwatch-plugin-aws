@@ -80,6 +80,8 @@ history.
 - DB bootstrap Job images: `amazon/aws-cli:2.42.2`, `postgres:19-alpine`. (#25)
 - `hmac` 0.13 and `sha2` 0.11 (signatures byte-identical), plus `md-5` for S3
   `Content-MD5`. GitHub Actions moved to their Node 24 releases. (#25, #28, #37)
+- `deckwatch-plugin-sdk` is pinned to a commit instead of following its `main`
+  branch, so a release builds exactly what CI tested. (#40)
 
 ### Fixed
 - **Provisioning a resource now grants the workload access to it.** Before this,

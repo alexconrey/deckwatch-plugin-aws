@@ -111,12 +111,16 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
 - Container images Dependabot can't see: moto (CI, Makefile, docs), and
   `DEFAULT_BOOTSTRAP_AWSCLI_IMAGE` / `DEFAULT_BOOTSTRAP_PSQL_IMAGE` in `src/lib.rs`.
 - Lockfiles are git-ignored on purpose.
-- `deckwatch-plugin-sdk` is a git dependency on `main`, so SDK changes reach the
-  next build without a bump. Pin it to a tag once one exists with what the plugin
-  needs (v0.10.0 adds `delete_kubernetes_resources`). deckwatch mirrors the SDK
-  types by hand, so a new SDK type (e.g. `ConfigFieldType::KeyValue`) only works
-  once deckwatch supports it. That's why `RESOURCE_TAGS` is still a `String`
-  field that also accepts `key_value`'s JSON.
+- **`deckwatch-plugin-sdk` is pinned to a commit (`rev`)** in both `Cargo.toml`
+  and `integration/Cargo.toml`; keep the two identical. Never go back to
+  `branch = "main"`. Without a lockfile, every build, including the release
+  build of a tag, compiles whatever the SDK's `main` is at that moment. That's
+  how the first v0.8.0 release build broke minutes after CI passed. Bump the rev
+  (or switch to a tag once the SDK publishes one) in its own PR, with CI.
+  v0.10.0's `delete_kubernetes_resources` needs a bump past the current pin.
+- deckwatch mirrors the SDK types by hand, so a new SDK type (e.g.
+  `ConfigFieldType::KeyValue`) only works once deckwatch supports it. That's why
+  `RESOURCE_TAGS` is still a `String` field that also accepts `key_value`'s JSON.
 
 ## Releasing
 
