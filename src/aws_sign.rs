@@ -173,4 +173,76 @@ mod tests {
         assert_eq!(y, 2026);
         assert_eq!(mo, 8);
     }
+
+    // ── Known-answer tests for the crypto primitives ──────────────────────────
+    //
+    // moto does not verify signatures, so these are the only tests that catch
+    // a hashing or HMAC regression (e.g. from a hmac/sha2 upgrade) before it
+    // reaches real AWS.
+
+    #[test]
+    fn sha256_matches_published_vectors() {
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    // RFC 4231 §4.3, test case 2.
+    #[test]
+    fn hmac_sha256_matches_rfc4231() {
+        assert_eq!(
+            hex(&hmac_sha256(b"Jefe", "what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    // Signing-key derivation example from the AWS SigV4 documentation.
+    #[test]
+    fn signing_key_matches_aws_documented_example() {
+        let key = signing_key(
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20120215",
+            "us-east-1",
+            "iam",
+        );
+        assert_eq!(
+            hex(&key),
+            "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d"
+        );
+    }
+
+    // End-to-end golden value for a GovCloud S3 PutBucketVersioning request.
+    // Captured with hmac 0.12 / sha2 0.10; any dependency upgrade must
+    // reproduce it byte for byte.
+    #[test]
+    fn authorization_header_is_stable() {
+        let (auth, payload_hash) = authorization_header(
+            "PUT",
+            "k2-ampere-artifacts.s3.us-gov-west-1.amazonaws.com",
+            "/",
+            "versioning",
+            r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#,
+            "20261124T170000Z",
+            "us-gov-west-1",
+            "s3",
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            Some("session-token-example"),
+            Some("application/xml"),
+        );
+        assert_eq!(payload_hash, GOLDEN_PAYLOAD_HASH);
+        assert_eq!(auth, GOLDEN_AUTH);
+    }
+
+    const GOLDEN_PAYLOAD_HASH: &str =
+        "482d4e510b5cdcf0bbf3a044e82832dc711f4f28757a6c06eb21758282a73ef7";
+    const GOLDEN_AUTH: &str = "AWS4-HMAC-SHA256 \
+        Credential=AKIDEXAMPLE/20261124/us-gov-west-1/s3/aws4_request, \
+        SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, \
+        Signature=dafea5fd01e1d3a9cabbf8b8a0b37906b12c64b57be77db3bacaba89b8de59b6";
 }
