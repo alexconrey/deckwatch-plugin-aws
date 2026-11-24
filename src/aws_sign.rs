@@ -10,7 +10,7 @@
 //!
 //! Reference: https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
