@@ -6,7 +6,7 @@
 //! Queue ARNs are derived from the queue URL to avoid an extra
 //! `GetQueueAttributes` round-trip:
 //! `https://sqs.<region>.amazonaws.com/<account>/<name>` →
-//! `arn:aws:sqs:<region>:<account>:<name>`
+//! `arn:<partition>:sqs:<region>:<account>:<name>`
 
 use extism_pdk::*;
 
@@ -26,7 +26,7 @@ pub struct SqsInfo {
 /// Returns the queue URL and ARN. For FIFO queues the name is automatically
 /// suffixed with `.fifo` if not already present.
 pub fn ensure_queue(cfg: &SqsConfig, creds: &AwsCredentials) -> Result<SqsInfo, String> {
-    let name = canonical_queue_name(&cfg.queue_name, cfg.fifo);
+    let name = crate::canonical_queue_name(&cfg.queue_name, cfg.fifo);
 
     if let Some(info) = get_queue_url(&name, creds)? {
         log!(
@@ -58,29 +58,23 @@ pub fn delete_queue(queue_url: &str, creds: &AwsCredentials) -> Result<(), Strin
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-fn canonical_queue_name(name: &str, fifo: bool) -> String {
-    if fifo && !name.ends_with(".fifo") {
-        format!("{name}.fifo")
-    } else {
-        name.to_string()
-    }
-}
-
 fn get_queue_url(name: &str, creds: &AwsCredentials) -> Result<Option<SqsInfo>, String> {
     let body = format!(
         "Action=GetQueueUrl&Version=2012-11-05&QueueName={}",
         url_encode(name)
     );
-    let xml = sqs_query(&body, creds)?;
-
-    if xml.contains("QueueDoesNotExist") || xml.contains("NonExistentQueue") {
-        return Ok(None);
-    }
+    // A missing queue comes back as an HTTP 400 error, which sqs_query
+    // surfaces as Err — map it to Ok(None) so ensure_queue creates the queue.
+    let xml = match sqs_query(&body, creds) {
+        Ok(xml) => xml,
+        Err(e) if crate::is_missing_queue_error(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
 
     match extract_tag(&xml, "QueueUrl") {
         Some(url) => {
-            let arn = arn_from_queue_url(&url, &creds.region)
-                .unwrap_or_else(|| format!("arn:aws:sqs:{}:*:{name}", creds.region));
+            let arn = crate::sqs_queue_arn(&url, &creds.region)
+                .unwrap_or_else(|| crate::sqs_fallback_arn(&creds.region, name));
             Ok(Some(SqsInfo {
                 queue_url: url,
                 queue_arn: arn,
@@ -116,8 +110,8 @@ fn create_queue(name: &str, cfg: &SqsConfig, creds: &AwsCredentials) -> Result<S
     let queue_url = extract_tag(&xml, "QueueUrl")
         .ok_or_else(|| "SQS CreateQueue: could not parse QueueUrl from response".to_string())?;
 
-    let queue_arn = arn_from_queue_url(&queue_url, &creds.region)
-        .unwrap_or_else(|| format!("arn:aws:sqs:{}:*:{name}", creds.region));
+    let queue_arn = crate::sqs_queue_arn(&queue_url, &creds.region)
+        .unwrap_or_else(|| crate::sqs_fallback_arn(&creds.region, name));
 
     log!(
         LogLevel::Info,
@@ -128,17 +122,6 @@ fn create_queue(name: &str, cfg: &SqsConfig, creds: &AwsCredentials) -> Result<S
         queue_url,
         queue_arn,
     })
-}
-
-/// Construct the SQS ARN from a queue URL without an extra API call.
-///
-/// URL format: `https://sqs.<region>.amazonaws.com/<account-id>/<queue-name>`
-/// ARN format: `arn:aws:sqs:<region>:<account-id>:<queue-name>`
-fn arn_from_queue_url(queue_url: &str, region: &str) -> Option<String> {
-    let prefix = format!("https://sqs.{region}.amazonaws.com/");
-    let path = queue_url.strip_prefix(&prefix)?;
-    let (account_id, queue_name) = path.split_once('/')?;
-    Some(format!("arn:aws:sqs:{region}:{account_id}:{queue_name}"))
 }
 
 fn sqs_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
@@ -180,10 +163,11 @@ fn sqs_query(body: &str, creds: &AwsCredentials) -> Result<String, String> {
     let text = String::from_utf8_lossy(&resp.body()).to_string();
 
     if status >= 400 {
+        let code = extract_tag(&text, "Code").unwrap_or_default();
         let msg = extract_tag(&text, "Message")
             .or_else(|| extract_tag(&text, "message"))
             .unwrap_or_else(|| text.clone());
-        return Err(format!("SQS API error {status}: {msg}"));
+        return Err(format!("SQS API error {status} [{code}]: {msg}"));
     }
 
     Ok(text)
@@ -211,42 +195,3 @@ fn url_encode(s: &str) -> String {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn arn_from_standard_url() {
-        let url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue";
-        assert_eq!(
-            arn_from_queue_url(url, "us-east-1"),
-            Some("arn:aws:sqs:us-east-1:123456789012:MyQueue".to_string())
-        );
-    }
-
-    #[test]
-    fn arn_from_govcloud_url() {
-        let url = "https://sqs.us-gov-west-1.amazonaws.com/123456789012/MyQueue";
-        assert_eq!(
-            arn_from_queue_url(url, "us-gov-west-1"),
-            Some("arn:aws:sqs:us-gov-west-1:123456789012:MyQueue".to_string())
-        );
-    }
-
-    #[test]
-    fn arn_from_fifo_url() {
-        let url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue.fifo";
-        assert_eq!(
-            arn_from_queue_url(url, "us-east-1"),
-            Some("arn:aws:sqs:us-east-1:123456789012:MyQueue.fifo".to_string())
-        );
-    }
-
-    #[test]
-    fn canonical_name_adds_fifo_suffix() {
-        assert_eq!(canonical_queue_name("my-queue", true), "my-queue.fifo");
-        assert_eq!(canonical_queue_name("my-queue.fifo", true), "my-queue.fifo");
-        assert_eq!(canonical_queue_name("my-queue", false), "my-queue");
-    }
-}

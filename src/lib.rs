@@ -316,6 +316,63 @@ fn s3_access_policy_document(bucket: &str, region: &str) -> String {
     )
 }
 
+/// SQS queue name with the `.fifo` suffix FIFO queues require.
+#[cfg(any(target_arch = "wasm32", test))]
+fn canonical_queue_name(name: &str, fifo: bool) -> String {
+    if fifo && !name.ends_with(".fifo") {
+        format!("{name}.fifo")
+    } else {
+        name.to_string()
+    }
+}
+
+/// SQS queue ARN derived from a queue URL, without an extra API call.
+///
+/// Accepts any `<scheme>://<host>/<account-id>/<queue-name>` URL — the
+/// regional `sqs.<region>.amazonaws.com` form, the legacy
+/// `<region>.queue.amazonaws.com` form, and emulator URLs under
+/// `AWS_ENDPOINT_URL`. The partition comes from `region`, so GovCloud queues
+/// get `arn:aws-us-gov:sqs:…`.
+#[cfg(any(target_arch = "wasm32", test))]
+fn sqs_queue_arn(queue_url: &str, region: &str) -> Option<String> {
+    let after_scheme = queue_url
+        .split_once("://")
+        .map_or(queue_url, |(_, rest)| rest);
+    let (_host, path) = after_scheme.split_once('/')?;
+    let (account_id, queue_name) = path.trim_end_matches('/').split_once('/')?;
+    if account_id.is_empty() || queue_name.is_empty() || queue_name.contains('/') {
+        return None;
+    }
+    let partition = aws_partition(region);
+    Some(format!(
+        "arn:{partition}:sqs:{region}:{account_id}:{queue_name}"
+    ))
+}
+
+/// Account-wildcard SQS ARN used when the queue URL can't be parsed.
+#[cfg(any(target_arch = "wasm32", test))]
+fn sqs_fallback_arn(region: &str, queue_name: &str) -> String {
+    let partition = aws_partition(region);
+    format!("arn:{partition}:sqs:{region}:*:{queue_name}")
+}
+
+/// True when an SQS API error means the queue doesn't exist.
+///
+/// `GetQueueUrl` for a missing queue returns HTTP 400 with code
+/// `AWS.SimpleQueueService.NonExistentQueue` (older docs: `QueueDoesNotExist`),
+/// which the SQS client surfaces as an error string including the code.
+#[cfg(any(target_arch = "wasm32", test))]
+fn is_missing_queue_error(err: &str) -> bool {
+    err.contains("NonExistentQueue") || err.contains("QueueDoesNotExist")
+}
+
+/// RDS DB instance ARN, as used in AWS Backup selections.
+#[cfg(any(target_arch = "wasm32", test))]
+fn rds_instance_arn(region: &str, account_id: &str, identifier: &str) -> String {
+    let partition = aws_partition(region);
+    format!("arn:{partition}:rds:{region}:{account_id}:db:{identifier}")
+}
+
 /// Deployment annotations `provision()` stamps for an S3 resource so `apply()`
 /// treats S3 as enabled on reconcile and re-attaches the bucket policy to the
 /// same role the application's ServiceAccount is bound to.
@@ -2408,6 +2465,107 @@ mod tests {
                 "{raw:?} should be rejected"
             );
         }
+    }
+
+    // ── SQS / RDS ARNs (partition-aware) ─────────────────────────────────────
+
+    #[test]
+    fn sqs_queue_arn_from_regional_urls() {
+        assert_eq!(
+            sqs_queue_arn(
+                "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
+                "us-east-1"
+            ),
+            Some("arn:aws:sqs:us-east-1:123456789012:MyQueue".into())
+        );
+        assert_eq!(
+            sqs_queue_arn(
+                "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue.fifo",
+                "us-east-1"
+            ),
+            Some("arn:aws:sqs:us-east-1:123456789012:MyQueue.fifo".into())
+        );
+    }
+
+    // Previously hardcoded arn:aws:sqs:, so the workload's SQS policy never
+    // matched a GovCloud queue.
+    #[test]
+    fn sqs_queue_arn_uses_govcloud_partition() {
+        assert_eq!(
+            sqs_queue_arn(
+                "https://sqs.us-gov-west-1.amazonaws.com/123456789012/MyQueue",
+                "us-gov-west-1"
+            ),
+            Some("arn:aws-us-gov:sqs:us-gov-west-1:123456789012:MyQueue".into())
+        );
+        assert_eq!(
+            sqs_fallback_arn("us-gov-west-1", "MyQueue"),
+            "arn:aws-us-gov:sqs:us-gov-west-1:*:MyQueue"
+        );
+    }
+
+    // Legacy and emulator URLs used to fall through to the wildcard ARN.
+    #[test]
+    fn sqs_queue_arn_accepts_legacy_and_emulator_urls() {
+        assert_eq!(
+            sqs_queue_arn(
+                "https://us-east-1.queue.amazonaws.com/123456789012/q",
+                "us-east-1"
+            ),
+            Some("arn:aws:sqs:us-east-1:123456789012:q".into())
+        );
+        assert_eq!(
+            sqs_queue_arn("http://localhost:5000/123456789012/q", "us-east-1"),
+            Some("arn:aws:sqs:us-east-1:123456789012:q".into())
+        );
+    }
+
+    #[test]
+    fn sqs_queue_arn_rejects_malformed_urls() {
+        for url in [
+            "https://sqs.us-east-1.amazonaws.com/",
+            "https://sqs.us-east-1.amazonaws.com/123456789012",
+            "https://sqs.us-east-1.amazonaws.com/123456789012/a/b",
+            "not a url",
+        ] {
+            assert_eq!(sqs_queue_arn(url, "us-east-1"), None, "{url:?}");
+        }
+    }
+
+    // GetQueueUrl on a missing queue is an HTTP 400. It used to propagate as a
+    // hard error, so ensure_queue could never create a new queue.
+    #[test]
+    fn missing_queue_errors_are_recognised() {
+        assert!(is_missing_queue_error(
+            "SQS API error 400 [AWS.SimpleQueueService.NonExistentQueue]: The specified queue does not exist."
+        ));
+        assert!(is_missing_queue_error(
+            "SQS API error 400 [QueueDoesNotExist]: gone"
+        ));
+        assert!(!is_missing_queue_error(
+            "SQS API error 403 [AccessDenied]: not allowed"
+        ));
+    }
+
+    #[test]
+    fn canonical_queue_name_adds_fifo_suffix_once() {
+        assert_eq!(canonical_queue_name("my-queue", true), "my-queue.fifo");
+        assert_eq!(canonical_queue_name("my-queue.fifo", true), "my-queue.fifo");
+        assert_eq!(canonical_queue_name("my-queue", false), "my-queue");
+    }
+
+    // Previously hardcoded arn:aws:rds:, so GovCloud backup selections
+    // targeted a resource that doesn't exist.
+    #[test]
+    fn rds_instance_arn_is_partition_aware() {
+        assert_eq!(
+            rds_instance_arn("us-gov-west-1", "123456789012", "ampere-db"),
+            "arn:aws-us-gov:rds:us-gov-west-1:123456789012:db:ampere-db"
+        );
+        assert_eq!(
+            rds_instance_arn("us-east-1", "123456789012", "app-db"),
+            "arn:aws:rds:us-east-1:123456789012:db:app-db"
+        );
     }
 
     // ── S3 IAM policy wiring ──────────────────────────────────────────────────
