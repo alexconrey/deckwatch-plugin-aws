@@ -155,13 +155,7 @@ pub fn attach_rds_policy(
     region: &str,
     creds: &AwsCredentials,
 ) -> Result<(), String> {
-    let partition = if region.starts_with("us-gov-") {
-        "aws-us-gov"
-    } else if region.starts_with("cn-") {
-        "aws-cn"
-    } else {
-        "aws"
-    };
+    let partition = crate::aws_partition(region);
     let account = config::get("AWS_ROLE_ARN")
         .ok()
         .flatten()
@@ -180,14 +174,16 @@ pub fn attach_rds_policy(
 }
 
 /// Attach an inline policy granting standard S3 object operations on the bucket.
+///
+/// `region` is the bucket's region; it selects the ARN partition so GovCloud
+/// buckets get `arn:aws-us-gov:s3:::` resources rather than `arn:aws:s3:::`.
 pub fn attach_s3_policy(
     role_name: &str,
     bucket_name: &str,
+    region: &str,
     creds: &AwsCredentials,
 ) -> Result<(), String> {
-    let policy = format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::{bucket_name}/*"}},{{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::{bucket_name}"}}]}}"#
-    );
+    let policy = crate::s3_access_policy_document(bucket_name, region);
     let body = format!(
         "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-s3-access&PolicyDocument={}",
         url_encode(role_name),
