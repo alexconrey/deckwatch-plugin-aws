@@ -475,6 +475,58 @@ async fn bucket_prefix_applied_once_end_to_end() {
     );
 }
 
+/// A deployment opting into SQS by annotation gets a queue and a
+/// deckwatch-sqs-access policy on its workload role. In GovCloud the policy
+/// must use the arn:aws-us-gov partition (it used to be hardcoded to arn:aws,
+/// so it never matched), and must name the real account parsed from moto's
+/// queue URL rather than the account-wildcard fallback.
+#[tokio::test]
+async fn govcloud_sqs_annotation_grants_queue_access() {
+    let region = "us-gov-west-1";
+    let (ns, app, queue) = ("orders-it", unique("orders"), unique("orders-events"));
+    let role_name = format!("{ns}-{app}-role");
+    let iam = iam_client(region).await;
+
+    let mut plugin = load_plugin(region, &[]);
+    let ctx = PluginContext {
+        namespace: ns.into(),
+        deployment_name: "worker".into(),
+        annotations: HashMap::from([
+            ("sqs.deckwatch.io/enabled".into(), "true".into()),
+            ("sqs.deckwatch.io/queue-name".into(), queue.into()),
+            ("aws.deckwatch.io/app-name".into(), app.into()),
+        ]),
+        labels: HashMap::new(),
+        plugin_outputs: HashMap::new(),
+        provisioned_resources: HashMap::new(),
+    };
+    let applied = call_apply(&mut plugin, &ctx);
+
+    let queue_url = applied
+        .outputs
+        .get("queue_url")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        queue_url.ends_with(&format!("/{queue}")),
+        "apply must output the queue URL, got {queue_url:?}"
+    );
+    let account = queue_url
+        .rsplit('/')
+        .nth(1)
+        .expect("account segment in queue URL");
+
+    let sqs_policy = inline_policy(&iam, &role_name, "deckwatch-sqs-access").await;
+    assert_eq!(
+        sqs_policy["Statement"][0]["Resource"],
+        format!("arn:aws-us-gov:sqs:{region}:{account}:{queue}")
+    );
+    assert_eq!(
+        applied.wants_service_account.map(|w| w.name),
+        Some(format!("{app}-aws-sa"))
+    );
+}
+
 /// A malformed AWS_ENDPOINT_URL must fail provisioning outright rather than
 /// fall back to real AWS endpoints.
 #[test]
