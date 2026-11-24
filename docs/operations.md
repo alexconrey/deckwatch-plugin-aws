@@ -1,0 +1,138 @@
+# Operations
+
+- [Upgrading the plugin](#upgrading-the-plugin)
+- [Verifying the loaded binary](#verifying-the-loaded-binary)
+- [Refreshing a resource](#refreshing-a-resource)
+- [Removing a resource](#removing-a-resource)
+- [Troubleshooting](#troubleshooting)
+- [Known limitations](#known-limitations)
+
+## Upgrading the plugin
+
+1. **Release builds:** bump the release `ref` in the plugin's GitHub source. deckwatch
+   fetches the new `plugin.wasm` and reloads it.
+2. **Unreleased builds** (for example, testing a fix): upload the binary. The
+   endpoint takes the raw bytes, not form data:
+
+   ```bash
+   make build
+   shasum -a 256 dist/plugin.wasm
+   curl -X POST -H 'Content-Type: application/wasm' \
+     --data-binary @dist/plugin.wasm \
+     https://<deckwatch-host>/api/plugins/AWS/upload        # → 204 No Content
+   ```
+
+   - Uploading switches the plugin's source to `upload: AWS.wasm`. Switch it back to
+     the GitHub release once the fix is released.
+   - On deckwatch versions without
+     [alexconrey/deckwatch#209](https://github.com/alexconrey/deckwatch/pull/209),
+     an upload unloads every *other* plugin until deckwatch next reloads all plugins
+     (a restart or a settings save).
+
+Upgrading the plugin changes nothing in AWS by itself. New behaviour applies the next
+time a resource is provisioned or refreshed, or a deployment is reconciled.
+
+## Verifying the loaded binary
+
+The plugin reports its version as `metadata().version`, taken from `Cargo.toml`.
+**An unreleased build can report the same version as a release**, so compare
+checksums instead. deckwatch builds that include
+[alexconrey/deckwatch#206](https://github.com/alexconrey/deckwatch/pull/206) report
+the SHA-256 of the bytes they actually loaded:
+
+```bash
+curl -s https://<deckwatch-host>/api/plugins | jq '.[] | select(.name=="AWS") | {version, sha256, loaded_at}'
+```
+
+The MCP `list_plugins` and `get_plugin_config` tools return the same fields. The
+`sha256` must match `shasum -a 256` of the file you uploaded or released.
+
+## Refreshing a resource
+
+deckwatch's `refresh_resource` (MCP) or the UI equivalent re-runs `provision()` with
+the original form fields. Use it to pick up plugin fixes, for example to stamp new
+annotations or re-attach a policy, or to unstick a resource left in
+`DB_STATUS=provisioning`.
+
+**Refreshing can restart the application's pods.** If the result changes the
+deployment annotations or injected env vars, deckwatch patches every deployment in
+the application. The pod templates change, so Kubernetes rolls the pods. With one
+replica and the default rollout settings, expect a short outage while the new pods
+start. Refresh outside busy periods.
+
+## Removing a resource
+
+| Resource | On removal |
+|---|---|
+| RDS | Turns off deletion protection, then deletes the instance. Takes a final snapshot named `<identifier>-final` unless `RDS_SKIP_FINAL_SNAPSHOT=true`. |
+| S3 | **Leaves the bucket and its objects in place.** Empty and delete it yourself, or let a lifecycle rule expire the objects. |
+| SQS | Deletes the queue. Its name can't be reused for 60 seconds. |
+| Secrets Manager | Schedules deletion with a 30-day recovery window. |
+
+IAM roles, inline policies and ServiceAccounts are **not** removed. Delete them by
+hand when you retire an application.
+
+## Troubleshooting
+
+### `AccessDenied` from the application
+
+1. **Find the pod's identity:** check its `serviceAccountName`. It should be
+   `<app>-aws-sa`, and the pod should have an `aws-iam-token` volume. If it runs as
+   `default`, it has no AWS identity at all; see the next section.
+2. **Check the role's policies:**
+   `aws iam list-role-policies --role-name <role>`. Each resource should have its
+   policy from [the table](identity.md#inline-policies).
+3. **Check the ARNs:** `aws iam get-role-policy …`. In GovCloud every ARN must start
+   with `arn:aws-us-gov:`.
+4. **Confirm what's allowed:**
+   `aws iam simulate-principal-policy --policy-source-arn <role-arn> --action-names s3:GetObject --resource-arns arn:<partition>:s3:::<bucket>/x`
+   shows whether the role itself allows the action. If it does, look at the resource
+   side next: bucket policies, KMS key policies, VPC endpoint policies.
+
+### The pod runs as `default` instead of `<app>-aws-sa`
+
+- **No AWS opt-in:** the deployment needs annotations that enable the plugin. Look
+  for `aws.deckwatch.io/*`, `rds.deckwatch.io/enabled` or `s3.deckwatch.io/enabled`
+  on the deployment.
+- **Role creation failed:** the plugin skips the ServiceAccount when `ensure_role`
+  fails. Check the plugin's logs in deckwatch.
+- **Applied to some deployments but not others:** if some deployments in an
+  application get the ServiceAccount and others don't, despite identical
+  annotations, the cause is on the deckwatch side, in how `wants_service_account`
+  is applied.
+
+### Pods can't assume the role
+
+The role's trust policy must name
+`system:serviceaccount:<namespace>:<app>-aws-sa` and the cluster's OIDC provider. An
+empty trust policy means `OIDC_PROVIDER_ARN` wasn't set when the role was created.
+Set it, and the next reconcile updates the trust policy.
+
+### RDS is stuck at `DB_STATUS=provisioning`
+
+Instance creation takes several minutes. If it stays stuck, check the instance in
+the RDS console and refresh the resource. The IAM role, ServiceAccount and bootstrap
+Job are only created once the instance reports an endpoint.
+
+### IAM database login fails
+
+- Check the bootstrap Job `<app>-db-bootstrap` in the application's namespace.
+- `DB_BOOTSTRAP_PSQL_IMAGE` must be the same as, or newer than, the engine's major
+  version.
+
+### Plugin calls fail with a host error
+
+The endpoint is missing from the plugin's `allowed_hosts`. See
+[Allowed hosts](configuration.md#allowed-hosts).
+
+## Known limitations
+
+- **Provisioned SQS and Secrets Manager resources don't grant IAM access.**
+  Provisioning creates the queue or secret and injects `QUEUE_URL` /
+  `SM_SECRET_ARN`, but attaches no policy. Use the `sqs.deckwatch.io/*` or
+  `secretsmanager.deckwatch.io/*` annotations to grant access.
+- **The workload role keeps the `-rds` suffix** even when it carries S3 policies.
+  Renaming it would orphan existing roles.
+- **Removing a resource doesn't remove IAM roles, policies or ServiceAccounts.**
+- **The IAM database user bootstrap is PostgreSQL-only.**
+- **China regions** need `IAM_ENDPOINT` set by hand.
