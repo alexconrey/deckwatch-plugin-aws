@@ -143,6 +143,7 @@ fn deprovision_request(
         resource_id: provision_req.resource_id.clone(),
         state: provisioned.state.clone(),
         fields: provision_req.fields.clone(),
+        ..Default::default()
     }
 }
 
@@ -160,6 +161,7 @@ fn resource_request(
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -181,6 +183,7 @@ fn s3_request(app: &str, namespace: &str, bucket: &str, region: &str) -> Resourc
             ("bucket_name".into(), bucket.into()),
             ("region".into(), region.into()),
         ]),
+        ..Default::default()
     }
 }
 
@@ -457,6 +460,7 @@ async fn apply_reconcile_reasserts_s3_policy_and_service_account() {
         labels: HashMap::from([("app".into(), "backend".into())]),
         plugin_outputs: HashMap::new(),
         provisioned_resources: HashMap::new(),
+        ..Default::default()
     };
     let applied = call_apply(&mut plugin, &ctx);
 
@@ -554,6 +558,7 @@ async fn bucket_prefix_applied_once_end_to_end() {
         labels: HashMap::new(),
         plugin_outputs: HashMap::new(),
         provisioned_resources: HashMap::new(),
+        ..Default::default()
     };
     let applied = call_apply(&mut plugin, &ctx);
     let s3_env = applied.env_vars.iter().find(|e| e.name == "S3_BUCKET");
@@ -590,6 +595,7 @@ async fn govcloud_sqs_annotation_grants_queue_access() {
         labels: HashMap::new(),
         plugin_outputs: HashMap::new(),
         provisioned_resources: HashMap::new(),
+        ..Default::default()
     };
     let applied = call_apply(&mut plugin, &ctx);
 
@@ -1027,6 +1033,7 @@ async fn resource_name_prefix_scopes_queue_and_secret_names() {
             labels: HashMap::new(),
             plugin_outputs: HashMap::new(),
             provisioned_resources: HashMap::new(),
+            ..Default::default()
         },
     );
     assert_eq!(
@@ -1236,6 +1243,7 @@ async fn rds_snapshot_schedule_creates_a_tagged_backup_plan() {
         labels: HashMap::new(),
         plugin_outputs: HashMap::new(),
         provisioned_resources: HashMap::new(),
+        ..Default::default()
     };
     // First reconcile creates the instance; the next one configures backups.
     call_apply(&mut plugin, &ctx);
