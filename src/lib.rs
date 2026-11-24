@@ -232,6 +232,250 @@ fn prefixed_name(prefix: &str, name: &str) -> String {
     }
 }
 
+// ── Resource tags ─────────────────────────────────────────────────────────────
+//
+// Every AWS resource the plugin manages gets the operator's RESOURCE_TAGS plus
+// three managed tags identifying the plugin, application and namespace. The
+// managed keys are reserved so a configured tag can't spoof ownership.
+
+/// Key/value tag pairs, in application order.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) type Tags = Vec<(String, String)>;
+
+#[cfg(any(target_arch = "wasm32", test))]
+const TAG_MANAGED_BY: &str = "deckwatch.io/managed-by";
+#[cfg(any(target_arch = "wasm32", test))]
+const TAG_APPLICATION: &str = "deckwatch.io/application";
+#[cfg(any(target_arch = "wasm32", test))]
+const TAG_NAMESPACE: &str = "deckwatch.io/namespace";
+#[cfg(any(target_arch = "wasm32", test))]
+const MANAGED_BY_VALUE: &str = "deckwatch-plugin-aws";
+/// AWS allows 50 tags per resource; three are reserved for the managed tags.
+#[cfg(any(target_arch = "wasm32", test))]
+const MAX_OPERATOR_TAGS: usize = 47;
+
+/// Parse `RESOURCE_TAGS`: `Key=Value` pairs separated by commas or newlines,
+/// e.g. `Team=platform,CostCenter=1234`. A later duplicate key wins.
+///
+/// Rejects anything AWS would refuse, rather than failing every API call
+/// later: empty or over-long keys (128) and values (256), characters outside
+/// AWS's tag character set, the reserved `aws:` prefix, keys under the
+/// plugin's own `deckwatch.io/` namespace, and more than 47 tags.
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_resource_tags(raw: &str) -> Result<Tags, String> {
+    fn valid_chars(s: &str) -> bool {
+        s.chars()
+            .all(|c| c.is_alphanumeric() || " _.:/=+-@".contains(c))
+    }
+    let mut tags: Tags = Vec::new();
+    for entry in raw
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        let (key, value) = entry
+            .split_once('=')
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .ok_or_else(|| format!("RESOURCE_TAGS entry {entry:?} is not Key=Value"))?;
+        if key.is_empty() || key.chars().count() > 128 {
+            return Err(format!(
+                "RESOURCE_TAGS key {key:?} must be 1-128 characters"
+            ));
+        }
+        if value.chars().count() > 256 {
+            return Err(format!(
+                "RESOURCE_TAGS value for {key:?} is over 256 characters"
+            ));
+        }
+        if !valid_chars(key) || !valid_chars(value) {
+            return Err(format!(
+                "RESOURCE_TAGS entry {entry:?} uses characters AWS doesn't allow in tags"
+            ));
+        }
+        if key.to_ascii_lowercase().starts_with("aws:") {
+            return Err(format!(
+                "RESOURCE_TAGS key {key:?} uses the reserved aws: prefix"
+            ));
+        }
+        if key.starts_with("deckwatch.io/") {
+            return Err(format!(
+                "RESOURCE_TAGS key {key:?} is reserved for the plugin's own tags"
+            ));
+        }
+        tags.retain(|(k, _)| k != key);
+        tags.push((key.to_string(), value.to_string()));
+    }
+    if tags.len() > MAX_OPERATOR_TAGS {
+        return Err(format!(
+            "RESOURCE_TAGS has {} tags; at most {MAX_OPERATOR_TAGS} are allowed",
+            tags.len()
+        ));
+    }
+    Ok(tags)
+}
+
+/// Tags for one application's resources: the operator's tags plus the managed
+/// ownership tags.
+#[cfg(any(target_arch = "wasm32", test))]
+fn resource_tags(operator_tags: &[(String, String)], app: &str, namespace: &str) -> Tags {
+    let mut tags: Tags = operator_tags.to_vec();
+    tags.push((TAG_MANAGED_BY.into(), MANAGED_BY_VALUE.into()));
+    tags.push((TAG_APPLICATION.into(), app.into()));
+    tags.push((TAG_NAMESPACE.into(), namespace.into()));
+    tags
+}
+
+/// Form-encode a query parameter value (RFC 3986 unreserved characters kept).
+#[cfg(any(target_arch = "wasm32", test))]
+fn form_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Query API tag parameters, e.g. `member_prefix = "Tags.member"` produces
+/// `&Tags.member.1.Key=…&Tags.member.1.Value=…` (IAM). RDS uses `Tags.Tag`
+/// and SQS uses `Tag`.
+#[cfg(any(target_arch = "wasm32", test))]
+fn query_tag_params(tags: &[(String, String)], member_prefix: &str) -> String {
+    tags.iter()
+        .enumerate()
+        .map(|(i, (k, v))| {
+            let n = i + 1;
+            format!(
+                "&{member_prefix}.{n}.Key={}&{member_prefix}.{n}.Value={}",
+                form_encode(k),
+                form_encode(v)
+            )
+        })
+        .collect()
+}
+
+/// Secrets Manager `Tags` array: `[{"Key":…,"Value":…}]`.
+#[cfg(any(target_arch = "wasm32", test))]
+fn json_tag_list(tags: &[(String, String)]) -> serde_json::Value {
+    tags.iter()
+        .map(|(k, v)| json!({ "Key": k, "Value": v }))
+        .collect()
+}
+
+/// `existing` tags with `ours` applied on top: same keys take our value, other
+/// keys are kept. S3's PutBucketTagging replaces the whole tag set, so this
+/// prevents the plugin from wiping tags set by anyone else.
+#[cfg(any(target_arch = "wasm32", test))]
+fn merge_tags(existing: &[(String, String)], ours: &[(String, String)]) -> Tags {
+    let mut merged: Tags = existing
+        .iter()
+        .filter(|(k, _)| !ours.iter().any(|(ok, _)| ok == k))
+        .cloned()
+        .collect();
+    merged.extend(ours.iter().cloned());
+    merged
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// S3 `Tagging` request body for PutBucketTagging.
+#[cfg(any(target_arch = "wasm32", test))]
+fn s3_tagging_xml(tags: &[(String, String)]) -> String {
+    let set: String = tags
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                xml_escape(k),
+                xml_escape(v)
+            )
+        })
+        .collect();
+    format!(
+        r#"<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet>{set}</TagSet></Tagging>"#
+    )
+}
+
+/// Tag set from an S3 GetBucketTagging response.
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_s3_tag_set(xml: &str) -> Tags {
+    xml_tag_values(xml, "Tag")
+        .iter()
+        .filter_map(|tag| {
+            let key = xml_tag_values(tag, "Key").into_iter().next()?;
+            let value = xml_tag_values(tag, "Value")
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            Some((xml_unescape(&key), xml_unescape(&value)))
+        })
+        .collect()
+}
+
+/// Standard base64 with padding.
+#[cfg(any(target_arch = "wasm32", test))]
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// `Content-MD5` header value: base64 of the body's MD5 digest. S3 requires a
+/// message integrity header on bucket-configuration PUTs such as tagging and
+/// lifecycle; Content-MD5 isn't an x-amz-* header, so it needn't be signed.
+#[cfg(any(target_arch = "wasm32", test))]
+fn content_md5(body: &str) -> String {
+    use md5::{Digest, Md5};
+    base64_encode(&Md5::digest(body.as_bytes()))
+}
+
+/// `RESOURCE_TAGS` from plugin config, with the managed tags added. On a
+/// parse error, only the managed tags are used and the error is returned for
+/// the caller to surface.
+#[cfg(target_arch = "wasm32")]
+fn configured_resource_tags(app: &str, namespace: &str) -> (Tags, Option<String>) {
+    let raw = config::get("RESOURCE_TAGS")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    match parse_resource_tags(&raw) {
+        Ok(operator) => (resource_tags(&operator, app, namespace), None),
+        Err(e) => (resource_tags(&[], app, namespace), Some(e)),
+    }
+}
+
 /// `RESOURCE_NAME_PREFIX` from plugin config (empty when unset).
 #[cfg(target_arch = "wasm32")]
 fn configured_resource_name_prefix() -> String {
@@ -936,7 +1180,8 @@ fn db_user_bootstrap(
     let sql = bootstrap_sql(db_user, db_name)?;
 
     let role_name = bootstrap_role_name(namespace, app);
-    let role_arn = iam::ensure_role(&role_name, namespace, &bootstrap_name(app), creds)
+    let (tags, _) = configured_resource_tags(app, namespace);
+    let role_arn = iam::ensure_role(&role_name, namespace, &bootstrap_name(app), &tags, creds)
         .map_err(|e| format!("bootstrap IAM role {role_name}: {e}"))?;
     iam::attach_secretsmanager_policy(
         &role_name,
@@ -1410,10 +1655,18 @@ fn apply_with_aws(
         return PluginResult::default();
     }
 
+    let (tags, tag_error) = configured_resource_tags(&cfg.app_name, &ctx.namespace);
+    if let Some(e) = tag_error {
+        log!(
+            LogLevel::Warn,
+            "deckwatch-plugin-aws: {e}; applying only the managed tags"
+        );
+    }
+
     let sa = workload_sa_name(&cfg.app_name);
 
     // ── 1. Ensure IAM role (OIDC-scoped trust policy) ─────────────────────────
-    let role_arn = match iam::ensure_role(&cfg.role_name, &ctx.namespace, &sa, creds) {
+    let role_arn = match iam::ensure_role(&cfg.role_name, &ctx.namespace, &sa, &tags, creds) {
         Ok(arn) => arn,
         Err(e) => {
             log!(
@@ -1427,7 +1680,7 @@ fn apply_with_aws(
 
     // ── 2. RDS ────────────────────────────────────────────────────────────────
     let rds_endpoint = if let Some(ref rds_cfg) = cfg.rds {
-        match rds::ensure_instance(rds_cfg, creds) {
+        match rds::ensure_instance(rds_cfg, &tags, creds) {
             Ok(instance) => {
                 for warning in &instance.warnings {
                     log!(LogLevel::Warn, "deckwatch-plugin-aws: {warning}");
@@ -1456,6 +1709,7 @@ fn apply_with_aws(
                         schedule,
                         rds_cfg.snapshot_retention,
                         &rds_cfg.backup_role_arn,
+                        &tags,
                         creds,
                     ) {
                         log!(
@@ -1481,7 +1735,7 @@ fn apply_with_aws(
     // ── 3. S3 ─────────────────────────────────────────────────────────────────
     let s3_bucket = if let Some(ref s3_cfg) = cfg.s3 {
         let full_bucket = format!("{}{}", bucket_prefix, s3_cfg.bucket_name);
-        match s3::ensure_bucket(s3_cfg, &full_bucket, creds) {
+        match s3::ensure_bucket(s3_cfg, &full_bucket, &tags, creds) {
             Ok(()) => {
                 if let Err(e) =
                     iam::attach_s3_policy(&cfg.role_name, &full_bucket, &s3_cfg.region, creds)
@@ -1503,7 +1757,7 @@ fn apply_with_aws(
 
     // ── 4. SQS ────────────────────────────────────────────────────────────────
     let queue_url = if let Some(ref sqs_cfg) = cfg.sqs {
-        match sqs::ensure_queue(sqs_cfg, creds) {
+        match sqs::ensure_queue(sqs_cfg, &tags, creds) {
             Ok(info) => {
                 if let Err(e) = iam::attach_sqs_policy(&cfg.role_name, &info.queue_arn, creds) {
                     log!(
@@ -1541,7 +1795,7 @@ fn apply_with_aws(
                 "Managed by deckwatch for {}/{}",
                 ctx.namespace, ctx.deployment_name
             );
-            match secretsmanager::ensure_secret(&sm_cfg.secret_name, &desc, creds) {
+            match secretsmanager::ensure_secret(&sm_cfg.secret_name, &desc, &tags, creds) {
                 Ok(arn) => {
                     all_arns.push(arn.clone());
                     arn
@@ -1658,6 +1912,7 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "ROLE_PATH".into(), label: "IAM Role Path".into(), description: "Path prefix for created roles. Must start and end with /.".into(), field_type: ConfigFieldType::String, default: Some("/deckwatch-plugin/".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "BUCKET_PREFIX".into(), label: "S3 Bucket Prefix".into(), description: "Prepended to all S3 bucket names (e.g. myorg-).".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "RESOURCE_NAME_PREFIX".into(), label: "Resource Name Prefix".into(), description: "Prepended to every SQS queue and Secrets Manager secret name (e.g. k2-dw-), so the plugin's IAM policy can be scoped to <prefix>* instead of all queues and secrets in the account.".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "RESOURCE_TAGS".into(), label: "Resource Tags".into(), description: "Tags applied to every AWS resource the plugin manages (IAM roles, RDS, S3, SQS, secrets, backup plans): Key=Value pairs separated by commas, e.g. Team=platform,CostCenter=1234. The plugin also adds deckwatch.io/managed-by, deckwatch.io/application and deckwatch.io/namespace.".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "AWS_ACCESS_KEY_ID".into(), label: "Access Key ID".into(), description: "Static AWS access key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_ACCESS_KEY_ID".into()) },
             ConfigField { key: "AWS_SECRET_ACCESS_KEY".into(), label: "Secret Access Key".into(), description: "Static AWS secret key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SECRET_ACCESS_KEY".into()) },
             ConfigField { key: "AWS_SESSION_TOKEN".into(), label: "Session Token".into(), description: "Temporary session token for assumed-role or SSO credentials. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SESSION_TOKEN".into()) },
@@ -1911,11 +2166,12 @@ fn bind_workload_identity(
     result: &mut ResourceProvisionResult,
     state_prefix: &str,
     what: &str,
+    tags: &[(String, String)],
     attach: impl FnOnce(&str) -> Result<(), String>,
 ) -> String {
     let role_name = rds_role_name(&req.namespace, &req.application_name);
     let sa_name = workload_sa_name(&req.application_name);
-    match iam::ensure_role(&role_name, &req.namespace, &sa_name, creds) {
+    match iam::ensure_role(&role_name, &req.namespace, &sa_name, tags, creds) {
         Ok(role_arn) => {
             if let Err(e) = attach(&role_name) {
                 log!(
@@ -1971,6 +2227,13 @@ pub fn provision(
             return Ok(Json(result));
         }
     };
+
+    let (tags, tag_error) = configured_resource_tags(&req.application_name, &req.namespace);
+    if let Some(e) = tag_error {
+        result
+            .warnings
+            .push(format!("{e}; applying only the managed tags"));
+    }
 
     match req.resource_id.as_str() {
         "rds" => {
@@ -2039,7 +2302,7 @@ pub fn provision(
             let db_user = rds_db_user(iam_auth, &req.application_name);
             let role_name = rds_role_name(&req.namespace, &req.application_name);
 
-            match rds::ensure_instance(&cfg, &creds) {
+            match rds::ensure_instance(&cfg, &tags, &creds) {
                 Ok(instance) => {
                     result.warnings.extend(instance.warnings.iter().cloned());
                     let port = engine_port(&engine).to_string();
@@ -2055,7 +2318,13 @@ pub fn provision(
                         // storing any credentials.
                         if iam_auth && !resource_id.is_empty() {
                             let sa_name = workload_sa_name(&req.application_name);
-                            match iam::ensure_role(&role_name, &req.namespace, &sa_name, &creds) {
+                            match iam::ensure_role(
+                                &role_name,
+                                &req.namespace,
+                                &sa_name,
+                                &tags,
+                                &creds,
+                            ) {
                                 Ok(role_arn) => {
                                     if let Err(e) = iam::attach_rds_policy(
                                         &role_name,
@@ -2180,7 +2449,7 @@ pub fn provision(
                 lifecycle_days: None,
             };
 
-            match s3::ensure_bucket(&cfg, &full_bucket, &creds) {
+            match s3::ensure_bucket(&cfg, &full_bucket, &tags, &creds) {
                 Ok(()) => {
                     // Grant the application's workload role access to the bucket.
                     // Same role and ServiceAccount as every other resource of the
@@ -2191,6 +2460,7 @@ pub fn provision(
                         &mut result,
                         "S3",
                         &format!("S3 bucket {full_bucket}"),
+                        &tags,
                         |role| iam::attach_s3_policy(role, &full_bucket, &region, &creds),
                     );
 
@@ -2250,7 +2520,7 @@ pub fn provision(
                 retention_days,
             };
 
-            match sqs::ensure_queue(&cfg, &creds) {
+            match sqs::ensure_queue(&cfg, &tags, &creds) {
                 Ok(info) => {
                     let name = info
                         .queue_arn
@@ -2264,6 +2534,7 @@ pub fn provision(
                         &mut result,
                         "SQS",
                         &format!("SQS queue {name}"),
+                        &tags,
                         |role| iam::attach_sqs_policy(role, &info.queue_arn, &creds),
                     );
                     result.state.insert("QUEUE_URL".into(), info.queue_url);
@@ -2296,7 +2567,7 @@ pub fn provision(
                 "Managed by deckwatch for {}/{}",
                 req.namespace, req.application_name
             );
-            match secretsmanager::ensure_secret(&secret_name, &desc, &creds) {
+            match secretsmanager::ensure_secret(&secret_name, &desc, &tags, &creds) {
                 Ok(arn) => {
                     let role_name = bind_workload_identity(
                         &req,
@@ -2304,6 +2575,7 @@ pub fn provision(
                         &mut result,
                         "SM",
                         &format!("secret {secret_name}"),
+                        &tags,
                         |role| {
                             iam::attach_secretsmanager_policy(
                                 role,
@@ -3110,6 +3382,130 @@ mod tests {
         assert_eq!(
             backup_plan_id(r#"{"BackupPlansList":[]}"#, "mydb-backup"),
             None
+        );
+    }
+
+    // ── RESOURCE_TAGS ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_resource_tags_accepts_key_value_lists() {
+        assert_eq!(
+            parse_resource_tags("").unwrap(),
+            Vec::<(String, String)>::new()
+        );
+        assert_eq!(
+            parse_resource_tags("Team=platform, CostCenter=1234\nEnv=prod").unwrap(),
+            vec![
+                ("Team".to_string(), "platform".to_string()),
+                ("CostCenter".to_string(), "1234".to_string()),
+                ("Env".to_string(), "prod".to_string()),
+            ]
+        );
+        // '=' is allowed in values; empty values are allowed; last duplicate wins.
+        assert_eq!(
+            parse_resource_tags("Expr=a=b,Empty=,Team=x,Team=y").unwrap(),
+            vec![
+                ("Expr".to_string(), "a=b".to_string()),
+                ("Empty".to_string(), String::new()),
+                ("Team".to_string(), "y".to_string()),
+            ]
+        );
+    }
+
+    // Fail at parse time, not on every AWS call later.
+    #[test]
+    fn parse_resource_tags_rejects_what_aws_would() {
+        for bad in [
+            "NoEquals",
+            "=value",
+            "aws:createdBy=me",
+            "AWS:x=y",
+            "deckwatch.io/application=spoofed",
+            "Bad#Key=v",
+            "K=bad;value",
+        ] {
+            assert!(
+                parse_resource_tags(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        assert!(parse_resource_tags(&format!("{}=v", "k".repeat(129))).is_err());
+        assert!(parse_resource_tags(&format!("k={}", "v".repeat(257))).is_err());
+        let too_many: Vec<String> = (0..48).map(|i| format!("k{i}=v")).collect();
+        assert!(parse_resource_tags(&too_many.join(",")).is_err());
+    }
+
+    #[test]
+    fn resource_tags_add_managed_ownership_tags() {
+        let tags = resource_tags(&[("Team".into(), "platform".into())], "ampere", "ampere-ns");
+        assert_eq!(
+            tags,
+            vec![
+                ("Team".to_string(), "platform".to_string()),
+                (
+                    "deckwatch.io/managed-by".to_string(),
+                    "deckwatch-plugin-aws".to_string()
+                ),
+                ("deckwatch.io/application".to_string(), "ampere".to_string()),
+                (
+                    "deckwatch.io/namespace".to_string(),
+                    "ampere-ns".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn content_md5_matches_known_vectors() {
+        // RFC 1321 vectors, base64-encoded as S3 expects.
+        assert_eq!(content_md5(""), "1B2M2Y8AsgTpgAmY7PhCfg==");
+        assert_eq!(content_md5("abc"), "kAFQmDzST7DWlj99KOF/cg==");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn tag_encodings_match_each_aws_api() {
+        let tags = vec![("Team".to_string(), "plat form".to_string())];
+        assert_eq!(
+            query_tag_params(&tags, "Tags.member"),
+            "&Tags.member.1.Key=Team&Tags.member.1.Value=plat%20form"
+        );
+        assert_eq!(
+            query_tag_params(&tags, "Tag"),
+            "&Tag.1.Key=Team&Tag.1.Value=plat%20form"
+        );
+        assert_eq!(
+            json_tag_list(&tags),
+            json!([{ "Key": "Team", "Value": "plat form" }])
+        );
+        assert_eq!(
+            s3_tagging_xml(&[("a&b".into(), "<v>".into())]),
+            r#"<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet><Tag><Key>a&amp;b</Key><Value>&lt;v&gt;</Value></Tag></TagSet></Tagging>"#
+        );
+    }
+
+    // S3 replaces the whole tag set, so existing tags must survive a merge.
+    #[test]
+    fn s3_tag_merge_keeps_foreign_tags() {
+        let xml = "<Tagging><TagSet><Tag><Key>Owner</Key><Value>finance</Value></Tag>\
+                   <Tag><Key>Team</Key><Value>old</Value></Tag></TagSet></Tagging>";
+        let existing = parse_s3_tag_set(xml);
+        assert_eq!(
+            existing,
+            vec![
+                ("Owner".to_string(), "finance".to_string()),
+                ("Team".to_string(), "old".to_string()),
+            ]
+        );
+        let merged = merge_tags(&existing, &[("Team".to_string(), "platform".to_string())]);
+        assert_eq!(
+            merged,
+            vec![
+                ("Owner".to_string(), "finance".to_string()),
+                ("Team".to_string(), "platform".to_string()),
+            ]
         );
     }
 

@@ -15,6 +15,7 @@ use crate::{aws_sign, AwsCredentials, S3Config};
 pub fn ensure_bucket(
     cfg: &S3Config,
     full_bucket: &str,
+    tags: &[(String, String)],
     creds: &AwsCredentials,
 ) -> Result<(), String> {
     // CreateBucket is idempotent for buckets we own — returns 200 if it
@@ -65,10 +66,98 @@ pub fn ensure_bucket(
             );
         }
     }
+    if !tags.is_empty() {
+        if let Err(e) = apply_bucket_tags(full_bucket, &cfg.region, tags, creds) {
+            log!(
+                LogLevel::Warn,
+                "deckwatch-plugin-aws: bucket tagging for {full_bucket}: {e}"
+            );
+        }
+    }
     Ok(())
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
+
+/// Merge the plugin's tags into the bucket's existing tag set.
+///
+/// PutBucketTagging replaces the whole set, so read it first and keep tags
+/// set by anyone else; skip the write when nothing would change.
+fn apply_bucket_tags(
+    bucket: &str,
+    region: &str,
+    tags: &[(String, String)],
+    creds: &AwsCredentials,
+) -> Result<(), String> {
+    let existing = match s3_get(bucket, region, "tagging", creds, "GetBucketTagging") {
+        Ok(xml) => crate::parse_s3_tag_set(&xml),
+        Err(e) if e.contains("NoSuchTagSet") => vec![],
+        Err(e) => return Err(e),
+    };
+    let merged = crate::merge_tags(&existing, tags);
+    if merged == existing {
+        return Ok(());
+    }
+    s3_put(
+        bucket,
+        region,
+        "tagging",
+        &crate::s3_tagging_xml(&merged),
+        creds,
+        "PutBucketTagging",
+    )
+}
+
+/// GET a bucket sub-resource (e.g. `tagging`) and return the response body.
+fn s3_get(
+    bucket: &str,
+    region: &str,
+    sub_resource: &str,
+    creds: &AwsCredentials,
+    op: &str,
+) -> Result<String, String> {
+    let (ep, path) = s3_target(bucket, region)?;
+    let host = ep.host.clone();
+    let path = path.as_str();
+    let datetime = aws_sign::utc_now_iso8601(region);
+
+    let (auth, payload_hash) = aws_sign::authorization_header(
+        "GET",
+        &host,
+        path,
+        sub_resource,
+        "",
+        &datetime,
+        region,
+        "s3",
+        &creds.access_key,
+        &creds.secret_key,
+        creds.session_token.as_deref(),
+        None,
+    );
+
+    let url = format!("{}{path}?{sub_resource}", ep.base_url);
+    let mut req = HttpRequest::new(&url)
+        .with_method("GET")
+        .with_header("Host", &host)
+        .with_header("X-Amz-Content-Sha256", &payload_hash)
+        .with_header("X-Amz-Date", &datetime)
+        .with_header("Authorization", &auth);
+    if let Some(ref tok) = creds.session_token {
+        req = req.with_header("X-Amz-Security-Token", tok);
+    }
+
+    let resp =
+        http::request::<String>(&req, None).map_err(|e| format!("S3 {op} HTTP error: {e}"))?;
+    let status = resp.status_code();
+    let text = String::from_utf8_lossy(&resp.body()).to_string();
+    if status >= 400 {
+        let code = extract_tag(&text, "Code").unwrap_or_default();
+        let msg = extract_tag(&text, "Message").unwrap_or_else(|| text.clone());
+        return Err(format!("S3 {op} error {status} [{code}]: {msg}"));
+    }
+    Ok(text)
+}
 
 /// Endpoint and canonical path for a bucket-level request.
 ///
@@ -223,8 +312,11 @@ fn s3_put(
     );
 
     let url = format!("{}{path}?{sub_resource}", ep.base_url);
+    // S3 requires a message integrity header on bucket-configuration PUTs
+    // (tagging, lifecycle); Content-MD5 isn't x-amz-*, so it needn't be signed.
     let mut req = HttpRequest::new(&url)
         .with_method("PUT")
+        .with_header("Content-MD5", crate::content_md5(body))
         .with_header("Content-Type", "application/xml")
         .with_header("Host", &host)
         .with_header("X-Amz-Content-Sha256", &payload_hash)
