@@ -7,6 +7,12 @@ history.
 
 ## [Unreleased]
 
+### Changed
+- `deckwatch-plugin-sdk` v0.10.0, the tagged release, replaces the pre-release
+  commit 0.8.0 was built with. No behaviour change: deckwatch receives the same
+  metadata and results, because the SDK's new fields are empty and left out of
+  the JSON. (#42)
+
 ## [0.8.0] - 2026-11-24
 
 ### Upgrade notes

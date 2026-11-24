@@ -170,9 +170,12 @@ crate, the integration harness and the GitHub Actions:
   After editing a `Cargo.toml`, run `cargo update --workspace` in that directory
   and commit the updated lockfile with it. A bare `cargo update` bumps every
   dependency.
-- **`deckwatch-plugin-sdk` is pinned to a commit** (`rev`) in both `Cargo.toml`
-  and `integration/Cargo.toml`, and the two must match. Bump the pin in its own
-  PR so CI tests the new SDK before a release uses it.
+- **`deckwatch-plugin-sdk` is pinned to a release tag** (`tag = "v0.10.0"`) in
+  both `Cargo.toml` and `integration/Cargo.toml`, and the two must match. Bump
+  it in its own PR so CI tests the new SDK before a release uses it. SDK structs
+  derive `Default`, so build them with `..Default::default()`. Then new SDK
+  fields don't break the build, and you can check the SDK CHANGELOG for any
+  worth setting.
 - deckwatch keeps its own hand-written copy of the SDK's types, so a new SDK type
   (such as the `key_value` config field type) does nothing until deckwatch
   supports it too.

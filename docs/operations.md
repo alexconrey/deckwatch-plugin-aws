@@ -274,10 +274,11 @@ The endpoint is missing from the plugin's `allowed_hosts`. See
   plugins delete Kubernetes objects; `deprovision()` can only return errors and a
   message. When the last resource's removal deletes the role, the message tells you
   to delete `<app>-aws-sa` with `kubectl`. The DB bootstrap Job and its
-  ServiceAccount stay as well. The SDK's `delete_kubernetes_resources` (merged for
-  SDK v0.10.0) and
-  [alexconrey/deckwatch#235](https://github.com/alexconrey/deckwatch/pull/235)
-  (in review) add this, and the plugin will use it once both are released.
+  ServiceAccount stay as well. SDK v0.10.0, which the plugin uses, adds
+  `delete_kubernetes_resources` for this. The plugin will use it once deckwatch
+  supports it
+  ([alexconrey/deckwatch#235](https://github.com/alexconrey/deckwatch/pull/235),
+  in review).
 - **Removing an application's last resource leaves its annotations on the
   deployments.** deckwatch only re-applies resource annotations to applications
   that still have resources, so `apply()` keeps seeing the old

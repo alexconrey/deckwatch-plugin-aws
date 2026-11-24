@@ -102,7 +102,7 @@ dependencies = [
 [[package]]
 name = "deckwatch-plugin-sdk"
 version = "0.10.0"
-source = "git+https://github.com/alexconrey/deckwatch-plugin-sdk?rev=889d739976c7f0bb4f55f5e578133af69dea33f8#889d739976c7f0bb4f55f5e578133af69dea33f8"
+source = "git+https://github.com/alexconrey/deckwatch-plugin-sdk?tag=v0.10.0#5d66d92feb7418bfedc18542faa1c0ca5c7ada3b"
 dependencies = [
  "serde",
  "serde_json",

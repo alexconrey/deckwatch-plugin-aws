@@ -2058,6 +2058,10 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
                 default: None,
             },
         ],
+        // Everything else keeps the SDK default. That leaves
+        // min_deckwatch_version unset (no constraint, and the field is
+        // omitted from the JSON), so deckwatch sees the same metadata as before.
+        ..Default::default()
     }))
 }
 
@@ -3041,6 +3045,7 @@ mod tests {
             labels: HashMap::new(),
             plugin_outputs: HashMap::new(),
             provisioned_resources: HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -3058,6 +3063,7 @@ mod tests {
                 .collect(),
             plugin_outputs: HashMap::new(),
             provisioned_resources: HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -4020,6 +4026,7 @@ mod tests {
             labels: [("app".to_string(), "backend".to_string())].into(),
             plugin_outputs: HashMap::new(),
             provisioned_resources: HashMap::new(),
+            ..Default::default()
         }
     }
 
