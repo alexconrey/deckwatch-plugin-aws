@@ -16,6 +16,26 @@ first.** They list the IAM permissions and settings the plugin's role and config
 need before the new binary runs. 0.8.0, for example, can't create workload roles
 without `iam:TagRole`.
 
+**If the notes say existing resources change** (0.8.0 raises RDS backup
+retention, tags every resource and rewrites inline policies), back up before
+upgrading:
+
+- Take a manual snapshot of each plugin-managed RDS instance. Manual snapshots
+  don't expire with the retention window:
+
+  ```bash
+  aws rds create-db-snapshot --db-instance-identifier <id> \
+    --db-snapshot-identifier <id>-pre-v<version>
+  ```
+
+- Record what to roll back to: the loaded binary's version, `sha256` and source
+  (see [Verifying the loaded binary](#verifying-the-loaded-binary)), and the
+  plugin's config.
+- Save the workload roles' inline policies with `aws iam get-role-policy`.
+
+Rolling back the binary stops further changes but doesn't undo the ones already
+made in AWS.
+
 1. **Release builds:** bump the release `ref` in the plugin's GitHub source. deckwatch
    fetches the new `plugin.wasm` and reloads it.
 2. **Unreleased builds** (for example, testing a fix): upload the binary. The

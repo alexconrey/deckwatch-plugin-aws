@@ -138,8 +138,9 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
 2. After CI passes and the user merges, tag `vX.Y.Z` on `main`. Never tag before
    the merge. `release.yml` attaches `plugin.wasm` to the release.
 3. Rolling it out (pointing deckwatch at the tag, or uploading) is a live change;
-   see [Live environments](#live-environments). Afterwards, compare the loaded
-   `sha256` from `GET /api/plugins` with the release asset.
+   see [Live environments](#live-environments). If the release changes existing
+   resources, take the backups described there first. Afterwards, compare the
+   loaded `sha256` from `GET /api/plugins` with the release asset.
 
 To test an unreleased build in deckwatch, upload the **raw bytes**:
 `curl -X POST -H 'Content-Type: application/wasm' --data-binary @dist/plugin.wasm https://<deckwatch>/api/plugins/AWS/upload`.
@@ -155,6 +156,24 @@ server) and the AWS account behind it.
   and refreshing or deprovisioning resources. Approval for one change doesn't
   cover the next. Read-only calls (`describe-*`, `get-*`, `list-*`, deckwatch
   `get_*`/`list_*`) are fine.
+- **Back up before rolling out a version with sweeping changes.** That means a
+  release whose *Upgrade notes* change existing resources on reconcile or
+  refresh. 0.8.0, for example, raises backup retention on every RDS instance,
+  tags every resource, rewrites inline policies, and can rename queues and
+  secrets through `RESOURCE_NAME_PREFIX`. Before loading such a version into a
+  live deckwatch:
+  1. Take a manual snapshot of every plugin-managed RDS instance, e.g.
+     `<id>-pre-v<version>`. Manual snapshots don't expire with the retention
+     window.
+  2. Record the rollback target: the loaded plugin's version, `sha256` and
+     source (`GET /api/plugins`), and its full config (env keys, allowed hosts,
+     inherited keys).
+  3. Save each workload role's inline policies (`aws iam get-role-policy`), so
+     any rewritten policy can be restored.
+
+  The snapshots are AWS writes, so confirm them like any other live change.
+  Rolling back the binary only stops further changes. It doesn't undo what the
+  new version already did in AWS, and that's what the backups are for.
 - **Hand-made grants get their own policy name** (`manual-<purpose>`), never a
   `deckwatch-*` one, which the next reconcile would overwrite. Remove them once
   the plugin covers the access. Until then they keep the role from being deleted.
