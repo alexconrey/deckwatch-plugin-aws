@@ -2468,16 +2468,7 @@ fn revoke_workload_access(
 ) {
     let role = rds_role_name(&req.namespace, &req.application_name);
     if let Some(policy) = resource_policy_name(&req.resource_id) {
-        match iam::delete_role_policy(&role, policy, creds) {
-            Ok(true) => notes.push(format!("Removed policy {policy} from IAM role {role}.")),
-            Ok(false) => {}
-            Err(e) => {
-                result
-                    .errors
-                    .push(format!("remove policy {policy} from {role}: {e}"));
-                return;
-            }
-        }
+        remove_role_policies(&role, &[policy], creds, result, notes);
     }
     if delete_role_if_unused(&role, creds, result, notes) {
         notes.push(format!(
@@ -2488,23 +2479,46 @@ fn revoke_workload_access(
     }
 
     if req.resource_id == "rds" {
+        // The bootstrap role carries only its own policy; remove all of it.
         let bootstrap = bootstrap_role_name(&req.namespace, &req.application_name);
-        match iam::list_role_policies(&bootstrap, creds) {
-            Ok(Some(policies)) => {
-                for policy in &policies {
-                    if let Err(e) = iam::delete_role_policy(&bootstrap, policy, creds) {
-                        result
-                            .errors
-                            .push(format!("remove policy {policy} from {bootstrap}: {e}"));
-                        return;
-                    }
-                }
-                delete_role_if_unused(&bootstrap, creds, result, notes);
-            }
-            Ok(None) => {}
+        remove_role_policies(&bootstrap, &[], creds, result, notes);
+        delete_role_if_unused(&bootstrap, creds, result, notes);
+    }
+}
+
+/// Delete inline policies from `role`: the named ones, or all of them when
+/// `only` is empty. Returns quietly if the role doesn't exist.
+///
+/// Lists before deleting: path-scoped IAM grants (e.g. `role/deckwatch-plugin/*`)
+/// authorize calls on a missing role against `role/<name>`, so
+/// `DeleteRolePolicy` on a missing role returns AccessDenied rather than
+/// NoSuchEntity. `ListRolePolicies` is read-only and can be granted on `role/*`.
+#[cfg(target_arch = "wasm32")]
+fn remove_role_policies(
+    role: &str,
+    only: &[&str],
+    creds: &AwsCredentials,
+    result: &mut ResourceDeprovisionResult,
+    notes: &mut Vec<String>,
+) {
+    let existing = match iam::list_role_policies(role, creds) {
+        Ok(Some(policies)) => policies,
+        Ok(None) => return,
+        Err(e) => {
+            result.errors.push(format!("list policies on {role}: {e}"));
+            return;
+        }
+    };
+    for policy in existing
+        .iter()
+        .filter(|p| only.is_empty() || only.contains(&p.as_str()))
+    {
+        match iam::delete_role_policy(role, policy, creds) {
+            Ok(true) => notes.push(format!("Removed policy {policy} from IAM role {role}.")),
+            Ok(false) => {}
             Err(e) => result
                 .errors
-                .push(format!("list policies on {bootstrap}: {e}")),
+                .push(format!("remove policy {policy} from {role}: {e}")),
         }
     }
 }
