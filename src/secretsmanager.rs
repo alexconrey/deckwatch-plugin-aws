@@ -51,7 +51,8 @@ pub fn schedule_delete_secret(
     let body =
         format!(r#"{{"SecretId":"{secret_name}","RecoveryWindowInDays":{recovery_window_days}}}"#);
     let json = sm_call("secretsmanager.DeleteSecret", &body, creds)?;
-    let deletion_date = extract_json_str(&json, "DeletionDate").unwrap_or_else(|| "unknown".into());
+    let deletion_date =
+        crate::json_str_field(&json, "DeletionDate").unwrap_or_else(|| "unknown".into());
     log!(
         LogLevel::Info,
         "deckwatch-plugin-aws: secret '{secret_name}' scheduled for deletion on {deletion_date}"
@@ -67,7 +68,7 @@ fn describe_secret(secret_name: &str, creds: &AwsCredentials) -> Result<Option<S
     match sm_call("secretsmanager.DescribeSecret", &body, creds) {
         Ok(json) => {
             // The ARN field is named "ARN" in the response.
-            let arn = extract_json_str(&json, "ARN");
+            let arn = crate::json_str_field(&json, "ARN");
             Ok(arn)
         }
         Err(e) if e.contains("ResourceNotFoundException") => Ok(None),
@@ -83,7 +84,7 @@ fn create_secret(
     let body = format!(r#"{{"Name":"{secret_name}","Description":"{description}"}}"#);
     let json = sm_call("secretsmanager.CreateSecret", &body, creds)?;
 
-    extract_json_str(&json, "ARN").ok_or_else(|| {
+    crate::json_str_field(&json, "ARN").ok_or_else(|| {
         format!("Secrets Manager CreateSecret: could not parse ARN from response: {json}")
     })
 }
@@ -133,33 +134,4 @@ fn sm_call(target: &str, body: &str, creds: &AwsCredentials) -> Result<String, S
     }
 
     Ok(text)
-}
-
-fn extract_json_str(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = json.find(&needle)? + needle.len();
-    let end = json[start..].find('"')?;
-    Some(json[start..start + end].to_string())
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_arn_from_describe_response() {
-        let json = r#"{"ARN":"arn:aws:secretsmanager:us-east-1:123456789012:secret:myapp-AbCdEf","Name":"myapp","VersionId":"xxx"}"#;
-        assert_eq!(
-            extract_json_str(json, "ARN"),
-            Some("arn:aws:secretsmanager:us-east-1:123456789012:secret:myapp-AbCdEf".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_returns_none_for_missing_key() {
-        let json = r#"{"Name":"myapp"}"#;
-        assert_eq!(extract_json_str(json, "ARN"), None);
-    }
 }

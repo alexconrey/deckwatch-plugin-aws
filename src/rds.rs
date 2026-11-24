@@ -220,13 +220,15 @@ fn url_encode(s: &str) -> String {
     out
 }
 
-/// Delete the RDS instance, optionally taking a final snapshot first.
-/// Disables deletion protection before deleting (required if it was enabled).
+/// Delete the RDS instance, always taking a final snapshot named
+/// `final_snapshot_id` first. Disables deletion protection before deleting.
+///
+/// Returns `Ok(false)` if the instance was already gone.
 pub fn delete_instance(
     identifier: &str,
-    skip_final_snapshot: bool,
+    final_snapshot_id: &str,
     creds: &AwsCredentials,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // 1. Disable deletion protection so the delete can proceed.
     // If the instance is already gone, treat it as success (idempotent deprovision).
     let modify_body = format!(
@@ -241,27 +243,21 @@ pub fn delete_instance(
                 "deckwatch-plugin-aws: RDS instance {} already gone, deprovision complete",
                 identifier
             );
-            return Ok(());
+            return Ok(false);
         }
         Err(e) => return Err(format!("failed to disable deletion protection: {e}")),
     }
 
     // 2. Delete the instance.
-    let mut delete_body = format!(
-        "Action=DeleteDBInstance&Version=2014-10-31&DBInstanceIdentifier={}",
-        url_encode(identifier)
+    // A final snapshot is always taken; there is deliberately no way to skip it.
+    let delete_body = format!(
+        "Action=DeleteDBInstance&Version=2014-10-31&DBInstanceIdentifier={}\
+         &SkipFinalSnapshot=false&FinalDBSnapshotIdentifier={}",
+        url_encode(identifier),
+        url_encode(final_snapshot_id),
     );
-    if skip_final_snapshot {
-        delete_body.push_str("&SkipFinalSnapshot=true");
-    } else {
-        let snapshot_id = format!("{identifier}-final");
-        delete_body.push_str(&format!(
-            "&SkipFinalSnapshot=false&FinalDBSnapshotIdentifier={}",
-            url_encode(&snapshot_id)
-        ));
-    }
 
     rds_query(&delete_body, creds).map_err(|e| format!("DeleteDBInstance failed: {e}"))?;
 
-    Ok(())
+    Ok(true)
 }
