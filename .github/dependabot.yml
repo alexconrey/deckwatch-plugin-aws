@@ -16,6 +16,12 @@ updates:
       prefix: chore
       include: scope
     groups:
+      # hmac and sha2 share the `digest` trait crate and only compile when
+      # both target the same digest version, so they must always be bumped
+      # together. No update-types filter: for 0.x crates a 0.12 -> 0.13 bump
+      # counts as semver-major and would otherwise get its own failing PR.
+      rustcrypto:
+        patterns: ["hmac", "sha2", "digest"]
       rust-minor-patch:
         update-types: [minor, patch]
 
