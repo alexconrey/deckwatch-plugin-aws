@@ -23,7 +23,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_iam::types::Role;
 use deckwatch_plugin_sdk::{
-    PluginContext, PluginResult, ResourceProvisionRequest, ResourceProvisionResult,
+    PluginContext, PluginResult, ResourceDeprovisionRequest, ResourceDeprovisionResult,
+    ResourceProvisionRequest, ResourceProvisionResult,
 };
 use extism::{Manifest, Plugin, Wasm};
 use serde_json::Value;
@@ -119,6 +120,58 @@ fn call_apply(plugin: &mut Plugin, ctx: &PluginContext) -> PluginResult {
     serde_json::from_str(out).expect("apply result JSON")
 }
 
+fn call_deprovision(
+    plugin: &mut Plugin,
+    req: &ResourceDeprovisionRequest,
+) -> ResourceDeprovisionResult {
+    let input = serde_json::to_string(req).unwrap();
+    let out = plugin
+        .call::<&str, &str>("deprovision", &input)
+        .expect("deprovision export");
+    serde_json::from_str(out).expect("deprovision result JSON")
+}
+
+/// The request deckwatch sends to deprovision a resource it provisioned:
+/// the original form fields plus the state provision() returned.
+fn deprovision_request(
+    provision_req: &ResourceProvisionRequest,
+    provisioned: &ResourceProvisionResult,
+) -> ResourceDeprovisionRequest {
+    ResourceDeprovisionRequest {
+        application_name: provision_req.application_name.clone(),
+        namespace: provision_req.namespace.clone(),
+        resource_id: provision_req.resource_id.clone(),
+        state: provisioned.state.clone(),
+        fields: provision_req.fields.clone(),
+    }
+}
+
+fn resource_request(
+    app: &str,
+    namespace: &str,
+    resource_id: &str,
+    fields: &[(&str, &str)],
+) -> ResourceProvisionRequest {
+    ResourceProvisionRequest {
+        application_name: app.into(),
+        namespace: namespace.into(),
+        resource_id: resource_id.into(),
+        fields: fields
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    }
+}
+
+/// Inline policy names on a role, or None if the role doesn't exist.
+async fn role_policies(iam: &aws_sdk_iam::Client, role: &str) -> Option<Vec<String>> {
+    match iam.list_role_policies().role_name(role).send().await {
+        Ok(out) => Some(out.policy_names().to_vec()),
+        Err(e) if format!("{e:?}").contains("NoSuchEntity") => None,
+        Err(e) => panic!("ListRolePolicies {role}: {e:?}"),
+    }
+}
+
 fn s3_request(app: &str, namespace: &str, bucket: &str, region: &str) -> ResourceProvisionRequest {
     ResourceProvisionRequest {
         application_name: app.into(),
@@ -150,6 +203,30 @@ async fn sdk_config(region: &str) -> aws_config::SdkConfig {
 
 async fn iam_client(region: &str) -> aws_sdk_iam::Client {
     aws_sdk_iam::Client::new(&sdk_config(region).await)
+}
+
+async fn rds_client(region: &str) -> aws_sdk_rds::Client {
+    aws_sdk_rds::Client::new(&sdk_config(region).await)
+}
+
+async fn db_instance(rds: &aws_sdk_rds::Client, id: &str) -> aws_sdk_rds::types::DbInstance {
+    rds.describe_db_instances()
+        .db_instance_identifier(id)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("RDS instance {id} must exist: {e:?}"))
+        .db_instances()
+        .first()
+        .cloned()
+        .expect("instance in response")
+}
+
+async fn sqs_client(region: &str) -> aws_sdk_sqs::Client {
+    aws_sdk_sqs::Client::new(&sdk_config(region).await)
+}
+
+async fn secrets_client(region: &str) -> aws_sdk_secretsmanager::Client {
+    aws_sdk_secretsmanager::Client::new(&sdk_config(region).await)
 }
 
 async fn s3_client(region: &str) -> aws_sdk_s3::Client {
@@ -524,6 +601,359 @@ async fn govcloud_sqs_annotation_grants_queue_access() {
     assert_eq!(
         applied.wants_service_account.map(|w| w.name),
         Some(format!("{app}-aws-sa"))
+    );
+}
+
+/// Provisioned SQS queues used to get no IAM grant at all. Now provision()
+/// attaches deckwatch-sqs-access (GovCloud partition, real account) to the app
+/// role, emits the ServiceAccount, and stamps annotations for apply().
+#[tokio::test]
+async fn govcloud_sqs_provision_grants_queue_access() {
+    let region = "us-gov-west-1";
+    let (ns, app, queue) = ("billing-it", unique("billing"), unique("billing-jobs"));
+    let role_name = format!("{ns}-{app}-rds");
+    let iam = iam_client(region).await;
+
+    let mut plugin = load_plugin(region, &[]);
+    let req = resource_request(app, ns, "sqs", &[("queue_name", queue)]);
+    let result = call_provision(&mut plugin, &req);
+    assert!(
+        result.errors.is_empty(),
+        "provision errors: {:?}",
+        result.errors
+    );
+    assert!(
+        result.warnings.is_empty(),
+        "provision warnings: {:?}",
+        result.warnings
+    );
+
+    let queue_url = result.state.get("QUEUE_URL").cloned().unwrap_or_default();
+    let account = queue_url.rsplit('/').nth(1).expect("account in queue URL");
+    let policy = inline_policy(&iam, &role_name, "deckwatch-sqs-access").await;
+    assert_eq!(
+        policy["Statement"][0]["Resource"],
+        format!("arn:aws-us-gov:sqs:{region}:{account}:{queue}")
+    );
+    assert_eq!(
+        result.state.get("SQS_SA_NAME"),
+        Some(&format!("{app}-aws-sa"))
+    );
+    assert!(
+        result
+            .kubernetes_resources
+            .iter()
+            .any(|r| r["kind"] == "ServiceAccount"
+                && r["metadata"]["name"] == format!("{app}-aws-sa"))
+    );
+    let ann = &result.deployment_annotations;
+    assert_eq!(
+        ann.get("sqs.deckwatch.io/enabled").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ann.get("sqs.deckwatch.io/queue-name").map(String::as_str),
+        Some(queue)
+    );
+    assert_eq!(ann.get("aws.deckwatch.io/role-name"), Some(&role_name));
+}
+
+/// Provisioned secrets now grant read access to the app role, and their
+/// deprovisioning schedules recoverable deletion and cleans up the role.
+#[tokio::test]
+async fn secretsmanager_provision_grants_and_deprovision_cleans_up() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("vault-it", unique("vault"));
+    let secret_name = format!("{ns}/{app}");
+    let role_name = format!("{ns}-{app}-rds");
+    let iam = iam_client(region).await;
+
+    let mut plugin = load_plugin(region, &[]);
+    let req = resource_request(app, ns, "secretsmanager", &[]);
+    let provisioned = call_provision(&mut plugin, &req);
+    assert!(
+        provisioned.errors.is_empty(),
+        "provision errors: {:?}",
+        provisioned.errors
+    );
+    let arn = provisioned
+        .state
+        .get("SM_SECRET_ARN")
+        .cloned()
+        .expect("secret ARN");
+
+    let policy = inline_policy(&iam, &role_name, "deckwatch-secretsmanager-access").await;
+    assert_eq!(policy["Statement"][0]["Resource"], serde_json::json!([arn]));
+    assert_eq!(
+        provisioned
+            .deployment_annotations
+            .get("secretsmanager.deckwatch.io/secret-arns"),
+        Some(&arn)
+    );
+    assert!(
+        !provisioned
+            .deployment_annotations
+            .contains_key("secretsmanager.deckwatch.io/enabled"),
+        "grant-only: apply() must not be told to create secrets"
+    );
+
+    let removed = call_deprovision(&mut plugin, &deprovision_request(&req, &provisioned));
+    assert!(
+        removed.errors.is_empty(),
+        "deprovision errors: {:?}",
+        removed.errors
+    );
+    let described = secrets_client(region)
+        .await
+        .describe_secret()
+        .secret_id(&secret_name)
+        .send()
+        .await
+        .expect("secret is still restorable during the recovery window");
+    assert!(
+        described.deleted_date().is_some(),
+        "deletion must be scheduled"
+    );
+    assert_eq!(
+        role_policies(&iam, &role_name).await,
+        None,
+        "last resource: role deleted"
+    );
+}
+
+/// The workload role is shared by every resource of an application.
+/// Deprovisioning one resource removes only its policy; the role is deleted
+/// with the last one. S3 data is always kept, and an empty queue is deleted.
+#[tokio::test]
+async fn deprovision_keeps_shared_role_until_last_resource() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("shop-it", unique("shop"));
+    let (bucket, queue) = (unique("k2-shop-assets"), unique("shop-orders"));
+    let role_name = format!("{ns}-{app}-rds");
+    let iam = iam_client(region).await;
+    let mut plugin = load_plugin(region, &[]);
+
+    let s3_req = s3_request(app, ns, bucket, region);
+    let s3_res = call_provision(&mut plugin, &s3_req);
+    let sqs_req = resource_request(app, ns, "sqs", &[("queue_name", queue)]);
+    let sqs_res = call_provision(&mut plugin, &sqs_req);
+    assert!(s3_res.errors.is_empty() && sqs_res.errors.is_empty());
+    let mut both = role_policies(&iam, &role_name).await.expect("role exists");
+    both.sort();
+    assert_eq!(both, vec!["deckwatch-s3-access", "deckwatch-sqs-access"]);
+
+    // Remove S3: bucket kept, only its policy removed, role kept for SQS.
+    let removed = call_deprovision(&mut plugin, &deprovision_request(&s3_req, &s3_res));
+    assert!(
+        removed.errors.is_empty(),
+        "deprovision errors: {:?}",
+        removed.errors
+    );
+    s3_client(region)
+        .await
+        .head_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("S3 data must be kept on deprovision");
+    assert_eq!(
+        role_policies(&iam, &role_name).await,
+        Some(vec!["deckwatch-sqs-access".to_string()])
+    );
+
+    // Remove the (empty) queue: deleted, and the role goes with it.
+    let removed = call_deprovision(&mut plugin, &deprovision_request(&sqs_req, &sqs_res));
+    assert!(
+        removed.errors.is_empty(),
+        "deprovision errors: {:?}",
+        removed.errors
+    );
+    let still_there = sqs_client(region)
+        .await
+        .get_queue_url()
+        .queue_name(queue)
+        .send()
+        .await;
+    assert!(still_there.is_err(), "empty queue must be deleted");
+    assert_eq!(
+        role_policies(&iam, &role_name).await,
+        None,
+        "role deleted with the last resource"
+    );
+    assert!(
+        removed.message.contains("ServiceAccount"),
+        "operator is told the ServiceAccount must be removed: {}",
+        removed.message
+    );
+}
+
+/// SQS messages can't be snapshotted, so a queue that still holds messages is
+/// kept on deprovision, and so is the application's access to drain it.
+#[tokio::test]
+async fn deprovision_keeps_sqs_queue_that_still_has_messages() {
+    let region = "us-gov-west-1";
+    let (ns, app, queue) = ("mail-it", unique("mail"), unique("mail-outbox"));
+    let role_name = format!("{ns}-{app}-rds");
+    let iam = iam_client(region).await;
+    let mut plugin = load_plugin(region, &[]);
+
+    let req = resource_request(app, ns, "sqs", &[("queue_name", queue)]);
+    let provisioned = call_provision(&mut plugin, &req);
+    assert!(
+        provisioned.errors.is_empty(),
+        "provision errors: {:?}",
+        provisioned.errors
+    );
+    let queue_url = provisioned
+        .state
+        .get("QUEUE_URL")
+        .cloned()
+        .expect("queue URL");
+    let sqs = sqs_client(region).await;
+    sqs.send_message()
+        .queue_url(&queue_url)
+        .message_body("pending")
+        .send()
+        .await
+        .expect("send message");
+
+    let removed = call_deprovision(&mut plugin, &deprovision_request(&req, &provisioned));
+    assert!(
+        removed.errors.is_empty(),
+        "deprovision errors: {:?}",
+        removed.errors
+    );
+    assert!(
+        removed.message.contains("kept"),
+        "message: {}",
+        removed.message
+    );
+    sqs.get_queue_url()
+        .queue_name(queue)
+        .send()
+        .await
+        .expect("queue with messages must be kept");
+    assert_eq!(
+        role_policies(&iam, &role_name).await,
+        Some(vec!["deckwatch-sqs-access".to_string()]),
+        "access is kept so the queue can be drained"
+    );
+}
+
+/// RDS's API default is 1 day of automated backups. Instances the plugin
+/// creates must get the plugin's retention (14 days by default) and copy tags
+/// to snapshots.
+#[tokio::test]
+async fn provisioned_rds_gets_14_day_backup_retention() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("ledger-it", unique("ledger"));
+    let identifier = unique("ledger-db");
+    let mut plugin = load_plugin(region, &[]);
+
+    let req = resource_request(app, ns, "rds", &[("identifier", identifier)]);
+    let result = call_provision(&mut plugin, &req);
+    assert!(
+        result.errors.is_empty(),
+        "provision errors: {:?}",
+        result.errors
+    );
+
+    let db = db_instance(&rds_client(region).await, identifier).await;
+    assert_eq!(db.backup_retention_period(), Some(14));
+    assert_eq!(db.copy_tags_to_snapshot(), Some(true));
+    assert_eq!(db.deletion_protection(), Some(true));
+}
+
+/// Instances created with RDS's 1-day default (all five plugin-created
+/// instances on zeus) are raised to the configured retention on the next
+/// reconcile, without being lowered or recreated.
+#[tokio::test]
+async fn existing_rds_backup_retention_is_raised_on_reconcile() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("legacy-it", unique("legacy"));
+    let identifier = unique("legacy-db");
+    let rds = rds_client(region).await;
+    rds.create_db_instance()
+        .db_instance_identifier(identifier)
+        .db_instance_class("db.t3.micro")
+        .engine("postgres")
+        .allocated_storage(20)
+        .master_username("dbadmin")
+        .master_user_password("not-a-real-password-1")
+        .backup_retention_period(1)
+        .send()
+        .await
+        .expect("seed a 1-day-retention instance");
+    assert_eq!(
+        db_instance(&rds, identifier)
+            .await
+            .backup_retention_period(),
+        Some(1)
+    );
+
+    let mut plugin = load_plugin(region, &[("RDS_BACKUP_RETENTION_DAYS", "21")]);
+    let req = resource_request(app, ns, "rds", &[("identifier", identifier)]);
+    let result = call_provision(&mut plugin, &req);
+    assert!(
+        result.errors.is_empty(),
+        "provision errors: {:?}",
+        result.errors
+    );
+
+    assert_eq!(
+        db_instance(&rds, identifier)
+            .await
+            .backup_retention_period(),
+        Some(21),
+        "retention must be raised to RDS_BACKUP_RETENTION_DAYS"
+    );
+}
+
+/// Removing an RDS resource always leaves a timestamped final snapshot.
+#[tokio::test]
+async fn rds_deprovision_always_takes_a_final_snapshot() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("archive-it", unique("archive"));
+    let identifier = unique("archive-db");
+    let rds = rds_client(region).await;
+    let mut plugin = load_plugin(region, &[]);
+
+    let req = resource_request(app, ns, "rds", &[("identifier", identifier)]);
+    let provisioned = call_provision(&mut plugin, &req);
+    assert!(
+        provisioned.errors.is_empty(),
+        "provision errors: {:?}",
+        provisioned.errors
+    );
+
+    let removed = call_deprovision(&mut plugin, &deprovision_request(&req, &provisioned));
+    assert!(
+        removed.errors.is_empty(),
+        "deprovision errors: {:?}",
+        removed.errors
+    );
+
+    let snapshots = rds
+        .describe_db_snapshots()
+        .db_instance_identifier(identifier)
+        .snapshot_type("manual")
+        .send()
+        .await
+        .expect("describe snapshots");
+    let names: Vec<&str> = snapshots
+        .db_snapshots()
+        .iter()
+        .filter_map(|s| s.db_snapshot_identifier())
+        .collect();
+    let prefix = format!("{identifier}-final-");
+    assert!(
+        names.iter().any(|n| n.starts_with(&prefix)),
+        "expected a final snapshot named {prefix}YYYYMMDD-HHMMSS, got {names:?}"
+    );
+    assert!(
+        removed.message.contains("final snapshot"),
+        "message: {}",
+        removed.message
     );
 }
 

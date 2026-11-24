@@ -173,8 +173,9 @@ pub fn attach_rds_policy(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"rds-db:connect","Resource":"arn:{partition}:rds-db:{region}:{account}:dbuser:{rds_resource_id}/{db_user}"}}]}}"#
     );
     let body = format!(
-        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-rds-connect&PolicyDocument={}",
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
         url_encode(role_name),
+        crate::POLICY_RDS,
         url_encode(&policy),
     );
     let _xml = iam_query(&body, creds)?;
@@ -193,8 +194,9 @@ pub fn attach_s3_policy(
 ) -> Result<(), String> {
     let policy = crate::s3_access_policy_document(bucket_name, region);
     let body = format!(
-        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-s3-access&PolicyDocument={}",
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
         url_encode(role_name),
+        crate::POLICY_S3,
         url_encode(&policy),
     );
     iam_query(&body, creds)?;
@@ -205,8 +207,9 @@ pub fn attach_s3_policy(
 pub fn attach_ecr_policy(role_name: &str, creds: &AwsCredentials) -> Result<(), String> {
     let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},{"Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage"],"Resource":"*"}]}"#;
     let body = format!(
-        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-ecr-pull&PolicyDocument={}",
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
         url_encode(role_name),
+        crate::POLICY_ECR,
         url_encode(policy),
     );
     iam_query(&body, creds)?;
@@ -223,8 +226,9 @@ pub fn attach_sqs_policy(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["sqs:SendMessage","sqs:ReceiveMessage","sqs:DeleteMessage","sqs:GetQueueUrl","sqs:GetQueueAttributes","sqs:ChangeMessageVisibility"],"Resource":"{queue_arn}"}}]}}"#
     );
     let body = format!(
-        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-sqs-access&PolicyDocument={}",
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
         url_encode(role_name),
+        crate::POLICY_SQS,
         url_encode(&policy),
     );
     iam_query(&body, creds)?;
@@ -249,12 +253,80 @@ pub fn attach_secretsmanager_policy(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["secretsmanager:GetSecretValue","secretsmanager:DescribeSecret"],"Resource":[{arns_json}]}}]}}"#
     );
     let body = format!(
-        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName=deckwatch-secretsmanager-access&PolicyDocument={}",
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
         url_encode(role_name),
+        crate::POLICY_SECRETS,
         url_encode(&policy),
     );
     iam_query(&body, creds)?;
     Ok(())
+}
+
+// ── Cleanup (deprovision) ─────────────────────────────────────────────────────
+
+/// Delete one inline policy from a role. Returns `false` if the role or policy
+/// doesn't exist, so cleanup is idempotent.
+pub fn delete_role_policy(
+    role_name: &str,
+    policy_name: &str,
+    creds: &AwsCredentials,
+) -> Result<bool, String> {
+    let body = format!(
+        "Action=DeleteRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}",
+        url_encode(role_name),
+        url_encode(policy_name),
+    );
+    match iam_query(&body, creds) {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("NoSuchEntity") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Names of a role's inline policies, or `None` if the role doesn't exist.
+pub fn list_role_policies(
+    role_name: &str,
+    creds: &AwsCredentials,
+) -> Result<Option<Vec<String>>, String> {
+    let body = format!(
+        "Action=ListRolePolicies&Version=2010-05-08&RoleName={}&MaxItems=1000",
+        url_encode(role_name)
+    );
+    match iam_query(&body, creds) {
+        Ok(xml) => Ok(Some(crate::xml_tag_values(&xml, "member"))),
+        Err(e) if e.contains("NoSuchEntity") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// ARNs of the managed policies attached to a role (empty if the role is gone).
+pub fn list_attached_role_policy_arns(
+    role_name: &str,
+    creds: &AwsCredentials,
+) -> Result<Vec<String>, String> {
+    let body = format!(
+        "Action=ListAttachedRolePolicies&Version=2010-05-08&RoleName={}&MaxItems=1000",
+        url_encode(role_name)
+    );
+    match iam_query(&body, creds) {
+        Ok(xml) => Ok(crate::xml_tag_values(&xml, "PolicyArn")),
+        Err(e) if e.contains("NoSuchEntity") => Ok(vec![]),
+        Err(e) => Err(e),
+    }
+}
+
+/// Delete a role. It must have no policies left. Returns `false` if it was
+/// already gone.
+pub fn delete_role(role_name: &str, creds: &AwsCredentials) -> Result<bool, String> {
+    let body = format!(
+        "Action=DeleteRole&Version=2010-05-08&RoleName={}",
+        url_encode(role_name)
+    );
+    match iam_query(&body, creds) {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("NoSuchEntity") => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

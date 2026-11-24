@@ -7,7 +7,36 @@ history.
 
 ## [Unreleased]
 
+### Added
+- `RDS_BACKUP_RETENTION_DAYS` (default **14**, range 1–35) and `RDS_BACKUP_WINDOW`
+  config keys.
+
+### Changed
+- **RDS instances keep 14 days of automated backups by default**, instead of RDS's
+  API default of 1 day. Existing instances below the setting are raised on
+  reconcile (no outage between non-zero values). Retention is never lowered, and
+  disabled backups are reported rather than re-enabled automatically. Snapshots
+  copy instance tags.
+- Deleting an RDS instance keeps its automated backups until they expire
+  (`DeleteAutomatedBackups=false`), in addition to the final snapshot.
+- **Removing a resource never destroys data without a recovery path.**
+  - RDS always takes a final snapshot, now timestamped
+    (`<identifier>-final-YYYYMMDD-HHMMSS`) so repeat deletions can't collide.
+  - SQS queues that still hold messages are kept, along with the app's access.
+  - S3 buckets are kept.
+  - Secrets keep a 30-day recovery window.
+- **Removing a resource cleans up IAM.** Its inline policy is removed from the
+  workload role, and the role (and, for RDS, the bootstrap Job's role) is deleted
+  once nothing is left on it.
+
 ### Fixed
+- **Provisioned SQS queues and Secrets Manager secrets now grant the workload
+  access.** They attach `deckwatch-sqs-access` / `deckwatch-secretsmanager-access`
+  to the app role, emit the ServiceAccount, and stamp annotations so every reconcile
+  re-asserts the grant.
+- **Secrets Manager and AWS Backup responses are parsed as JSON**, instead of by
+  `"key":"` substring matching. Responses with whitespace previously failed, and
+  Secrets Manager's numeric `DeletionDate` showed as "unknown".
 - **Provisioning an S3 bucket now grants the workload access to it.** `provision("s3")`
   never attached an IAM policy, and the S3 policy used `arn:aws:s3:::` ARNs, which
   never match GovCloud buckets. It now attaches `deckwatch-s3-access` with the
@@ -33,6 +62,8 @@ history.
 - GitHub Actions moved to their Node 24 releases. (#25)
 
 ### Removed
+- The `RDS_SKIP_FINAL_SNAPSHOT` config key. RDS deletion always takes a final
+  snapshot.
 - The `rds.deckwatch.io/region` annotation. It was parsed but never used; RDS always
   uses `AWS_REGION`. (#29)
 

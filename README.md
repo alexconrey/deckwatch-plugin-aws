@@ -11,10 +11,14 @@ inside deckwatch, calls AWS APIs directly, and works in both commercial AWS and
 | **IAM** | Creates the application's workload role with a trust policy scoped to its ServiceAccount, and attaches one inline policy per resource |
 | **RDS** (PostgreSQL, MySQL) | Creates an encrypted, private instance with IAM database auth, and creates the IAM database user |
 | **S3** | Creates a bucket (public access blocked by default) and grants the workload object read/write |
-| **SQS** | Creates a standard or FIFO queue |
+| **SQS** | Creates a standard or FIFO queue and grants the workload send/receive |
 | **Secrets Manager** | Creates an empty secret, or grants read access to existing secrets |
 | **ECR** | Grants image pull permissions |
 | **AWS Backup** | Schedules RDS snapshots |
+
+Removing a resource never destroys data without a way to get it back. RDS always
+takes a final snapshot, S3 buckets are kept, SQS queues with messages are kept, and
+secrets keep a 30-day recovery window. Only that resource's IAM access is revoked.
 
 Connection details reach the application as environment variables (`DB_HOST`,
 `S3_BUCKET`, `QUEUE_URL`, …), and the pods run as the application's ServiceAccount,

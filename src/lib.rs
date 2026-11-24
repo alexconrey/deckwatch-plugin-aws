@@ -373,6 +373,242 @@ fn rds_instance_arn(region: &str, account_id: &str, identifier: &str) -> String 
     format!("arn:{partition}:rds:{region}:{account_id}:db:{identifier}")
 }
 
+// ── Workload inline policies ──────────────────────────────────────────────────
+//
+// One inline policy per resource type on the application's workload role.
+// deckwatch allows at most one resource of each type per application (unique
+// on application, plugin, resource_id), so a fixed name per type can't collide.
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const POLICY_RDS: &str = "deckwatch-rds-connect";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const POLICY_S3: &str = "deckwatch-s3-access";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const POLICY_SQS: &str = "deckwatch-sqs-access";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const POLICY_SECRETS: &str = "deckwatch-secretsmanager-access";
+#[cfg(target_arch = "wasm32")]
+pub(crate) const POLICY_ECR: &str = "deckwatch-ecr-pull";
+
+/// Inline policy a provisioned resource adds to the workload role, which
+/// deprovisioning removes.
+#[cfg(any(target_arch = "wasm32", test))]
+fn resource_policy_name(resource_id: &str) -> Option<&'static str> {
+    match resource_id {
+        "rds" => Some(POLICY_RDS),
+        "s3" => Some(POLICY_S3),
+        "sqs" => Some(POLICY_SQS),
+        "secretsmanager" => Some(POLICY_SECRETS),
+        _ => None,
+    }
+}
+
+/// A workload role can be deleted only when nothing is left on it: no inline
+/// policies (from other resources, annotations, or an operator) and no attached
+/// managed policies. Anything else means the role is still in use.
+#[cfg(any(target_arch = "wasm32", test))]
+fn role_is_disposable(inline_policies: &[String], attached_policy_arns: &[String]) -> bool {
+    inline_policies.is_empty() && attached_policy_arns.is_empty()
+}
+
+// ── RDS automated backups ─────────────────────────────────────────────────────
+
+/// Automated-backup retention for RDS instances when `RDS_BACKUP_RETENTION_DAYS`
+/// is unset. Without an explicit value, RDS defaults to 1 day, which allows only
+/// a 24-hour point-in-time recovery window.
+#[cfg(any(target_arch = "wasm32", test))]
+const DEFAULT_RDS_BACKUP_RETENTION_DAYS: u32 = 14;
+
+/// The longest automated-backup retention RDS allows.
+#[cfg(any(target_arch = "wasm32", test))]
+const MAX_RDS_BACKUP_RETENTION_DAYS: u32 = 35;
+
+/// Parse `RDS_BACKUP_RETENTION_DAYS` into 1–35 days.
+///
+/// Empty, invalid or `0` values fall back to the default: the plugin never
+/// disables automated backups. Values above the RDS maximum are capped.
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_backup_retention_days(raw: Option<&str>) -> u32 {
+    match raw.map(str::trim).and_then(|v| v.parse::<u32>().ok()) {
+        Some(0) | None => DEFAULT_RDS_BACKUP_RETENTION_DAYS,
+        Some(days) => days.min(MAX_RDS_BACKUP_RETENTION_DAYS),
+    }
+}
+
+/// What to do about an existing instance's automated-backup retention.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, PartialEq)]
+enum RetentionAction {
+    /// Already at or above the configured retention. Never lowered.
+    Keep,
+    /// Raise to the configured retention. Changing between non-zero values
+    /// takes effect without an outage.
+    Raise(u32),
+    /// Automated backups are disabled (`0`). Re-enabling them can cause a brief
+    /// outage, so warn instead of changing it during a reconcile.
+    WarnDisabled,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn retention_action(current_days: u32, configured_days: u32) -> RetentionAction {
+    if current_days == 0 {
+        RetentionAction::WarnDisabled
+    } else if current_days < configured_days {
+        RetentionAction::Raise(configured_days)
+    } else {
+        RetentionAction::Keep
+    }
+}
+
+/// `RDS_BACKUP_RETENTION_DAYS` from plugin config (see [`parse_backup_retention_days`]).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn configured_backup_retention_days() -> u32 {
+    parse_backup_retention_days(
+        config::get("RDS_BACKUP_RETENTION_DAYS")
+            .ok()
+            .flatten()
+            .as_deref(),
+    )
+}
+
+/// `RDS_BACKUP_WINDOW` from plugin config: `hh24:mi-hh24:mi` in UTC, or `None`
+/// to let RDS choose a window.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn configured_backup_window() -> Option<String> {
+    config::get("RDS_BACKUP_WINDOW")
+        .ok()
+        .flatten()
+        .map(|w| w.trim().to_string())
+        .filter(|w| !w.is_empty())
+}
+
+/// Final snapshot name for a deleted RDS instance: `<identifier>-final-YYYYMMDD-HHMMSS`.
+///
+/// The timestamp keeps the name unique, so deleting an instance that was
+/// re-created under the same identifier can't fail on an existing snapshot.
+/// `datetime` is the SigV4 `YYYYMMDDTHHMMSSZ` form from `CURRENT_TIMESTAMP`.
+#[cfg(any(target_arch = "wasm32", test))]
+fn final_snapshot_identifier(identifier: &str, datetime: &str) -> String {
+    let digits: String = datetime.chars().filter(char::is_ascii_digit).collect();
+    let stamp = match (digits.get(..8), digits.get(8..14)) {
+        (Some(date), Some(time)) => format!("{date}-{time}"),
+        _ => digits,
+    };
+    let mut id = format!("{}-final-{stamp}", identifier.trim_end_matches('-'));
+    id.truncate(255);
+    id.trim_end_matches('-').to_string()
+}
+
+/// Text content of every `<tag>…</tag>` element in an XML document, in order.
+#[cfg(any(target_arch = "wasm32", test))]
+fn xml_tag_values(xml: &str, tag: &str) -> Vec<String> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut values = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else { break };
+        values.push(after[..end].trim().to_string());
+        rest = &after[end + close.len()..];
+    }
+    values
+}
+
+/// Total messages in an SQS queue from a `GetQueueAttributes` response that
+/// requested the visible, in-flight and delayed counts. `None` if the
+/// response has no parseable counts, which callers treat as "not empty".
+#[cfg(any(target_arch = "wasm32", test))]
+fn queue_message_count(get_queue_attributes_xml: &str) -> Option<u64> {
+    let counts: Vec<u64> = xml_tag_values(get_queue_attributes_xml, "Value")
+        .iter()
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    (!counts.is_empty()).then(|| counts.iter().sum())
+}
+
+/// Top-level string or number field of a JSON object, as a string.
+///
+/// AWS JSON APIs aren't guaranteed to be compact, and some fields are numbers
+/// (e.g. Secrets Manager `DeletionDate`), so parse properly rather than
+/// substring-matching `"key":"`.
+#[cfg(any(target_arch = "wasm32", test))]
+fn json_str_field(json: &str, key: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    match value.get(key)? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// `BackupPlanId` of the plan named `plan_name` in a `ListBackupPlans` response.
+#[cfg(any(target_arch = "wasm32", test))]
+fn backup_plan_id(list_backup_plans_json: &str, plan_name: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(list_backup_plans_json).ok()?;
+    value
+        .get("BackupPlansList")?
+        .as_array()?
+        .iter()
+        .find(|plan| plan.get("BackupPlanName").and_then(|n| n.as_str()) == Some(plan_name))?
+        .get("BackupPlanId")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Deployment annotations `provision()` stamps for an SQS queue so `apply()`
+/// keeps the queue and its `deckwatch-sqs-access` policy reconciled.
+///
+/// `queue_name` is the name as provisioned, before the `.fifo` suffix;
+/// `apply()` adds the suffix from the `fifo` flag.
+#[cfg(any(target_arch = "wasm32", test))]
+fn sqs_apply_annotations(
+    app: &str,
+    queue_name: &str,
+    fifo: bool,
+    visibility_timeout: u32,
+    retention_days: u32,
+    role_name: &str,
+) -> std::collections::HashMap<String, String> {
+    [
+        ("sqs.deckwatch.io/enabled", "true".to_string()),
+        ("sqs.deckwatch.io/queue-name", queue_name.to_string()),
+        ("sqs.deckwatch.io/fifo", fifo.to_string()),
+        (
+            "sqs.deckwatch.io/visibility-timeout",
+            visibility_timeout.to_string(),
+        ),
+        (
+            "sqs.deckwatch.io/retention-days",
+            retention_days.to_string(),
+        ),
+        ("aws.deckwatch.io/app-name", app.to_string()),
+        ("aws.deckwatch.io/role-name", role_name.to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+/// Deployment annotations `provision()` stamps for a Secrets Manager secret.
+///
+/// Grants access by ARN (`secret-arns`) rather than `enabled`, so `apply()`
+/// re-asserts `deckwatch-secretsmanager-access` without ever creating a secret.
+#[cfg(any(target_arch = "wasm32", test))]
+fn secretsmanager_apply_annotations(
+    app: &str,
+    secret_arn: &str,
+    role_name: &str,
+) -> std::collections::HashMap<String, String> {
+    [
+        ("secretsmanager.deckwatch.io/secret-arns", secret_arn),
+        ("aws.deckwatch.io/app-name", app),
+        ("aws.deckwatch.io/role-name", role_name),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
 /// Deployment annotations `provision()` stamps for an S3 resource so `apply()`
 /// treats S3 as enabled on reconcile and re-attaches the bucket policy to the
 /// same role the application's ServiceAccount is bound to.
@@ -1145,6 +1381,9 @@ fn apply_with_aws(
     let rds_endpoint = if let Some(ref rds_cfg) = cfg.rds {
         match rds::ensure_instance(rds_cfg, creds) {
             Ok(instance) => {
+                for warning in &instance.warnings {
+                    log!(LogLevel::Warn, "deckwatch-plugin-aws: {warning}");
+                }
                 // rds-db:connect is scoped to the DbiResourceId, which is only
                 // known once the instance exists; the next reconcile attaches it.
                 if rds_cfg.iam_auth && !instance.resource_id.is_empty() {
@@ -1373,10 +1612,11 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "AWS_ACCESS_KEY_ID".into(), label: "Access Key ID".into(), description: "Static AWS access key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_ACCESS_KEY_ID".into()) },
             ConfigField { key: "AWS_SECRET_ACCESS_KEY".into(), label: "Secret Access Key".into(), description: "Static AWS secret key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SECRET_ACCESS_KEY".into()) },
             ConfigField { key: "AWS_SESSION_TOKEN".into(), label: "Session Token".into(), description: "Temporary session token for assumed-role or SSO credentials. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SESSION_TOKEN".into()) },
-            ConfigField { key: "RDS_SKIP_FINAL_SNAPSHOT".into(), label: "Skip RDS Final Snapshot".into(), description: "Set to true to skip the final snapshot when deleting an RDS instance. Default: false (snapshot is always taken).".into(), field_type: ConfigFieldType::Bool, default: Some("false".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "RDS_DEFAULT_SUBNET_GROUP".into(), label: "RDS Default Subnet Group".into(), description: "DB subnet group name for all provisioned RDS instances. Required to place instances in the correct VPC.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "RDS_DEFAULT_SECURITY_GROUPS".into(), label: "RDS Default Security Groups".into(), description: "Comma-separated VPC security group IDs applied to all provisioned RDS instances.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "RDS_DEFAULT_IAM_AUTH".into(), label: "RDS IAM Auth by Default".into(), description: "Enable IAM database authentication on all provisioned RDS instances. Default: true.".into(), field_type: ConfigFieldType::Bool, default: Some("true".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "RDS_BACKUP_RETENTION_DAYS".into(), label: "RDS Backup Retention (days)".into(), description: "Days of automated backups (point-in-time recovery) to keep for RDS instances, 1-35. Existing instances below this are raised on reconcile; never lowered. Default: 14.".into(), field_type: ConfigFieldType::String, default: Some("14".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "RDS_BACKUP_WINDOW".into(), label: "RDS Backup Window".into(), description: "Daily automated-backup window for new RDS instances, hh24:mi-hh24:mi in UTC (at least 30 minutes). Empty lets RDS choose.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "DB_BOOTSTRAP_AWSCLI_IMAGE".into(), label: "DB Bootstrap AWS CLI Image".into(), description: "Image for the init container that reads the RDS master secret when creating the IAM database user.".into(), field_type: ConfigFieldType::String, default: Some(DEFAULT_BOOTSTRAP_AWSCLI_IMAGE.into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "DB_BOOTSTRAP_PSQL_IMAGE".into(), label: "DB Bootstrap psql Image".into(), description: "Image with psql used to create the IAM database user. Match or exceed the RDS engine major version.".into(), field_type: ConfigFieldType::String, default: Some(DEFAULT_BOOTSTRAP_PSQL_IMAGE.into()), required: false, options: vec![], env_source: None },
         ],
@@ -1606,6 +1846,62 @@ pub fn secretsmanager_resource() -> PluginResource {
 
 // ── WASM entry point: provision ───────────────────────────────────────────────
 
+/// Bind a provisioned resource to the application's workload identity.
+///
+/// Ensures the app role `<ns>-<app>-rds` exists and trusts `<app>-aws-sa`,
+/// runs `attach` to put the resource's inline policy on it, and emits the
+/// ServiceAccount. Records `<state_prefix>_ROLE_ARN` and `<state_prefix>_SA_NAME`.
+/// Failures become warnings: the resource itself still exists, and the next
+/// reconcile (via the stamped annotations) retries the grant.
+///
+/// Returns the role name, for the caller's apply() annotations.
+#[cfg(target_arch = "wasm32")]
+fn bind_workload_identity(
+    req: &ResourceProvisionRequest,
+    creds: &AwsCredentials,
+    result: &mut ResourceProvisionResult,
+    state_prefix: &str,
+    what: &str,
+    attach: impl FnOnce(&str) -> Result<(), String>,
+) -> String {
+    let role_name = rds_role_name(&req.namespace, &req.application_name);
+    let sa_name = workload_sa_name(&req.application_name);
+    match iam::ensure_role(&role_name, &req.namespace, &sa_name, creds) {
+        Ok(role_arn) => {
+            if let Err(e) = attach(&role_name) {
+                log!(
+                    LogLevel::Warn,
+                    "deckwatch-plugin-aws: attach access policy for {what}: {e}"
+                );
+                result.warnings.push(format!(
+                    "attach access policy for {what} to {role_name}: {e}"
+                ));
+            }
+            result
+                .state
+                .insert(format!("{state_prefix}_ROLE_ARN"), role_arn.clone());
+            result
+                .state
+                .insert(format!("{state_prefix}_SA_NAME"), sa_name.clone());
+            result.kubernetes_resources.push(service_account_yaml(
+                &sa_name,
+                &role_arn,
+                &req.namespace,
+            ));
+        }
+        Err(e) => {
+            log!(
+                LogLevel::Warn,
+                "deckwatch-plugin-aws: ensure_role for {what}: {e}"
+            );
+            result.warnings.push(format!(
+                "IAM role {role_name} not created; pods cannot access {what} until it exists: {e}"
+            ));
+        }
+    }
+    role_name
+}
+
 /// Provision a single infrastructure resource on behalf of an application.
 ///
 /// Called by deckwatch when an operator submits the provisioning form for a
@@ -1696,6 +1992,7 @@ pub fn provision(
 
             match rds::ensure_instance(&cfg, &creds) {
                 Ok(instance) => {
+                    result.warnings.extend(instance.warnings.iter().cloned());
                     let port = engine_port(&engine).to_string();
                     let endpoint = instance.endpoint.clone();
                     let resource_id = instance.resource_id.clone();
@@ -1837,41 +2134,16 @@ pub fn provision(
             match s3::ensure_bucket(&cfg, &full_bucket, &creds) {
                 Ok(()) => {
                     // Grant the application's workload role access to the bucket.
-                    // This is the same role (and ServiceAccount) RDS provisioning
-                    // uses, so an application has one identity for all resources.
-                    let role_name = rds_role_name(&req.namespace, &req.application_name);
-                    let sa_name = workload_sa_name(&req.application_name);
-                    match iam::ensure_role(&role_name, &req.namespace, &sa_name, &creds) {
-                        Ok(role_arn) => {
-                            if let Err(e) =
-                                iam::attach_s3_policy(&role_name, &full_bucket, &region, &creds)
-                            {
-                                log!(
-                                    LogLevel::Warn,
-                                    "deckwatch-plugin-aws: attach_s3_policy: {e}"
-                                );
-                                result.warnings.push(format!(
-                                    "attach S3 access policy for {full_bucket} to {role_name}: {e}"
-                                ));
-                            }
-                            result.state.insert("S3_ROLE_ARN".into(), role_arn.clone());
-                            result.state.insert("S3_SA_NAME".into(), sa_name.clone());
-                            result.kubernetes_resources.push(service_account_yaml(
-                                &sa_name,
-                                &role_arn,
-                                &req.namespace,
-                            ));
-                        }
-                        Err(e) => {
-                            log!(
-                                LogLevel::Warn,
-                                "deckwatch-plugin-aws: ensure_role for S3: {e}"
-                            );
-                            result.warnings.push(format!(
-                                "IAM role {role_name} not created; pods cannot access {full_bucket} until it exists: {e}"
-                            ));
-                        }
-                    }
+                    // Same role and ServiceAccount as every other resource of the
+                    // app, so an application has one identity.
+                    let role_name = bind_workload_identity(
+                        &req,
+                        &creds,
+                        &mut result,
+                        "S3",
+                        &format!("S3 bucket {full_bucket}"),
+                        |role| iam::attach_s3_policy(role, &full_bucket, &region, &creds),
+                    );
 
                     result.state.insert("S3_BUCKET".into(), full_bucket.clone());
                     result.state.insert("S3_REGION".into(), region.clone());
@@ -1922,7 +2194,7 @@ pub fn provision(
                 .unwrap_or(4);
 
             let cfg = SqsConfig {
-                queue_name,
+                queue_name: queue_name.clone(),
                 fifo,
                 visibility_timeout,
                 retention_days,
@@ -1936,8 +2208,26 @@ pub fn provision(
                         .next_back()
                         .unwrap_or("")
                         .to_string();
+                    let role_name = bind_workload_identity(
+                        &req,
+                        &creds,
+                        &mut result,
+                        "SQS",
+                        &format!("SQS queue {name}"),
+                        |role| iam::attach_sqs_policy(role, &info.queue_arn, &creds),
+                    );
                     result.state.insert("QUEUE_URL".into(), info.queue_url);
                     result.state.insert("QUEUE_NAME".into(), name);
+                    // Enable SQS for apply() so every reconcile re-asserts the
+                    // queue policy on the same role and binds pods to the SA.
+                    result.deployment_annotations.extend(sqs_apply_annotations(
+                        &req.application_name,
+                        &queue_name,
+                        fifo,
+                        visibility_timeout,
+                        retention_days,
+                        &role_name,
+                    ));
                 }
                 Err(e) => {
                     result.errors.push(format!("SQS provisioning error: {e}"));
@@ -1957,6 +2247,29 @@ pub fn provision(
             );
             match secretsmanager::ensure_secret(&secret_name, &desc, &creds) {
                 Ok(arn) => {
+                    let role_name = bind_workload_identity(
+                        &req,
+                        &creds,
+                        &mut result,
+                        "SM",
+                        &format!("secret {secret_name}"),
+                        |role| {
+                            iam::attach_secretsmanager_policy(
+                                role,
+                                std::slice::from_ref(&arn),
+                                &creds,
+                            )
+                        },
+                    );
+                    // Grant-only annotation: apply() re-asserts read access to
+                    // this ARN and never creates a secret.
+                    result
+                        .deployment_annotations
+                        .extend(secretsmanager_apply_annotations(
+                            &req.application_name,
+                            &arn,
+                            &role_name,
+                        ));
                     result.state.insert("SM_SECRET_ARN".into(), arn);
                     result.state.insert("SM_SECRET_NAME".into(), secret_name);
                 }
@@ -1975,14 +2288,20 @@ pub fn provision(
     Ok(Json(result))
 }
 
-/// Clean up provisioned resources before deckwatch removes the DB record.
+/// Clean up a provisioned resource before deckwatch removes its record.
 ///
-/// - **RDS**: disables deletion protection, optionally takes a final snapshot
-///   (default: yes), then deletes the instance. Set `RDS_SKIP_FINAL_SNAPSHOT=true`
-///   in plugin config to skip the snapshot.
-/// - **S3**: leaves the bucket intact — non-empty buckets cannot be deleted without
-///   enumerating and removing all objects. Deckwatch records are removed; the bucket
-///   remains in AWS and can be cleaned up manually or via a lifecycle rule.
+/// Data is never destroyed without a recovery path:
+/// - **RDS**: always takes a final snapshot (`<identifier>-final-<timestamp>`),
+///   then deletes the instance.
+/// - **S3**: S3 has no snapshots, so the bucket and its objects are kept.
+/// - **SQS**: messages can't be snapshotted, so a queue that still holds
+///   messages is kept. Only an empty queue is deleted.
+/// - **Secrets Manager**: deletion is scheduled with a 30-day recovery window.
+///
+/// Afterwards the resource's inline policy is removed from the workload role,
+/// and the role is deleted once nothing is left on it. If the resource itself
+/// was kept because deletion failed or was refused, the application keeps its
+/// access, so it can still reach (for example, drain) the resource.
 #[cfg(target_arch = "wasm32")]
 #[plugin_fn]
 pub fn deprovision(
@@ -1999,79 +2318,100 @@ pub fn deprovision(
         }
     };
 
-    let skip_snapshot = config::get("RDS_SKIP_FINAL_SNAPSHOT")
-        .ok()
-        .flatten()
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    let mut notes: Vec<String> = Vec::new();
 
-    match req.resource_id.as_str() {
+    // Whether the workload's IAM access to this resource should be revoked.
+    let revoke_access = match req.resource_id.as_str() {
         "rds" => {
-            // Derive the identifier — same logic as provision(): from state, then
-            // from fields, then fall back to the default naming convention.
+            // Same identifier logic as provision(): fields, then the default.
             let identifier = req
                 .state
                 .get("DB_IDENTIFIER")
                 .or_else(|| req.fields.get("identifier"))
+                .filter(|s| !s.is_empty())
                 .cloned()
-                .unwrap_or_else(|| format!("{}-{}-db", req.namespace, req.application_name));
-
-            let snapshot_msg = if skip_snapshot {
-                "no final snapshot (RDS_SKIP_FINAL_SNAPSHOT=true)".to_string()
-            } else {
-                format!("final snapshot: {identifier}-final")
-            };
-
-            match rds::delete_instance(&identifier, skip_snapshot, &creds) {
-                Ok(()) => {
-                    result.message =
-                        format!("RDS instance '{identifier}' deleted ({snapshot_msg}).");
+                .unwrap_or_else(|| default_rds_identifier(&req.namespace, &req.application_name));
+            let snapshot_id =
+                final_snapshot_identifier(&identifier, &aws_sign::utc_now_iso8601(&creds.region));
+            match rds::delete_instance(&identifier, &snapshot_id, &creds) {
+                Ok(true) => {
+                    notes.push(format!(
+                        "RDS instance '{identifier}' deleted after final snapshot '{snapshot_id}'."
+                    ));
+                    true
+                }
+                Ok(false) => {
+                    notes.push(format!("RDS instance '{identifier}' was already gone."));
+                    true
                 }
                 Err(e) => {
                     result.errors.push(format!("delete_instance failed: {e}"));
-                    result.message = format!(
-                        "RDS instance '{identifier}' could not be deleted — manual cleanup required."
-                    );
+                    notes.push(format!(
+                        "RDS instance '{identifier}' was NOT deleted; the application keeps its access."
+                    ));
+                    false
                 }
             }
         }
         "s3" => {
-            // S3 buckets with objects cannot be deleted without listing and removing
-            // every object. We intentionally leave the bucket in place and tell the
-            // operator what to do.
             let bucket = req
                 .state
                 .get("S3_BUCKET")
                 .or_else(|| req.fields.get("bucket_name"))
                 .cloned()
                 .unwrap_or_default();
-
-            result.message = format!(
-                "S3 bucket '{bucket}' was NOT deleted — non-empty buckets must be \
-                 emptied manually before deletion. Use the AWS console, CLI \
-                 (`aws s3 rm s3://{bucket} --recursive`), or configure a bucket \
-                 lifecycle rule to expire objects."
-            );
+            notes.push(format!(
+                "S3 bucket '{bucket}' and its objects were kept (S3 has no snapshots). \
+                 Delete it manually when it's no longer needed: \
+                 `aws s3 rm s3://{bucket} --recursive && aws s3 rb s3://{bucket}`."
+            ));
+            true
         }
         "sqs" => {
             let queue_url = req.state.get("QUEUE_URL").cloned().unwrap_or_default();
-
             if queue_url.is_empty() {
-                result.message =
-                    "SQS queue URL not found in provisioned state — cannot delete.".into();
+                notes.push("SQS queue URL not found in provisioned state; nothing deleted.".into());
+                true
             } else {
-                match sqs::delete_queue(&queue_url, &creds) {
-                    Ok(()) => {
-                        result.message = format!(
-                            "SQS queue '{queue_url}' deleted. Note: the queue name cannot be \
-                             reused for 60 seconds after deletion."
-                        );
+                match sqs::queue_message_count(&queue_url, &creds) {
+                    Ok(0) => match sqs::delete_queue(&queue_url, &creds) {
+                        Ok(()) => {
+                            notes.push(format!(
+                                "Empty SQS queue '{queue_url}' deleted (its name can be reused after 60 seconds)."
+                            ));
+                            true
+                        }
+                        Err(e) if is_missing_queue_error(&e) => {
+                            notes.push(format!("SQS queue '{queue_url}' was already gone."));
+                            true
+                        }
+                        Err(e) => {
+                            result.errors.push(format!("SQS DeleteQueue failed: {e}"));
+                            notes.push(format!(
+                                "SQS queue '{queue_url}' was NOT deleted; the application keeps its access."
+                            ));
+                            false
+                        }
+                    },
+                    Ok(n) => {
+                        notes.push(format!(
+                            "SQS queue '{queue_url}' still holds {n} message(s), so it was kept \
+                             along with the application's access. Drain it, then delete it manually."
+                        ));
+                        false
+                    }
+                    Err(e) if is_missing_queue_error(&e) => {
+                        notes.push(format!("SQS queue '{queue_url}' was already gone."));
+                        true
                     }
                     Err(e) => {
-                        result.errors.push(format!("SQS DeleteQueue failed: {e}"));
-                        result.message = format!(
-                            "SQS queue '{queue_url}' could not be deleted — manual cleanup required."
-                        );
+                        result
+                            .errors
+                            .push(format!("could not check SQS queue for messages: {e}"));
+                        notes.push(format!(
+                            "SQS queue '{queue_url}' was kept because it couldn't be confirmed empty."
+                        ));
+                        false
                     }
                 }
             }
@@ -2082,31 +2422,137 @@ pub fn deprovision(
                 .get("SM_SECRET_NAME")
                 .or_else(|| req.fields.get("secret_name"))
                 .cloned()
-                .unwrap_or_else(|| format!("{}/{}", req.namespace, req.application_name));
-
+                .unwrap_or_else(|| default_secret_name(&req.namespace, &req.application_name));
             match secretsmanager::schedule_delete_secret(&secret_name, 30, &creds) {
                 Ok(deletion_date) => {
-                    result.message = format!(
-                        "Secret '{secret_name}' scheduled for deletion on {deletion_date}. \
-                         It can be restored from the AWS console within the 30-day recovery window."
-                    );
+                    notes.push(format!(
+                        "Secret '{secret_name}' scheduled for deletion on {deletion_date}; \
+                         restore it within the 30-day recovery window if needed."
+                    ));
+                    true
                 }
                 Err(e) => {
                     result
                         .errors
                         .push(format!("Secrets Manager DeleteSecret failed: {e}"));
-                    result.message = format!(
-                        "Secret '{secret_name}' could not be scheduled for deletion — manual cleanup required."
-                    );
+                    notes.push(format!(
+                        "Secret '{secret_name}' was NOT scheduled for deletion; the application keeps its access."
+                    ));
+                    false
                 }
             }
         }
         other => {
             result.errors.push(format!("unknown resource_id: {other}"));
+            return Ok(Json(result));
         }
+    };
+
+    if revoke_access {
+        revoke_workload_access(&req, &creds, &mut result, &mut notes);
     }
 
+    result.message = notes.join(" ");
     Ok(Json(result))
+}
+
+/// Remove the resource's inline policy from the app's workload role, then
+/// delete the role if nothing is left on it. For RDS, also remove the DB
+/// bootstrap Job's role, which exists only to read that instance's secret.
+#[cfg(target_arch = "wasm32")]
+fn revoke_workload_access(
+    req: &ResourceDeprovisionRequest,
+    creds: &AwsCredentials,
+    result: &mut ResourceDeprovisionResult,
+    notes: &mut Vec<String>,
+) {
+    let role = rds_role_name(&req.namespace, &req.application_name);
+    if let Some(policy) = resource_policy_name(&req.resource_id) {
+        match iam::delete_role_policy(&role, policy, creds) {
+            Ok(true) => notes.push(format!("Removed policy {policy} from IAM role {role}.")),
+            Ok(false) => {}
+            Err(e) => {
+                result
+                    .errors
+                    .push(format!("remove policy {policy} from {role}: {e}"));
+                return;
+            }
+        }
+    }
+    if delete_role_if_unused(&role, creds, result, notes) {
+        notes.push(format!(
+            "ServiceAccount {}-aws-sa still exists and now refers to a deleted role; \
+             delete it with kubectl (deckwatch can't yet remove Kubernetes objects for plugins).",
+            req.application_name
+        ));
+    }
+
+    if req.resource_id == "rds" {
+        let bootstrap = bootstrap_role_name(&req.namespace, &req.application_name);
+        match iam::list_role_policies(&bootstrap, creds) {
+            Ok(Some(policies)) => {
+                for policy in &policies {
+                    if let Err(e) = iam::delete_role_policy(&bootstrap, policy, creds) {
+                        result
+                            .errors
+                            .push(format!("remove policy {policy} from {bootstrap}: {e}"));
+                        return;
+                    }
+                }
+                delete_role_if_unused(&bootstrap, creds, result, notes);
+            }
+            Ok(None) => {}
+            Err(e) => result
+                .errors
+                .push(format!("list policies on {bootstrap}: {e}")),
+        }
+    }
+}
+
+/// Delete `role` if it has no inline or attached policies left. Returns true
+/// if it was deleted.
+#[cfg(target_arch = "wasm32")]
+fn delete_role_if_unused(
+    role: &str,
+    creds: &AwsCredentials,
+    result: &mut ResourceDeprovisionResult,
+    notes: &mut Vec<String>,
+) -> bool {
+    let inline = match iam::list_role_policies(role, creds) {
+        Ok(Some(policies)) => policies,
+        Ok(None) => return false,
+        Err(e) => {
+            result.errors.push(format!("list policies on {role}: {e}"));
+            return false;
+        }
+    };
+    let attached = match iam::list_attached_role_policy_arns(role, creds) {
+        Ok(arns) => arns,
+        Err(e) => {
+            result
+                .errors
+                .push(format!("list attached policies on {role}: {e}"));
+            return false;
+        }
+    };
+    if !role_is_disposable(&inline, &attached) {
+        notes.push(format!(
+            "Kept IAM role {role}: {} other policy(ies) still attached.",
+            inline.len() + attached.len()
+        ));
+        return false;
+    }
+    match iam::delete_role(role, creds) {
+        Ok(true) => {
+            notes.push(format!("Deleted IAM role {role} (no policies left)."));
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            result.errors.push(format!("delete IAM role {role}: {e}"));
+            false
+        }
+    }
 }
 
 /// Provision AWS resources and return env vars / Kubernetes resources for the
@@ -2566,6 +3012,199 @@ mod tests {
             rds_instance_arn("us-east-1", "123456789012", "app-db"),
             "arn:aws:rds:us-east-1:123456789012:db:app-db"
         );
+    }
+
+    // ── JSON response parsing (Secrets Manager, AWS Backup) ────────────────────
+
+    // Previously a `"key":"` substring match, which failed on valid JSON with
+    // whitespace (moto's responses) and on numeric fields like DeletionDate.
+    #[test]
+    fn json_str_field_tolerates_whitespace_and_numbers() {
+        let compact = r#"{"ARN":"arn:aws:secretsmanager:us-east-1:123456789012:secret:myapp-AbCdEf","Name":"myapp"}"#;
+        let spaced = r#"{"ARN": "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:x-Ab", "Name": "x"}"#;
+        assert_eq!(
+            json_str_field(compact, "ARN").as_deref(),
+            Some("arn:aws:secretsmanager:us-east-1:123456789012:secret:myapp-AbCdEf")
+        );
+        assert_eq!(
+            json_str_field(spaced, "ARN").as_deref(),
+            Some("arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:x-Ab")
+        );
+        assert_eq!(
+            json_str_field(r#"{"DeletionDate": 1767225600.0}"#, "DeletionDate").as_deref(),
+            Some("1767225600.0")
+        );
+        assert_eq!(json_str_field(r#"{"Name":"myapp"}"#, "ARN"), None);
+        assert_eq!(json_str_field("not json", "ARN"), None);
+    }
+
+    #[test]
+    fn backup_plan_id_finds_the_named_plan() {
+        let json = r#"{"BackupPlansList": [
+            {"BackupPlanId": "aaa", "BackupPlanName": "other-backup", "AdvancedBackupSettings": [{"x": {}}]},
+            {"BackupPlanId": "bbb111", "BackupPlanName": "mydb-backup", "VersionId": "v1"}
+        ]}"#;
+        assert_eq!(
+            backup_plan_id(json, "mydb-backup").as_deref(),
+            Some("bbb111")
+        );
+        assert_eq!(backup_plan_id(json, "missing-backup"), None);
+        assert_eq!(
+            backup_plan_id(r#"{"BackupPlansList":[]}"#, "mydb-backup"),
+            None
+        );
+    }
+
+    // ── Provisioning grants and safe deprovisioning ─────────────────────────
+
+    // SQS provisioning stamps annotations that apply() parses back into the
+    // same queue, so reconciles keep the queue policy on the app role.
+    #[test]
+    fn sqs_apply_annotations_round_trip_through_apply() {
+        let role = rds_role_name("orders", "orders");
+        let anns = sqs_apply_annotations("orders", "orders-events", true, 45, 7, &role);
+        let pairs: Vec<(&str, &str)> = anns.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let cfg = AwsConfig::from_context(&ctx(&pairs));
+
+        assert!(cfg.enabled);
+        assert_eq!(cfg.role_name, "orders-orders-rds");
+        assert_eq!(cfg.app_name, "orders");
+        let sqs = cfg.sqs.expect("apply() must see SQS as enabled");
+        assert_eq!(sqs.queue_name, "orders-events");
+        assert!(sqs.fifo);
+        assert_eq!(sqs.visibility_timeout, 45);
+        assert_eq!(sqs.retention_days, 7);
+        // apply() adds the .fifo suffix itself, matching the provisioned queue.
+        assert_eq!(
+            find_env(&apply_inner(&ctx(&pairs), ""), "QUEUE_NAME"),
+            Some("orders-events.fifo")
+        );
+    }
+
+    // Secrets Manager provisioning grants by ARN and must never make apply()
+    // create a secret of its own.
+    #[test]
+    fn secretsmanager_apply_annotations_grant_without_creating() {
+        let arn =
+            "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:orders/orders-AbCdEf";
+        let anns = secretsmanager_apply_annotations("orders", arn, "orders-orders-rds");
+        let pairs: Vec<(&str, &str)> = anns.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let cfg = AwsConfig::from_context(&ctx(&pairs));
+
+        assert_eq!(cfg.role_name, "orders-orders-rds");
+        let sm = cfg
+            .secretsmanager
+            .expect("apply() must see Secrets Manager access");
+        assert_eq!(sm.secret_arns, vec![arn.to_string()]);
+        assert!(
+            !sm.create_secret,
+            "grant-only annotations must not create a secret"
+        );
+    }
+
+    #[test]
+    fn every_provisionable_resource_has_a_policy_to_remove() {
+        assert_eq!(resource_policy_name("rds"), Some("deckwatch-rds-connect"));
+        assert_eq!(resource_policy_name("s3"), Some("deckwatch-s3-access"));
+        assert_eq!(resource_policy_name("sqs"), Some("deckwatch-sqs-access"));
+        assert_eq!(
+            resource_policy_name("secretsmanager"),
+            Some("deckwatch-secretsmanager-access")
+        );
+        assert_eq!(resource_policy_name("unknown"), None);
+    }
+
+    // The role is shared by every resource of the app; it may only go once
+    // nothing at all is left on it.
+    #[test]
+    fn role_is_disposable_only_when_nothing_is_left() {
+        let none: Vec<String> = vec![];
+        assert!(role_is_disposable(&none, &none));
+        assert!(!role_is_disposable(
+            &["deckwatch-rds-connect".into()],
+            &none
+        ));
+        assert!(!role_is_disposable(
+            &none,
+            &["arn:aws:iam::aws:policy/ReadOnlyAccess".into()]
+        ));
+    }
+
+    // RDS's API default is 1 day of automated backups. The plugin's default
+    // is 14 days, and it can never be configured to disable backups.
+    #[test]
+    fn backup_retention_defaults_to_14_days_and_is_clamped() {
+        assert_eq!(parse_backup_retention_days(None), 14);
+        assert_eq!(parse_backup_retention_days(Some("")), 14);
+        assert_eq!(parse_backup_retention_days(Some("garbage")), 14);
+        assert_eq!(
+            parse_backup_retention_days(Some("0")),
+            14,
+            "never disable backups"
+        );
+        assert_eq!(parse_backup_retention_days(Some(" 7 ")), 7);
+        assert_eq!(parse_backup_retention_days(Some("35")), 35);
+        assert_eq!(parse_backup_retention_days(Some("90")), 35, "RDS maximum");
+    }
+
+    // Existing instances are only ever raised; disabled backups are surfaced
+    // rather than re-enabled mid-reconcile (that can cause an outage).
+    #[test]
+    fn retention_action_only_raises_nonzero_retention() {
+        assert_eq!(retention_action(1, 14), RetentionAction::Raise(14));
+        assert_eq!(retention_action(13, 14), RetentionAction::Raise(14));
+        assert_eq!(retention_action(14, 14), RetentionAction::Keep);
+        assert_eq!(
+            retention_action(30, 14),
+            RetentionAction::Keep,
+            "never lowered"
+        );
+        assert_eq!(retention_action(0, 14), RetentionAction::WarnDisabled);
+    }
+
+    #[test]
+    fn final_snapshot_identifier_is_timestamped_and_valid() {
+        assert_eq!(
+            final_snapshot_identifier("ampere-db", "20261124T170503Z"),
+            "ampere-db-final-20261124-170503"
+        );
+        // Unique per deletion, so a re-created instance can be deleted again.
+        assert_ne!(
+            final_snapshot_identifier("ampere-db", "20261124T170503Z"),
+            final_snapshot_identifier("ampere-db", "20261125T090000Z")
+        );
+        // Never ends with a hyphen and stays within RDS's 255-char limit.
+        let long = final_snapshot_identifier(&"a".repeat(300), "20261124T170503Z");
+        assert!(long.len() <= 255 && !long.ends_with('-'));
+    }
+
+    #[test]
+    fn xml_tag_values_returns_every_element_in_order() {
+        let xml = "<PolicyNames><member>deckwatch-s3-access</member><member>deckwatch-sqs-access</member></PolicyNames>";
+        assert_eq!(
+            xml_tag_values(xml, "member"),
+            vec!["deckwatch-s3-access", "deckwatch-sqs-access"]
+        );
+        assert!(xml_tag_values("<PolicyNames/>", "member").is_empty());
+    }
+
+    // A queue is only "empty" when every count is zero; an unparseable
+    // response must never be mistaken for an empty queue.
+    #[test]
+    fn queue_message_count_sums_visible_inflight_and_delayed() {
+        let xml = |a: u64, b: u64, c: u64| {
+            format!(
+                "<GetQueueAttributesResult>\
+                 <Attribute><Name>ApproximateNumberOfMessages</Name><Value>{a}</Value></Attribute>\
+                 <Attribute><Name>ApproximateNumberOfMessagesNotVisible</Name><Value>{b}</Value></Attribute>\
+                 <Attribute><Name>ApproximateNumberOfMessagesDelayed</Name><Value>{c}</Value></Attribute>\
+                 </GetQueueAttributesResult>"
+            )
+        };
+        assert_eq!(queue_message_count(&xml(0, 0, 0)), Some(0));
+        assert_eq!(queue_message_count(&xml(0, 2, 0)), Some(2));
+        assert_eq!(queue_message_count(&xml(3, 1, 1)), Some(5));
+        assert_eq!(queue_message_count("<Error>throttled</Error>"), None);
     }
 
     // ── S3 IAM policy wiring ──────────────────────────────────────────────────

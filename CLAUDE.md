@@ -32,13 +32,15 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
    (the old SQS tests never ran). Gate helpers with
    `#[cfg(any(target_arch = "wasm32", test))]` and call them as `crate::…`.
 3. **`provision()` must stamp the annotations `apply()` needs**
-   (`rds_apply_annotations`, `s3_apply_annotations`), or reconciliation never picks
+   (`rds_apply_annotations`, `s3_apply_annotations`, `sqs_apply_annotations`,
+   `secretsmanager_apply_annotations`), or reconciliation never picks
    the resource up. Stamp names *without* `BUCKET_PREFIX`; `apply()` adds it.
 4. **Grant IAM when you create a resource.** Creating a bucket or queue without
    attaching the matching inline policy to the app role leaves the workload with
-   `AccessDenied`. The role is `rds_role_name(ns, app)` (`<ns>-<app>-rds`, a
-   historical name; don't rename it). Provisioned SQS and Secrets Manager still
-   don't grant access; that's a known gap.
+   `AccessDenied`. Use `bind_workload_identity()` in `provision()`: it ensures the
+   role `rds_role_name(ns, app)` (`<ns>-<app>-rds`, a historical name; don't rename
+   it), attaches the policy and emits the ServiceAccount. Policy names are the
+   `POLICY_*` constants, one per resource type.
 5. **"Not found" is often an HTTP 4xx.** Map it to `Ok(None)` before propagating
    errors (IAM `NoSuchEntity`, SQS `NonExistentQueue`). Include the AWS error `Code`
    in error strings so these checks have something to match.
@@ -49,6 +51,16 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
    `inherit_env_file_keys`).
 8. **Every outgoing URL goes through `service_endpoint()`**, so `AWS_ENDPOINT_URL` can
    redirect it in tests. A malformed override must fail, never fall back to AWS.
+9. **Deprovisioning never destroys data without a recovery path.** RDS always takes a
+   final snapshot (there's no skip option) and keeps its automated backups, S3
+   buckets are kept, SQS queues with messages are kept, and secrets keep their
+   recovery window. RDS automated-backup retention defaults to 14 days and is only
+   ever raised on reconcile, never lowered or disabled. Revoke IAM only for
+   resources that were actually removed, and delete the role only when
+   `role_is_disposable()` says nothing is left on it.
+10. **Parse JSON with `serde_json`** (`json_str_field`), never with `"key":"`
+    substring matching. AWS doesn't promise compact JSON, and some fields are
+    numbers.
 
 ## Testing
 

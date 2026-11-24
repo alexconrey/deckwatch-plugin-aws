@@ -36,7 +36,9 @@ listed with their defaults.
 
 What gets created:
 - **An instance** that is encrypted (gp3), not publicly accessible, has **deletion
-  protection** on, uses 20 GiB of storage and is single-AZ. Its master user is
+  protection** on, uses 20 GiB of storage and is single-AZ. It has **daily automated
+  backups kept for `RDS_BACKUP_RETENTION_DAYS`** (default 14) with point-in-time
+  recovery, and snapshots copy the instance's tags. Its master user is
   `dbadmin`, with a password managed by RDS in Secrets Manager. It's placed using
   `RDS_DEFAULT_SUBNET_GROUP` and `RDS_DEFAULT_SECURITY_GROUPS`.
 - **Polling while it starts:** while the instance is being created, the state is
@@ -72,9 +74,12 @@ What gets created:
 | `visibility_timeout` | `30` | Seconds. |
 | `retention_days` | `4` | Days, at most 14. |
 
-Creates the queue. **Provisioning doesn't grant the workload IAM access to it.** Use
-the [`sqs.deckwatch.io/*` annotations](#sqs) to get the `deckwatch-sqs-access`
-policy. See [Known limitations](operations.md#known-limitations).
+What gets created:
+- The queue.
+- The `deckwatch-sqs-access` inline policy on the app's workload role,
+  `<namespace>-<app>-rds`.
+- The `<app>-aws-sa` ServiceAccount.
+- The `sqs.deckwatch.io/*` annotations, so every reconcile re-asserts the policy.
 
 ### Secrets Manager secret (`secretsmanager`)
 
@@ -82,9 +87,13 @@ policy. See [Known limitations](operations.md#known-limitations).
 |---|---|---|
 | `secret_name` | `<namespace>/<app>` | Name or path. |
 
-Creates an **empty** secret; populate the value yourself or from CI. Provisioning
-doesn't grant read access. Use
-[`secretsmanager.deckwatch.io/*` annotations](#secrets-manager) for that.
+What gets created:
+- An **empty** secret. Populate the value yourself or from CI.
+- The `deckwatch-secretsmanager-access` inline policy (`GetSecretValue` and
+  `DescribeSecret` on that secret) on the app's workload role.
+- The `<app>-aws-sa` ServiceAccount.
+- A `secretsmanager.deckwatch.io/secret-arns` annotation. It grants access without
+  `enabled`, so reconciles re-assert read access but never create another secret.
 
 ## Annotation reference
 
@@ -185,8 +194,8 @@ The pods run as `shop-aws-sa`, bound to the role `shop-shop-role`. That role has
 |---|---|
 | RDS | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_ENGINE`, `DB_STATUS` (`provisioning` / `available`), `DB_IAM_AUTH`, and the PostgreSQL-style aliases `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`. Provisioning also records `DB_ROLE_ARN` and `DB_SA_NAME`. |
 | S3 | `S3_BUCKET` (prefix applied), `S3_REGION`, `AWS_REGION`. Provisioning also records `S3_ROLE_ARN` and `S3_SA_NAME`. |
-| SQS | `QUEUE_URL`, `QUEUE_NAME` |
-| Secrets Manager | `SM_SECRET_ARN`, `SM_SECRET_NAME` |
+| SQS | `QUEUE_URL`, `QUEUE_NAME`. Provisioning also records `SQS_ROLE_ARN` and `SQS_SA_NAME`. |
+| Secrets Manager | `SM_SECRET_ARN`, `SM_SECRET_NAME`. Provisioning also records `SM_ROLE_ARN` and `SM_SA_NAME`. |
 
 `POSTGRES_USER` is the IAM database user (`<app>`) when IAM auth is on; otherwise it's
 the master user `dbadmin`. With IAM auth, generate a token at runtime instead of
