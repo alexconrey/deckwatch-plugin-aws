@@ -111,8 +111,8 @@ Set these keys in the plugin's `config`. Defaults come from the plugin's
 | `AWS_REGION` | `us-east-1` | Region for API calls and provisioned resources. Selects the partition: `us-gov-*` uses GovCloud endpoints and `arn:aws-us-gov` ARNs. |
 | `OIDC_PROVIDER_ARN` | *(none)* | ARN of the cluster's IAM OIDC provider, e.g. `arn:aws-us-gov:iam::<account>:oidc-provider/oidc.eks.us-gov-west-1.amazonaws.com/id/<id>`. **Required for IRSA:** without it, workload roles get an empty trust policy and pods can't assume them. |
 | `ROLE_PATH` | `/deckwatch-plugin/` | IAM path for every role the plugin creates. Must start and end with `/`. Scope the plugin's IAM permissions to this path. |
-| `BUCKET_PREFIX` | *(empty)* | Prepended to every S3 bucket name, e.g. `myorg-` turns `uploads` into `myorg-uploads`. |
-| `RESOURCE_NAME_PREFIX` | *(empty)* | Prepended to every SQS queue and Secrets Manager secret name, both defaults and names chosen in the UI, e.g. `acme-dw-` produces `acme-dw-<namespace>-<app>-queue`. It's never added twice. Set it so the plugin's IAM policy can be [scoped to `<prefix>*`](#scoping-sqs-and-secrets-manager-to-a-prefix) instead of every queue and secret in the account. |
+| `BUCKET_PREFIX` | *(empty)* | **Deprecated; use `RESOURCE_NAME_PREFIX`.** While set, it's still prepended to every S3 bucket name instead of `RESOURCE_NAME_PREFIX` (e.g. `myorg-` turns `uploads` into `myorg-uploads`), and provisioning warns. See [moving from `BUCKET_PREFIX`](#scoping-the-plugin-to-a-prefix). |
+| `RESOURCE_NAME_PREFIX` | *(empty)* | Prepended to the names of new SQS queues, Secrets Manager secrets and S3 buckets, both defaults and names chosen in the UI, e.g. `acme-dw-` produces `acme-dw-<namespace>-<app>-queue`. It's never added twice, and existing resources keep their names. Set it so the plugin's IAM policy can be [scoped to `<prefix>*`](#scoping-the-plugin-to-a-prefix) instead of every queue, secret and bucket in the account. |
 | `RESOURCE_TAGS` | *(empty)* | Tags applied to every AWS resource the plugin manages: IAM roles, RDS instances (and their snapshots), S3 buckets, SQS queues, secrets and backup plans. Write them as `Key=Value` pairs separated by commas or newlines, e.g. `Team=platform,CostCenter=1234`. A JSON object of string values (`{"Team":"platform"}`) is also accepted; that's how deckwatch will store the field once its row-per-tag editor ships. Validated against AWS's tag rules (at most 47 tags; no `aws:` or `deckwatch.io/` keys). See [Resource tags](#resource-tags). |
 
 ### Credentials
@@ -280,17 +280,42 @@ Notes:
 - **moto doesn't check IAM**, so the integration tests can't catch a missing
   permission. This list is maintained by hand from the API calls in `src/`.
 
-### Scoping SQS and Secrets Manager to a prefix
+### Scoping the plugin to a prefix
 
-Granting the SQS and Secrets Manager actions on every queue or secret would let
-deckwatch change unrelated ones, such as a Karpenter interruption queue or
-application credentials. Set `RESOURCE_NAME_PREFIX` (for example `acme-dw-`)
-instead, and scope those statements to `…:<prefix>*` as shown above. Every
-queue and secret the plugin creates carries the prefix, including names entered
-in the UI.
+Granting the SQS, Secrets Manager and S3 actions on every queue, secret or bucket
+would let deckwatch change unrelated ones, such as a Karpenter interruption
+queue, application credentials or another team's bucket. Set
+`RESOURCE_NAME_PREFIX` (for example `acme-dw-`) instead, and scope those
+statements to the prefix:
 
-Changing the prefix after queues or secrets exist makes reconciles create *new*
-prefixed resources for annotation-based queues, so choose it before first use.
+| Statement | Resource |
+|---|---|
+| `Sqs` | `arn:<partition>:sqs:*:<account>:<prefix>*` |
+| `SecretsManager` | `arn:<partition>:secretsmanager:*:<account>:secret:<prefix>*` |
+| `S3` | `arn:<partition>:s3:::<prefix>*`, plus each existing bucket (see below) |
+
+Every queue, secret and bucket the plugin creates carries the prefix, including
+names entered in the UI. For buckets, the prefix applies when `BUCKET_PREFIX` is
+empty, and only when it's a valid start of a bucket name: lowercase letters,
+digits, hyphens and dots, beginning with a letter or digit.
+
+**Existing resources keep their names.** If a queue, secret or bucket was created
+before the prefix was set, a refresh or reconcile finds it under its old,
+unprefixed name and keeps using it, and provisioning reports that. Only new
+resources get the prefix. Some caveats:
+
+- **The plugin must be able to read the old resources** (`sqs:GetQueueUrl`,
+  `secretsmanager:DescribeSecret`, `s3:GetBucketTagging`). Otherwise it can't
+  find them, and creates prefixed replacements instead. Before scoping a
+  statement to `<prefix>*`, add the existing resources to it explicitly.
+- **A secret kept under its old name stays readable** by the application, but
+  `PutSecretValue` is only granted on secrets under the prefix.
+- **Switching from one prefix to another isn't supported.** Existing resources
+  are found only under their unprefixed name or the current prefix.
+
+**Moving from `BUCKET_PREFIX`:** set `RESOURCE_NAME_PREFIX` to the same value,
+then clear `BUCKET_PREFIX`. The existing buckets' names already start with the
+prefix, so nothing changes for them.
 
 ## Resource tags
 

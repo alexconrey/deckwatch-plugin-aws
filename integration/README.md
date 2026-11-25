@@ -25,8 +25,12 @@ GovCloud regions:
   one goes.
 - **RDS:** new instances get 14-day backup retention, existing instances are
   raised on reconcile, and removal always takes a final snapshot.
-- **Naming and tags:** `RESOURCE_NAME_PREFIX` scopes queue and secret names, and
-  `RESOURCE_TAGS` plus the managed tags reach every resource type.
+- **Naming and tags:**
+  - `RESOURCE_NAME_PREFIX` names new queues, secrets and buckets, while
+    `BUCKET_PREFIX` still wins for buckets while it's set.
+  - Resources created before the prefix keep their names through refresh,
+    reconcile and removal.
+  - `RESOURCE_TAGS` plus the managed tags reach every resource type.
 - **AWS Backup:** a snapshot schedule creates a tagged backup plan.
 - **No-op reconciles:** reconciling an unchanged app makes no AWS writes, which
   moto's request recorder confirms, while a changed tag still reaches every

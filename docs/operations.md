@@ -69,12 +69,12 @@ time a resource is provisioned or refreshed, or a deployment is reconciled.
 - Refresh each S3, SQS and Secrets Manager resource once. Those versions attached
   no IAM policy when provisioning them, so the application got `AccessDenied`.
   Refreshing attaches the policy and stamps the annotations that keep it in place.
-- Queues and secrets that already exist keep their names. If you set
-  `RESOURCE_NAME_PREFIX`, refreshing one creates a **new**, prefixed queue or secret
-  and points the application at it. The application loses access to the old one,
-  which is left in place, so drain the queue or copy the secret's value across.
-  To keep the existing names, leave the prefix empty. The plugin's SQS and Secrets
-  Manager permissions then can't be scoped to a prefix.
+- **Setting `RESOURCE_NAME_PREFIX` doesn't rename anything, from 0.8.1.**
+  Existing queues, secrets and buckets keep their names, and only new ones get
+  the prefix. 0.8.0 instead created a new, prefixed resource on refresh or
+  reconcile, so set the prefix after upgrading to 0.8.1. The plugin must still
+  be able to read the old resources. See
+  [Scoping the plugin to a prefix](configuration.md#scoping-the-plugin-to-a-prefix).
 
 ## Verifying the loaded binary
 
@@ -223,8 +223,10 @@ application's, the plugin's own permissions are missing something. Compare the
 action and resource in the message with
 [Plugin IAM permissions](configuration.md#plugin-iam-permissions):
 
-- **A queue or secret name without your prefix:** `RESOURCE_NAME_PREFIX` isn't set,
-  or doesn't match the `<prefix>*` the policy is scoped to.
+- **A queue, secret or bucket name without your prefix:** either
+  `RESOURCE_NAME_PREFIX` isn't set or doesn't match the `<prefix>*` the policy is
+  scoped to, or it's an existing resource kept under its old name, which the
+  policy has to grant explicitly.
 - **A tagging action** (`iam:TagRole`, `rds:AddTagsToResource`, `sqs:TagQueue`,
   `secretsmanager:TagResource`): grant it. Every create call carries tags, so
   without it the create fails.

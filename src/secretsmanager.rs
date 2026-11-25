@@ -72,6 +72,11 @@ pub fn schedule_delete_secret(
     Ok(deletion_date)
 }
 
+/// Whether the secret exists, for `RESOURCE_NAME_PREFIX` name resolution.
+pub fn secret_exists(secret_name: &str, creds: &AwsCredentials) -> Result<bool, String> {
+    describe_secret(secret_name, creds).map(|found| found.is_some())
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// The secret's ARN and tags, or `None` if it doesn't exist.

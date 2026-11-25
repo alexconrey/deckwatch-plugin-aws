@@ -130,6 +130,20 @@ pub fn ensure_bucket(
     Ok(())
 }
 
+/// Whether a bucket we can read exists, for `RESOURCE_NAME_PREFIX` name
+/// resolution. HeadBucket doesn't work through extism's HTTP host function, so
+/// this reads the bucket's tags: success or `NoSuchTagSet` means it exists,
+/// `NoSuchBucket` means it doesn't, and anything else (e.g. 403 for another
+/// account's bucket) is an error, which callers treat as "doesn't exist".
+pub fn bucket_exists(bucket: &str, region: &str, creds: &AwsCredentials) -> Result<bool, String> {
+    match s3_get(bucket, region, "tagging", creds, "GetBucketTagging") {
+        Ok(_) => Ok(true),
+        Err(e) if e.contains("NoSuchTagSet") => Ok(true),
+        Err(e) if e.contains("NoSuchBucket") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Merge the plugin's tags into the bucket's existing tag set.
