@@ -29,13 +29,10 @@ pub fn ensure_secret(
     tags: &[(String, String)],
     creds: &AwsCredentials,
 ) -> Result<String, String> {
-    if let Some(arn) = describe_secret(secret_name, creds)? {
-        log!(
-            LogLevel::Info,
-            "deckwatch-plugin-aws: Secrets Manager secret '{secret_name}' already exists"
-        );
+    if let Some((arn, existing_tags)) = describe_secret(secret_name, creds)? {
         // TagResource adds or updates only these keys; other tags are kept.
-        if !tags.is_empty() {
+        // Skipped when DescribeSecret already shows every tag.
+        if !crate::tags_satisfied(&existing_tags, tags) {
             let body = serde_json::json!({ "SecretId": arn, "Tags": crate::json_tag_list(tags) })
                 .to_string();
             if let Err(e) = sm_call("secretsmanager.TagResource", &body, creds) {
@@ -60,8 +57,11 @@ pub fn schedule_delete_secret(
     recovery_window_days: u32,
     creds: &AwsCredentials,
 ) -> Result<String, String> {
-    let body =
-        format!(r#"{{"SecretId":"{secret_name}","RecoveryWindowInDays":{recovery_window_days}}}"#);
+    let body = serde_json::json!({
+        "SecretId": secret_name,
+        "RecoveryWindowInDays": recovery_window_days,
+    })
+    .to_string();
     let json = sm_call("secretsmanager.DeleteSecret", &body, creds)?;
     let deletion_date =
         crate::json_str_field(&json, "DeletionDate").unwrap_or_else(|| "unknown".into());
@@ -74,14 +74,17 @@ pub fn schedule_delete_secret(
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-fn describe_secret(secret_name: &str, creds: &AwsCredentials) -> Result<Option<String>, String> {
-    let body = format!(r#"{{"SecretId":"{secret_name}"}}"#);
+/// The secret's ARN and tags, or `None` if it doesn't exist.
+fn describe_secret(
+    secret_name: &str,
+    creds: &AwsCredentials,
+) -> Result<Option<(String, crate::Tags)>, String> {
+    let body = serde_json::json!({ "SecretId": secret_name }).to_string();
 
     match sm_call("secretsmanager.DescribeSecret", &body, creds) {
+        // The ARN field is named "ARN" in the response.
         Ok(json) => {
-            // The ARN field is named "ARN" in the response.
-            let arn = crate::json_str_field(&json, "ARN");
-            Ok(arn)
+            Ok(crate::json_str_field(&json, "ARN").map(|arn| (arn, crate::secret_tags(&json))))
         }
         Err(e) if e.contains("ResourceNotFoundException") => Ok(None),
         Err(e) => Err(e),

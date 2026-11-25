@@ -26,8 +26,17 @@
 //! }
 //! ```
 //!
-//! `UpdateAssumeRolePolicy` is called on every reconcile so that adding
-//! `OIDC_PROVIDER_ARN` after initial role creation takes effect automatically.
+//! The trust policy is compared with the role's current one on every
+//! reconcile, and `UpdateAssumeRolePolicy` is called when they differ, so
+//! adding `OIDC_PROVIDER_ARN` after the role was created takes effect
+//! automatically.
+//!
+//! ## Writes only when something changed
+//!
+//! deckwatch can reconcile every few seconds, so `ensure_role` and
+//! `put_role_policy` read first (`GetRole`, `GetRolePolicy`) and only write
+//! when the trust policy, tags or a policy document differ. If a read fails,
+//! they write as before.
 
 use extism_pdk::*;
 
@@ -105,8 +114,10 @@ fn trust_policy_document(namespace: &str, sa_name: &str) -> String {
 
 /// Ensure a role with the given name exists and has the correct trust policy.
 ///
-/// Creates the role if it does not exist; calls `UpdateAssumeRolePolicy` on
-/// every reconcile so OIDC_PROVIDER_ARN changes take effect automatically.
+/// Creates the role if it does not exist. On every reconcile, the trust policy
+/// and tags from `GetRole` are compared with the desired ones, and
+/// `UpdateAssumeRolePolicy` / `TagRole` are called only when they differ. A
+/// later `OIDC_PROVIDER_ARN` change still takes effect automatically.
 ///
 /// Returns the role ARN on success.
 pub fn ensure_role(
@@ -118,19 +129,17 @@ pub fn ensure_role(
 ) -> Result<String, String> {
     let trust = trust_policy_document(namespace, sa_name);
 
-    if let Some(arn) = get_role(role_name, creds)? {
-        log!(
-            LogLevel::Info,
-            "deckwatch-plugin-aws: IAM role {role_name} already exists"
-        );
-        if let Err(e) = update_assume_role_policy(role_name, &trust, creds) {
-            log!(
-                LogLevel::Warn,
-                "deckwatch-plugin-aws: UpdateAssumeRolePolicy for {role_name}: {e}"
-            );
+    if let Some(role) = get_role(role_name, creds)? {
+        if !crate::iam_policy_matches(&role.trust_policy, &trust) {
+            if let Err(e) = update_assume_role_policy(role_name, &trust, creds) {
+                log!(
+                    LogLevel::Warn,
+                    "deckwatch-plugin-aws: UpdateAssumeRolePolicy for {role_name}: {e}"
+                );
+            }
         }
         // TagRole adds or updates only these keys; other tags are untouched.
-        if !tags.is_empty() {
+        if !crate::tags_satisfied(&role.tags, tags) {
             let body = format!(
                 "Action=TagRole&Version=2010-05-08&RoleName={}{}",
                 url_encode(role_name),
@@ -143,7 +152,7 @@ pub fn ensure_role(
                 );
             }
         }
-        return Ok(arn);
+        return Ok(role.arn);
     }
 
     let role_path = config::get("ROLE_PATH")
@@ -188,14 +197,7 @@ pub fn attach_rds_policy(
     let policy = format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"rds-db:connect","Resource":"arn:{partition}:rds-db:{region}:{account}:dbuser:{rds_resource_id}/{db_user}"}}]}}"#
     );
-    let body = format!(
-        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
-        url_encode(role_name),
-        crate::POLICY_RDS,
-        url_encode(&policy),
-    );
-    let _xml = iam_query(&body, creds)?;
-    Ok(())
+    put_role_policy(role_name, crate::POLICY_RDS, &policy, creds)
 }
 
 /// Attach an inline policy granting standard S3 object operations on the bucket.
@@ -209,27 +211,13 @@ pub fn attach_s3_policy(
     creds: &AwsCredentials,
 ) -> Result<(), String> {
     let policy = crate::s3_access_policy_document(bucket_name, region);
-    let body = format!(
-        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
-        url_encode(role_name),
-        crate::POLICY_S3,
-        url_encode(&policy),
-    );
-    iam_query(&body, creds)?;
-    Ok(())
+    put_role_policy(role_name, crate::POLICY_S3, &policy, creds)
 }
 
 /// Attach an inline policy granting ECR image pull operations.
 pub fn attach_ecr_policy(role_name: &str, creds: &AwsCredentials) -> Result<(), String> {
     let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},{"Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage"],"Resource":"*"}]}"#;
-    let body = format!(
-        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
-        url_encode(role_name),
-        crate::POLICY_ECR,
-        url_encode(policy),
-    );
-    iam_query(&body, creds)?;
-    Ok(())
+    put_role_policy(role_name, crate::POLICY_ECR, policy, creds)
 }
 
 /// Attach an inline policy granting standard SQS producer/consumer operations.
@@ -241,14 +229,7 @@ pub fn attach_sqs_policy(
     let policy = format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["sqs:SendMessage","sqs:ReceiveMessage","sqs:DeleteMessage","sqs:GetQueueUrl","sqs:GetQueueAttributes","sqs:ChangeMessageVisibility"],"Resource":"{queue_arn}"}}]}}"#
     );
-    let body = format!(
-        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
-        url_encode(role_name),
-        crate::POLICY_SQS,
-        url_encode(&policy),
-    );
-    iam_query(&body, creds)?;
-    Ok(())
+    put_role_policy(role_name, crate::POLICY_SQS, &policy, creds)
 }
 
 /// Attach the workload's Secrets Manager policy: read on `read_arns` and
@@ -263,14 +244,7 @@ pub fn attach_secretsmanager_policy(
     let Some(policy) = crate::secrets_policy_document(read_arns, write_arns) else {
         return Ok(());
     };
-    let body = format!(
-        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
-        url_encode(role_name),
-        crate::POLICY_SECRETS,
-        url_encode(&policy),
-    );
-    iam_query(&body, creds)?;
-    Ok(())
+    put_role_policy(role_name, crate::POLICY_SECRETS, &policy, creds)
 }
 
 // ── Cleanup (deprovision) ─────────────────────────────────────────────────────
@@ -356,7 +330,15 @@ fn update_assume_role_policy(
     Ok(())
 }
 
-fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<String>, String> {
+/// What `ensure_role` needs to know about an existing role.
+struct RoleInfo {
+    arn: String,
+    /// The trust policy as `GetRole` returns it (URL-encoded).
+    trust_policy: String,
+    tags: crate::Tags,
+}
+
+fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<RoleInfo>, String> {
     let body = format!(
         "Action=GetRole&Version=2010-05-08&RoleName={}",
         url_encode(role_name)
@@ -364,7 +346,68 @@ fn get_role(role_name: &str, creds: &AwsCredentials) -> Result<Option<String>, S
     // A missing role comes back as HTTP 404 with Code=NoSuchEntity, which
     // iam_query surfaces as Err — map it to Ok(None) so ensure_role creates it.
     match iam_query(&body, creds) {
-        Ok(xml) => Ok(extract_tag(&xml, "Arn")),
+        Ok(xml) => Ok(extract_tag(&xml, "Arn").map(|arn| RoleInfo {
+            arn,
+            trust_policy: extract_tag(&xml, "AssumeRolePolicyDocument").unwrap_or_default(),
+            tags: crate::iam_role_tags(&xml),
+        })),
+        Err(e) if e.contains("NoSuchEntity") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Set when `GetRolePolicy` is denied, so the remaining policies in this call
+/// skip the read and write directly. deckwatch creates a fresh plugin instance
+/// for each call, so this resets every time.
+static GET_ROLE_POLICY_DENIED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Write an inline policy unless the role already has an identical one.
+///
+/// Reading first turns the unchanged-policy case (almost every reconcile) into
+/// a `GetRolePolicy` read instead of a `PutRolePolicy` write. If the read
+/// fails, including when `iam:GetRolePolicy` isn't granted, the policy is
+/// written as before.
+fn put_role_policy(
+    role_name: &str,
+    policy_name: &str,
+    document: &str,
+    creds: &AwsCredentials,
+) -> Result<(), String> {
+    use core::sync::atomic::Ordering;
+    if !GET_ROLE_POLICY_DENIED.load(Ordering::Relaxed) {
+        match get_role_policy(role_name, policy_name, creds) {
+            Ok(Some(current)) if crate::iam_policy_matches(&current, document) => return Ok(()),
+            Err(e) if e.contains("AccessDenied") => {
+                GET_ROLE_POLICY_DENIED.store(true, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+    let body = format!(
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
+        url_encode(role_name),
+        url_encode(policy_name),
+        url_encode(document),
+    );
+    iam_query(&body, creds)?;
+    Ok(())
+}
+
+/// The inline policy document as IAM returns it (URL-encoded), or `None` if
+/// the role or policy doesn't exist.
+fn get_role_policy(
+    role_name: &str,
+    policy_name: &str,
+    creds: &AwsCredentials,
+) -> Result<Option<String>, String> {
+    let body = format!(
+        "Action=GetRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}",
+        url_encode(role_name),
+        url_encode(policy_name),
+    );
+    match iam_query(&body, creds) {
+        Ok(xml) => Ok(extract_tag(&xml, "PolicyDocument")),
         Err(e) if e.contains("NoSuchEntity") => Ok(None),
         Err(e) => Err(e),
     }

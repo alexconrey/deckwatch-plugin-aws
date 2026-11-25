@@ -1275,6 +1275,278 @@ async fn rds_snapshot_schedule_creates_a_tagged_backup_plan() {
     );
 }
 
+// ── Request recording (moto's /moto-api/recorder) ─────────────────────────────
+
+/// Call moto's management API with a bare HTTP/1.1 request (the harness has
+/// no HTTP client, and these endpoints need nothing more).
+fn moto_api(method: &str, path: &str) -> String {
+    use std::io::{Read, Write};
+    let endpoint = moto_endpoint();
+    let authority = endpoint
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    let mut stream = std::net::TcpStream::connect(&authority).expect("connect to moto");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send to moto");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read from moto");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    assert!(
+        head.lines().next().is_some_and(|l| l.contains(" 200")),
+        "moto {method} {path}: {head}"
+    );
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        dechunk(body)
+    } else {
+        body.to_string()
+    }
+}
+
+/// Decode an HTTP/1.1 chunked body.
+fn dechunk(mut body: &str) -> String {
+    let mut out = String::new();
+    while let Some((size_line, rest)) = body.split_once("\r\n") {
+        let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+        if size == 0 || rest.len() < size {
+            break;
+        }
+        out.push_str(&rest[..size]);
+        body = rest[size..].trim_start_matches("\r\n");
+    }
+    out
+}
+
+/// Standard base64 (moto records request bodies base64-encoded).
+fn base64_decode(s: &str) -> Vec<u8> {
+    let (mut out, mut buf, mut bits) = (Vec::new(), 0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue, // padding and whitespace
+        };
+        buf = (buf << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
+/// Every request moto recorded that mentions `token`, as ("operation" or
+/// "METHOD url", is_read). A request is a read when its Query `Action` or JSON
+/// `X-Amz-Target` operation starts with Get, List or Describe, or when it's an
+/// S3 GET; everything else counts as a write.
+fn recorded_requests(recording: &str, token: &str) -> Vec<(String, bool)> {
+    let is_read_op = |op: &str| {
+        ["Get", "List", "Describe"]
+            .iter()
+            .any(|p| op.starts_with(p))
+    };
+    recording
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let entry: Value = serde_json::from_str(line).ok()?;
+            let method = entry["method"].as_str().unwrap_or("");
+            let url = entry["url"].as_str().unwrap_or("");
+            let raw_body = entry["body"].as_str().unwrap_or("");
+            let body = if entry["body_encoded"].as_bool() == Some(true) {
+                String::from_utf8_lossy(&base64_decode(raw_body)).into_owned()
+            } else {
+                raw_body.to_string()
+            };
+            if !url.contains(token) && !body.contains(token) {
+                return None;
+            }
+            let target = entry["headers"].as_object().and_then(|h| {
+                h.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-target"))
+                    .and_then(|(_, v)| v.as_str())
+            });
+            let action = body
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("Action="))
+                .map(str::to_string);
+            let (op, is_read) = match (target, action) {
+                (Some(t), _) => {
+                    let op = t.rsplit('.').next().unwrap_or(t).to_string();
+                    let read = is_read_op(&op);
+                    (op, read)
+                }
+                (None, Some(a)) => {
+                    let read = is_read_op(&a);
+                    (a, read)
+                }
+                (None, None) => (format!("{method} {url}"), method == "GET"),
+            };
+            Some((op, is_read))
+        })
+        .collect()
+}
+
+/// Once everything exists and is configured, reconciling again must not write
+/// to AWS. deckwatch can call apply() every few seconds, so a no-op reconcile
+/// that still wrote would mean a constant stream of IAM, S3, SQS, Secrets
+/// Manager and RDS writes. Changing an input must still write.
+#[tokio::test]
+async fn reconcile_without_changes_makes_no_aws_writes() {
+    let region = "us-gov-west-1";
+    let token = unique("noop");
+    let ns = "noop-it";
+    let bucket = format!("{token}-bucket");
+    let queue = format!("{token}-queue");
+    let secret = format!("{ns}/{token}");
+    let identifier = format!("{token}-db");
+    let ctx = PluginContext {
+        namespace: ns.into(),
+        deployment_name: "api".into(),
+        annotations: HashMap::from([
+            ("aws.deckwatch.io/app-name".into(), token.into()),
+            ("s3.deckwatch.io/enabled".into(), "true".into()),
+            ("s3.deckwatch.io/bucket-name".into(), bucket.clone()),
+            ("s3.deckwatch.io/region".into(), region.into()),
+            ("sqs.deckwatch.io/enabled".into(), "true".into()),
+            ("sqs.deckwatch.io/queue-name".into(), queue.clone()),
+            ("secretsmanager.deckwatch.io/enabled".into(), "true".into()),
+            (
+                "secretsmanager.deckwatch.io/secret-name".into(),
+                secret.clone(),
+            ),
+            ("rds.deckwatch.io/enabled".into(), "true".into()),
+            ("rds.deckwatch.io/identifier".into(), identifier.clone()),
+        ]),
+        ..Default::default()
+    };
+
+    let mut plugin = load_plugin(region, &[("RESOURCE_TAGS", "Team=platform")]);
+    // The first reconcile creates everything. The second runs once the RDS
+    // instance is available, and attaches its rds-db:connect policy.
+    call_apply(&mut plugin, &ctx);
+    call_apply(&mut plugin, &ctx);
+
+    moto_api("POST", "/moto-api/recorder/reset-recording");
+    moto_api("POST", "/moto-api/recorder/start-recording");
+    let steady = call_apply(&mut plugin, &ctx);
+    moto_api("POST", "/moto-api/recorder/stop-recording");
+    let recording = moto_api("GET", "/moto-api/recorder/download-recording");
+    moto_api("POST", "/moto-api/recorder/reset-recording");
+
+    assert!(steady.errors.is_empty(), "errors: {:?}", steady.errors);
+    let requests = recorded_requests(&recording, token);
+    // The reconcile's own reads must be in the recording, or "no writes"
+    // would pass vacuously.
+    assert!(
+        requests.iter().any(|(_, is_read)| *is_read),
+        "the recorder captured none of this reconcile's requests"
+    );
+    let writes: Vec<&String> = requests
+        .iter()
+        .filter(|(_, is_read)| !is_read)
+        .map(|(op, _)| op)
+        .collect();
+    assert!(
+        writes.is_empty(),
+        "a reconcile with nothing to change made AWS writes: {writes:#?}"
+    );
+
+    // A changed input is still written: every resource picks up the new value.
+    let mut plugin = load_plugin(region, &[("RESOURCE_TAGS", "Team=rad")]);
+    let changed = call_apply(&mut plugin, &ctx);
+    assert!(changed.errors.is_empty(), "errors: {:?}", changed.errors);
+    let want = |tags: &HashMap<String, String>, what: &str| {
+        assert_eq!(
+            tags.get("Team").map(String::as_str),
+            Some("rad"),
+            "{what} tags: {tags:?}"
+        );
+    };
+
+    let role = format!("{ns}-{token}-role");
+    let iam = iam_client(region).await;
+    let role_tags = tag_map(
+        iam.list_role_tags()
+            .role_name(&role)
+            .send()
+            .await
+            .expect("role tags")
+            .tags()
+            .iter()
+            .map(|t| (t.key(), t.value())),
+    );
+    want(&role_tags, "role");
+
+    let s3 = s3_client(region).await;
+    let bucket_tags = tag_map(
+        s3.get_bucket_tagging()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect("bucket tags")
+            .tag_set()
+            .iter()
+            .map(|t| (t.key(), t.value())),
+    );
+    want(&bucket_tags, "bucket");
+
+    let sqs = sqs_client(region).await;
+    let queue_url = sqs
+        .get_queue_url()
+        .queue_name(&queue)
+        .send()
+        .await
+        .expect("queue url")
+        .queue_url()
+        .expect("queue url")
+        .to_string();
+    let queue_tags: HashMap<String, String> = sqs
+        .list_queue_tags()
+        .queue_url(&queue_url)
+        .send()
+        .await
+        .expect("queue tags")
+        .tags()
+        .cloned()
+        .unwrap_or_default();
+    want(&queue_tags, "queue");
+
+    let secrets = secrets_client(region).await;
+    let secret_tags = tag_map(
+        secrets
+            .describe_secret()
+            .secret_id(&secret)
+            .send()
+            .await
+            .expect("describe secret")
+            .tags()
+            .iter()
+            .map(|t| (t.key().unwrap_or(""), t.value().unwrap_or(""))),
+    );
+    want(&secret_tags, "secret");
+
+    let db = db_instance(&rds_client(region).await, &identifier).await;
+    let db_tags = tag_map(
+        db.tag_list()
+            .iter()
+            .map(|t| (t.key().unwrap_or(""), t.value().unwrap_or(""))),
+    );
+    want(&db_tags, "RDS instance");
+}
+
 /// A malformed AWS_ENDPOINT_URL must fail provisioning outright rather than
 /// fall back to real AWS endpoints.
 #[test]

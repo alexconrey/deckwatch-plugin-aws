@@ -64,8 +64,11 @@ ServiceAccount**:
 | `deckwatch-secretsmanager-access` | Secrets Manager (provisioned, or `secretsmanager.deckwatch.io/*`) | `GetSecretValue`, `DescribeSecret`; plus `PutSecretValue` on secrets the plugin created for the app | read: the listed secret ARNs and the app's own secrets; write: only the app's own secrets, and only under `RESOURCE_NAME_PREFIX` when it's set |
 | `deckwatch-ecr-pull` | `ecr.deckwatch.io/enabled` | `GetAuthorizationToken`, `BatchCheckLayerAvailability`, `GetDownloadUrlForLayer`, `BatchGetImage` | `*` |
 
-`PutRolePolicy` replaces a policy of the same name, so the plugin can re-apply
-policies on every reconcile safely. deckwatch allows at most one resource of each
+On every reconcile the plugin compares each policy with the role's current one
+(`GetRolePolicy`), and the trust policy and tags with `GetRole`. It writes only
+what differs. `PutRolePolicy` replaces a policy of the same name, so re-applying
+is always safe. Without `iam:GetRolePolicy`, the plugin re-applies every
+policy, as it did before 0.8.1. deckwatch allows at most one resource of each
 type per application, so one fixed policy name per type never collides. Removing a
 resource deletes its policy, and the role is deleted with the last policy (see
 [Removing a resource](operations.md#removing-a-resource)). If someone deletes a

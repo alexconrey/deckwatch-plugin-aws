@@ -2,8 +2,9 @@
 //!
 //! Uses virtual-hosted-style endpoints (`{bucket}.s3.{region}.amazonaws.com`)
 //! and includes `x-amz-content-sha256` in all signed requests — both required
-//! by S3 GovCloud. CreateBucket is called directly (idempotent for owned buckets)
-//! to avoid HeadBucket which fails via extism's HTTP sandbox.
+//! by S3 GovCloud. HeadBucket fails through extism's HTTP sandbox, so
+//! `GetBucketTagging` is the existence check, and CreateBucket (idempotent for
+//! owned buckets) runs only when that read can't confirm the bucket.
 
 use extism_pdk::*;
 
@@ -11,47 +12,90 @@ use crate::{aws_sign, AwsCredentials, S3Config};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Ensure the S3 bucket exists, creating and configuring it if it does not.
+/// What a `GetBucketTagging` read says about a bucket.
+enum TagRead {
+    /// The bucket exists and we can read it; these are its tags.
+    Tags(crate::Tags),
+    /// The read was denied (no `s3:GetBucketTagging`).
+    Denied(String),
+    /// Anything else: the bucket may not exist, so fall back to CreateBucket.
+    Unknown,
+}
+
+fn read_bucket_tags(bucket: &str, region: &str, creds: &AwsCredentials) -> TagRead {
+    match s3_get(bucket, region, "tagging", creds, "GetBucketTagging") {
+        Ok(xml) => TagRead::Tags(crate::parse_s3_tag_set(&xml)),
+        Err(e) if e.contains("NoSuchTagSet") => TagRead::Tags(vec![]),
+        Err(e) if e.contains("AccessDenied") => TagRead::Denied(e),
+        Err(_) => TagRead::Unknown,
+    }
+}
+
+/// Ensure the S3 bucket exists and has the configured settings and tags.
+///
+/// deckwatch can reconcile every few seconds, so every step reads first and
+/// writes only when something differs:
+/// - `GetBucketTagging` doubles as the existence check (HeadBucket doesn't
+///   work through extism's HTTP host function). It succeeds, or fails with
+///   `NoSuchTagSet`, only for an existing bucket we can read. Otherwise
+///   `CreateBucket` runs as before.
+/// - Versioning, public access block and lifecycle are read before writing.
+///   A failed read, e.g. a missing optional `s3:Get*` permission, means write
+///   as before.
 pub fn ensure_bucket(
     cfg: &S3Config,
     full_bucket: &str,
     tags: &[(String, String)],
     creds: &AwsCredentials,
 ) -> Result<(), String> {
-    // CreateBucket is idempotent for buckets we own — returns 200 if it
-    // already exists, which is simpler than HeadBucket + conditional create.
-    create_bucket(full_bucket, &cfg.region, creds).or_else(|e| {
-        // 409 BucketAlreadyOwnedByYou means we own the bucket — not an error.
-        // Error string format: "S3 CreateBucket error 409 [BucketAlreadyOwnedByYou]: ..."
-        if e.contains("BucketAlreadyOwnedByYou")
-            || e.contains("BucketAlreadyExists")
-            || e.contains("you already own it")
-        {
-            log!(
-                LogLevel::Info,
-                "deckwatch-plugin-aws: S3 bucket {full_bucket} already exists"
-            );
-            Ok(())
-        } else {
-            Err(e)
-        }
-    })?;
+    let tag_read = read_bucket_tags(full_bucket, &cfg.region, creds);
 
-    log!(
-        LogLevel::Info,
-        "deckwatch-plugin-aws: S3 bucket {full_bucket} ready"
-    );
+    if !matches!(tag_read, TagRead::Tags(_)) {
+        // CreateBucket is idempotent for buckets we own, so it's safe when we
+        // couldn't tell whether the bucket exists.
+        create_bucket(full_bucket, &cfg.region, creds).or_else(|e| {
+            // 409 BucketAlreadyOwnedByYou means we own the bucket — not an error.
+            // Error string format: "S3 CreateBucket error 409 [BucketAlreadyOwnedByYou]: ..."
+            if e.contains("BucketAlreadyOwnedByYou")
+                || e.contains("BucketAlreadyExists")
+                || e.contains("you already own it")
+            {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })?;
+    }
 
-    if cfg.versioning {
-        if let Err(e) = put_bucket_versioning(full_bucket, &cfg.region, creds) {
+    let region = &cfg.region;
+    if cfg.versioning
+        && !s3_get(
+            full_bucket,
+            region,
+            "versioning",
+            creds,
+            "GetBucketVersioning",
+        )
+        .is_ok_and(|xml| crate::s3_versioning_enabled(&xml))
+    {
+        if let Err(e) = put_bucket_versioning(full_bucket, region, creds) {
             log!(
                 LogLevel::Warn,
                 "deckwatch-plugin-aws: put_bucket_versioning: {e}"
             );
         }
     }
-    if cfg.public_access_block {
-        if let Err(e) = put_public_access_block(full_bucket, &cfg.region, creds) {
+    if cfg.public_access_block
+        && !s3_get(
+            full_bucket,
+            region,
+            "publicAccessBlock",
+            creds,
+            "GetPublicAccessBlock",
+        )
+        .is_ok_and(|xml| crate::s3_public_access_fully_blocked(&xml))
+    {
+        if let Err(e) = put_public_access_block(full_bucket, region, creds) {
             log!(
                 LogLevel::Warn,
                 "deckwatch-plugin-aws: put_public_access_block: {e}"
@@ -59,15 +103,24 @@ pub fn ensure_bucket(
         }
     }
     if let Some(days) = cfg.lifecycle_days {
-        if let Err(e) = put_bucket_lifecycle(full_bucket, &cfg.region, days, creds) {
-            log!(
-                LogLevel::Warn,
-                "deckwatch-plugin-aws: put_bucket_lifecycle: {e}"
-            );
+        let current = s3_get(
+            full_bucket,
+            region,
+            "lifecycle",
+            creds,
+            "GetBucketLifecycleConfiguration",
+        );
+        if !current.is_ok_and(|xml| crate::s3_lifecycle_has_expiry_rule(&xml, days)) {
+            if let Err(e) = put_bucket_lifecycle(full_bucket, region, days, creds) {
+                log!(
+                    LogLevel::Warn,
+                    "deckwatch-plugin-aws: put_bucket_lifecycle: {e}"
+                );
+            }
         }
     }
     if !tags.is_empty() {
-        if let Err(e) = apply_bucket_tags(full_bucket, &cfg.region, tags, creds) {
+        if let Err(e) = apply_bucket_tags(full_bucket, region, tags, tag_read, creds) {
             log!(
                 LogLevel::Warn,
                 "deckwatch-plugin-aws: bucket tagging for {full_bucket}: {e}"
@@ -82,22 +135,32 @@ pub fn ensure_bucket(
 /// Merge the plugin's tags into the bucket's existing tag set.
 ///
 /// PutBucketTagging replaces the whole set, so read it first and keep tags
-/// set by anyone else; skip the write when nothing would change.
+/// set by anyone else. The write is skipped when the bucket already has every
+/// tag. `tag_read` is the read `ensure_bucket` already made; if it didn't
+/// return tags (the bucket was just created), the tags are read again.
 fn apply_bucket_tags(
     bucket: &str,
     region: &str,
     tags: &[(String, String)],
+    tag_read: TagRead,
     creds: &AwsCredentials,
 ) -> Result<(), String> {
-    let existing = match s3_get(bucket, region, "tagging", creds, "GetBucketTagging") {
-        Ok(xml) => crate::parse_s3_tag_set(&xml),
-        Err(e) if e.contains("NoSuchTagSet") => vec![],
-        Err(e) => return Err(e),
+    let existing = match tag_read {
+        TagRead::Tags(existing) => existing,
+        // Reading again would be denied again.
+        TagRead::Denied(e) => return Err(e),
+        // Same handling as before this read was shared: any error other than
+        // NoSuchTagSet means we can't merge safely, so don't write.
+        TagRead::Unknown => match s3_get(bucket, region, "tagging", creds, "GetBucketTagging") {
+            Ok(xml) => crate::parse_s3_tag_set(&xml),
+            Err(e) if e.contains("NoSuchTagSet") => vec![],
+            Err(e) => return Err(e),
+        },
     };
-    let merged = crate::merge_tags(&existing, tags);
-    if merged == existing {
+    if crate::tags_satisfied(&existing, tags) {
         return Ok(());
     }
+    let merged = crate::merge_tags(&existing, tags);
     s3_put(
         bucket,
         region,
@@ -270,8 +333,10 @@ fn put_bucket_lifecycle(
     days: u32,
     creds: &AwsCredentials,
 ) -> Result<(), String> {
+    // The rule ID must match what s3_lifecycle_has_expiry_rule() looks for.
+    let id = crate::S3_LIFECYCLE_RULE_ID;
     let body = format!(
-        r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>deckwatch-expire</ID><Status>Enabled</Status><Filter></Filter><Expiration><Days>{days}</Days></Expiration></Rule></LifecycleConfiguration>"#
+        r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>{id}</ID><Status>Enabled</Status><Filter></Filter><Expiration><Days>{days}</Days></Expiration></Rule></LifecycleConfiguration>"#
     );
     s3_put(
         bucket,

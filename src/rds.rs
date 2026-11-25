@@ -111,14 +111,15 @@ fn reconcile_backup_retention(
 }
 
 /// Add or update the plugin's tags on an existing instance. AddTagsToResource
-/// only touches the given keys; other tags are kept.
+/// only touches the given keys; other tags are kept. Skipped when the
+/// instance already has every tag (from the `DescribeDBInstances` response).
 fn apply_instance_tags(
     identifier: &str,
     info: &DbInstanceInfo,
     tags: &[(String, String)],
     creds: &AwsCredentials,
 ) -> Vec<String> {
-    if tags.is_empty() || info.db_instance_arn.is_empty() {
+    if info.db_instance_arn.is_empty() || crate::tags_satisfied(&info.tags, tags) {
         return vec![];
     }
     let body = format!(
@@ -142,6 +143,8 @@ struct DbInstanceInfo {
     db_instance_arn: String,
     /// `BackupRetentionPeriod` in days, if present in the response.
     backup_retention_days: Option<u32>,
+    /// The instance's tags (`TagList`).
+    tags: crate::Tags,
 }
 
 fn describe_db_instance(
@@ -172,6 +175,7 @@ fn describe_db_instance(
         db_instance_arn: extract_tag(&xml, "DBInstanceArn").unwrap_or_default(),
         backup_retention_days: extract_tag(&xml, "BackupRetentionPeriod")
             .and_then(|v| v.parse().ok()),
+        tags: crate::rds_instance_tags(&xml),
     }))
 }
 

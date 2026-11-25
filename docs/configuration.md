@@ -165,7 +165,8 @@ the permissions below. The list comes from the API calls in `src/`. Replace
       "Effect": "Allow",
       "Action": [
         "iam:CreateRole", "iam:TagRole", "iam:UpdateAssumeRolePolicy",
-        "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:DeleteRole"
+        "iam:PutRolePolicy", "iam:GetRolePolicy", "iam:DeleteRolePolicy",
+        "iam:DeleteRole"
       ],
       "Resource": "arn:<partition>:iam::<account>:role/deckwatch-plugin/*"
     },
@@ -194,8 +195,9 @@ the permissions below. The list comes from the API calls in `src/`. Replace
       "Sid": "S3",
       "Effect": "Allow",
       "Action": [
-        "s3:CreateBucket", "s3:PutBucketVersioning",
-        "s3:PutBucketPublicAccessBlock", "s3:PutLifecycleConfiguration",
+        "s3:CreateBucket", "s3:PutBucketVersioning", "s3:GetBucketVersioning",
+        "s3:PutBucketPublicAccessBlock", "s3:GetBucketPublicAccessBlock",
+        "s3:PutLifecycleConfiguration", "s3:GetLifecycleConfiguration",
         "s3:GetBucketTagging", "s3:PutBucketTagging"
       ],
       "Resource": "arn:<partition>:s3:::*"
@@ -205,7 +207,7 @@ the permissions below. The list comes from the API calls in `src/`. Replace
       "Effect": "Allow",
       "Action": [
         "sqs:CreateQueue", "sqs:GetQueueUrl", "sqs:GetQueueAttributes",
-        "sqs:DeleteQueue", "sqs:TagQueue"
+        "sqs:DeleteQueue", "sqs:TagQueue", "sqs:ListQueueTags"
       ],
       "Resource": "arn:<partition>:sqs:*:<account>:<RESOURCE_NAME_PREFIX>*"
     },
@@ -267,6 +269,14 @@ Notes:
   (`CreateSecret`). `backup:TagResource` covers the backup plan's tags.
   `s3:GetBucketTagging` and `s3:PutBucketTagging` merge bucket tags after the
   bucket is created.
+- **Read permissions that save writes (optional):** `iam:GetRolePolicy`,
+  `s3:GetBucketVersioning`, `s3:GetBucketPublicAccessBlock`,
+  `s3:GetLifecycleConfiguration` and `sqs:ListQueueTags`. deckwatch can
+  reconcile every few seconds, so the plugin compares before it writes: an
+  unchanged policy, setting or tag set costs a read instead of a write.
+  Without these permissions, the read fails and the plugin writes as it always
+  has. `s3:GetBucketTagging` also serves as the bucket existence check, so a
+  bucket that's already there isn't sent another `CreateBucket`.
 - **moto doesn't check IAM**, so the integration tests can't catch a missing
   permission. This list is maintained by hand from the API calls in `src/`.
 

@@ -7,6 +7,12 @@ history.
 
 ## [Unreleased]
 
+### Upgrade notes
+- **Optional:** grant `iam:GetRolePolicy`, `s3:GetBucketVersioning`,
+  `s3:GetBucketPublicAccessBlock`, `s3:GetLifecycleConfiguration` and
+  `sqs:ListQueueTags`, so reconciles can skip writes when nothing changed.
+  Without them, the plugin writes exactly as 0.8.0 did.
+
 ### Changed
 - `deckwatch-plugin-sdk` v0.10.0, the tagged release, replaces the pre-release
   commit 0.8.0 was built with. No behaviour change: deckwatch receives the same
@@ -14,11 +20,22 @@ history.
   the JSON. (#42)
 - `md-5` is now a wasm32 dependency plus a dev-dependency, which clears cargo's
   "unused dependency" warning on host builds. (#44)
+- **Reconciles skip AWS writes when nothing changed.** deckwatch can call
+  `apply()` every few seconds. Each reconcile now compares before it writes and
+  writes only what differs. That covers IAM trust policies, tags and inline
+  policies; RDS tags; S3 bucket existence, public access block, versioning,
+  lifecycle and tags; SQS tags; and secret tags. Most reconciles are now reads
+  only. (#46)
 
 ### Fixed
 - The backup guidance's example snapshot name (`<id>-pre-v<version>`) isn't a
   valid RDS identifier once the version has dots. The docs now use
   `<id>-pre-v0-8-0-<yyyymmdd>` and show waiting for `available`. (#45)
+- The "bucket tags already correct" check compared tag order as well as
+  content, so unchanged bucket tags could be rewritten on every reconcile.
+  (#46)
+- Secrets Manager `DescribeSecret` and `DeleteSecret` requests are built with
+  `serde_json`, so secret names are JSON-escaped. (#46)
 
 ## [0.8.0] - 2026-11-24
 
