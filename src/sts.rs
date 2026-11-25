@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn url_encode_role_arn() {
-        let arn = "arn:aws-us-gov:iam::591839118651:role/my-role";
+        let arn = "arn:aws-us-gov:iam::123456789012:role/my-role";
         let encoded = url_encode(arn);
         assert!(encoded.contains("%3A")); // colons encoded
         assert!(!encoded.contains(':'));

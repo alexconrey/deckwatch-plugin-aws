@@ -112,7 +112,7 @@ Set these keys in the plugin's `config`. Defaults come from the plugin's
 | `OIDC_PROVIDER_ARN` | *(none)* | ARN of the cluster's IAM OIDC provider, e.g. `arn:aws-us-gov:iam::<account>:oidc-provider/oidc.eks.us-gov-west-1.amazonaws.com/id/<id>`. **Required for IRSA:** without it, workload roles get an empty trust policy and pods can't assume them. |
 | `ROLE_PATH` | `/deckwatch-plugin/` | IAM path for every role the plugin creates. Must start and end with `/`. Scope the plugin's IAM permissions to this path. |
 | `BUCKET_PREFIX` | *(empty)* | Prepended to every S3 bucket name, e.g. `myorg-` turns `uploads` into `myorg-uploads`. |
-| `RESOURCE_NAME_PREFIX` | *(empty)* | Prepended to every SQS queue and Secrets Manager secret name, both defaults and names chosen in the UI, e.g. `k2-dw-` produces `k2-dw-<namespace>-<app>-queue`. It's never added twice. Set it so the plugin's IAM policy can be [scoped to `<prefix>*`](#scoping-sqs-and-secrets-manager-to-a-prefix) instead of every queue and secret in the account. |
+| `RESOURCE_NAME_PREFIX` | *(empty)* | Prepended to every SQS queue and Secrets Manager secret name, both defaults and names chosen in the UI, e.g. `acme-dw-` produces `acme-dw-<namespace>-<app>-queue`. It's never added twice. Set it so the plugin's IAM policy can be [scoped to `<prefix>*`](#scoping-sqs-and-secrets-manager-to-a-prefix) instead of every queue and secret in the account. |
 | `RESOURCE_TAGS` | *(empty)* | Tags applied to every AWS resource the plugin manages: IAM roles, RDS instances (and their snapshots), S3 buckets, SQS queues, secrets and backup plans. Write them as `Key=Value` pairs separated by commas or newlines, e.g. `Team=platform,CostCenter=1234`. A JSON object of string values (`{"Team":"platform"}`) is also accepted; that's how deckwatch will store the field once its row-per-tag editor ships. Validated against AWS's tag rules (at most 47 tags; no `aws:` or `deckwatch.io/` keys). See [Resource tags](#resource-tags). |
 
 ### Credentials
@@ -274,7 +274,7 @@ Notes:
 
 Granting the SQS and Secrets Manager actions on every queue or secret would let
 deckwatch change unrelated ones, such as a Karpenter interruption queue or
-application credentials. Set `RESOURCE_NAME_PREFIX` (for example `k2-dw-`)
+application credentials. Set `RESOURCE_NAME_PREFIX` (for example `acme-dw-`)
 instead, and scope those statements to `…:<prefix>*` as shown above. Every
 queue and secret the plugin creates carries the prefix, including names entered
 in the UI.
