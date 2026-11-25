@@ -20,12 +20,18 @@ without `iam:TagRole`.
 retention, tags every resource and rewrites inline policies), back up before
 upgrading:
 
-- Take a manual snapshot of each plugin-managed RDS instance. Manual snapshots
-  don't expire with the retention window:
+- Take a manual snapshot of each plugin-managed RDS instance, and wait until it's
+  `available` before upgrading. Manual snapshots don't expire with the retention
+  window. Snapshot identifiers allow only letters, digits and hyphens (starting
+  with a letter, with no double hyphens), so write the version's dots as
+  hyphens and add a date. Tag values may contain dots:
 
   ```bash
   aws rds create-db-snapshot --db-instance-identifier <id> \
-    --db-snapshot-identifier <id>-pre-v<version>
+    --db-snapshot-identifier <id>-pre-v0-8-0-<yyyymmdd> \
+    --tags Key=Purpose,Value=pre-plugin-upgrade-v0.8.0
+  aws rds wait db-snapshot-available \
+    --db-snapshot-identifier <id>-pre-v0-8-0-<yyyymmdd>
   ```
 
 - Record what to roll back to: the loaded binary's version, `sha256` and source

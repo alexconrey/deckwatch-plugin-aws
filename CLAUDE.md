@@ -166,8 +166,10 @@ server) and the AWS account behind it.
   secrets through `RESOURCE_NAME_PREFIX`. Before loading such a version into a
   live deckwatch:
   1. Take a manual snapshot of every plugin-managed RDS instance, e.g.
-     `<id>-pre-v<version>`. Manual snapshots don't expire with the retention
-     window.
+     `<id>-pre-v0-8-0-<yyyymmdd>`, and wait until each one is `available`.
+     Snapshot identifiers allow only letters, digits and hyphens, so write the
+     version's dots as hyphens. Manual snapshots don't expire with the
+     retention window.
   2. Record the rollback target: the loaded plugin's version, `sha256` and
      source (`GET /api/plugins`), and its full config (env keys, allowed hosts,
      inherited keys).
