@@ -223,7 +223,7 @@ mod tests {
     fn authorization_header_is_stable() {
         let (auth, payload_hash) = authorization_header(
             "PUT",
-            "k2-ampere-artifacts.s3.us-gov-west-1.amazonaws.com",
+            "acme-atlas-artifacts.s3.us-gov-west-1.amazonaws.com",
             "/",
             "versioning",
             r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#,
@@ -244,5 +244,5 @@ mod tests {
     const GOLDEN_AUTH: &str = "AWS4-HMAC-SHA256 \
         Credential=AKIDEXAMPLE/20261124/us-gov-west-1/s3/aws4_request, \
         SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, \
-        Signature=dafea5fd01e1d3a9cabbf8b8a0b37906b12c64b57be77db3bacaba89b8de59b6";
+        Signature=75d00342afa54abf4f7488f7b5685f01dfb30c63de875c3a83644a134e4def79";
 }

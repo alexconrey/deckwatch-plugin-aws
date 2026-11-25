@@ -2010,7 +2010,7 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "IAM_SIGNING_REGION".into(), label: "IAM Signing Region".into(), description: "Override Sig V4 region for IAM. Auto-detected from region.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "ROLE_PATH".into(), label: "IAM Role Path".into(), description: "Path prefix for created roles. Must start and end with /.".into(), field_type: ConfigFieldType::String, default: Some("/deckwatch-plugin/".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "BUCKET_PREFIX".into(), label: "S3 Bucket Prefix".into(), description: "Prepended to all S3 bucket names (e.g. myorg-).".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
-            ConfigField { key: "RESOURCE_NAME_PREFIX".into(), label: "Resource Name Prefix".into(), description: "Prepended to every SQS queue and Secrets Manager secret name (e.g. k2-dw-), so the plugin's IAM policy can be scoped to <prefix>* instead of all queues and secrets in the account.".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "RESOURCE_NAME_PREFIX".into(), label: "Resource Name Prefix".into(), description: "Prepended to every SQS queue and Secrets Manager secret name (e.g. acme-dw-), so the plugin's IAM policy can be scoped to <prefix>* instead of all queues and secrets in the account.".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "RESOURCE_TAGS".into(), label: "Resource Tags".into(), description: "Tags applied to every AWS resource the plugin manages (IAM roles, RDS, S3, SQS, secrets, backup plans): Key=Value pairs separated by commas, e.g. Team=platform,CostCenter=1234. The plugin also adds deckwatch.io/managed-by, deckwatch.io/application and deckwatch.io/namespace.".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "AWS_ACCESS_KEY_ID".into(), label: "Access Key ID".into(), description: "Static AWS access key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_ACCESS_KEY_ID".into()) },
             ConfigField { key: "AWS_SECRET_ACCESS_KEY".into(), label: "Secret Access Key".into(), description: "Static AWS secret key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SECRET_ACCESS_KEY".into()) },
@@ -2030,7 +2030,7 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
                 label: "RDS Instance Naming Convention".into(),
                 description: "Convention for naming RDS instances created by this plugin. \
                               Used by the AI agent when suggesting identifiers.".into(),
-                placeholder: "k2-{namespace}-{app}".into(),
+                placeholder: "acme-{namespace}-{app}".into(),
                 default: None,
             },
             McpTuningField {
@@ -2038,7 +2038,7 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
                 label: "S3 Bucket Naming Convention".into(),
                 description: "Convention for naming S3 buckets created by this plugin. \
                               Prepended or combined with the application name.".into(),
-                placeholder: "k2-{namespace}-{app}-".into(),
+                placeholder: "acme-{namespace}-{app}-".into(),
                 default: None,
             },
             McpTuningField {
@@ -3455,8 +3455,8 @@ mod tests {
     #[test]
     fn rds_instance_arn_is_partition_aware() {
         assert_eq!(
-            rds_instance_arn("us-gov-west-1", "123456789012", "ampere-db"),
-            "arn:aws-us-gov:rds:us-gov-west-1:123456789012:db:ampere-db"
+            rds_instance_arn("us-gov-west-1", "123456789012", "atlas-db"),
+            "arn:aws-us-gov:rds:us-gov-west-1:123456789012:db:atlas-db"
         );
         assert_eq!(
             rds_instance_arn("us-east-1", "123456789012", "app-db"),
@@ -3581,7 +3581,7 @@ mod tests {
 
     #[test]
     fn resource_tags_add_managed_ownership_tags() {
-        let tags = resource_tags(&[("Team".into(), "platform".into())], "ampere", "ampere-ns");
+        let tags = resource_tags(&[("Team".into(), "platform".into())], "atlas", "atlas-ns");
         assert_eq!(
             tags,
             vec![
@@ -3590,11 +3590,8 @@ mod tests {
                     "deckwatch.io/managed-by".to_string(),
                     "deckwatch-plugin-aws".to_string()
                 ),
-                ("deckwatch.io/application".to_string(), "ampere".to_string()),
-                (
-                    "deckwatch.io/namespace".to_string(),
-                    "ampere-ns".to_string()
-                ),
+                ("deckwatch.io/application".to_string(), "atlas".to_string()),
+                ("deckwatch.io/namespace".to_string(), "atlas-ns".to_string()),
             ]
         );
     }
@@ -3658,12 +3655,12 @@ mod tests {
     #[test]
     fn prefixed_name_is_idempotent() {
         assert_eq!(
-            prefixed_name("k2-dw-", "orders-queue"),
-            "k2-dw-orders-queue"
+            prefixed_name("acme-dw-", "orders-queue"),
+            "acme-dw-orders-queue"
         );
         assert_eq!(
-            prefixed_name("k2-dw-", "k2-dw-orders-queue"),
-            "k2-dw-orders-queue"
+            prefixed_name("acme-dw-", "acme-dw-orders-queue"),
+            "acme-dw-orders-queue"
         );
         assert_eq!(prefixed_name("", "orders-queue"), "orders-queue");
     }
@@ -3676,11 +3673,14 @@ mod tests {
             ("sqs.deckwatch.io/enabled", "true"),
             ("secretsmanager.deckwatch.io/enabled", "true"),
         ]);
-        let cfg = AwsConfig::from_context_with_prefix(&c, "k2-dw-");
-        assert_eq!(cfg.sqs.unwrap().queue_name, "k2-dw-production-my-app-queue");
+        let cfg = AwsConfig::from_context_with_prefix(&c, "acme-dw-");
+        assert_eq!(
+            cfg.sqs.unwrap().queue_name,
+            "acme-dw-production-my-app-queue"
+        );
         assert_eq!(
             cfg.secretsmanager.unwrap().secret_name,
-            "k2-dw-production/my-app"
+            "acme-dw-production/my-app"
         );
 
         let named = ctx(&[
@@ -3688,18 +3688,18 @@ mod tests {
             ("sqs.deckwatch.io/queue-name", "orders"),
             ("sqs.deckwatch.io/fifo", "true"),
         ]);
-        let result = apply_inner_with_prefixes(&named, "", "k2-dw-");
-        assert_eq!(find_env(&result, "QUEUE_NAME"), Some("k2-dw-orders.fifo"));
+        let result = apply_inner_with_prefixes(&named, "", "acme-dw-");
+        assert_eq!(find_env(&result, "QUEUE_NAME"), Some("acme-dw-orders.fifo"));
     }
 
     // provision() stamps the already-prefixed name; reconciling it must not
-    // produce k2-dw-k2-dw-… (which would create a second queue).
+    // produce acme-dw-acme-dw-… (which would create a second queue).
     #[test]
     fn stamped_prefixed_queue_name_is_not_prefixed_again() {
-        let anns = sqs_apply_annotations("orders", "k2-dw-orders-events", false, 30, 4, "r");
+        let anns = sqs_apply_annotations("orders", "acme-dw-orders-events", false, 30, 4, "r");
         let pairs: Vec<(&str, &str)> = anns.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let cfg = AwsConfig::from_context_with_prefix(&ctx(&pairs), "k2-dw-");
-        assert_eq!(cfg.sqs.unwrap().queue_name, "k2-dw-orders-events");
+        let cfg = AwsConfig::from_context_with_prefix(&ctx(&pairs), "acme-dw-");
+        assert_eq!(cfg.sqs.unwrap().queue_name, "acme-dw-orders-events");
     }
 
     // Without a prefix configured, names are unchanged.
@@ -3765,7 +3765,7 @@ mod tests {
     // secrets are read-only.
     #[test]
     fn secrets_policy_grants_write_only_on_owned_secrets() {
-        let owned = "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:k2-dw-shop/shop-AbCdEf".to_string();
+        let owned = "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:acme-dw-shop/shop-AbCdEf".to_string();
         let shared =
             "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:shared/db-ZyXwVu"
                 .to_string();
@@ -3808,18 +3808,18 @@ mod tests {
     // a hand-added owned-secret-arns annotation can't reach other secrets.
     #[test]
     fn writable_secret_arns_respects_resource_prefix() {
-        let ours = "arn:aws-us-gov:secretsmanager:us-gov-west-1:1:secret:k2-dw-shop/shop-AbCdEf"
+        let ours = "arn:aws-us-gov:secretsmanager:us-gov-west-1:1:secret:acme-dw-shop/shop-AbCdEf"
             .to_string();
         let theirs =
             "arn:aws-us-gov:secretsmanager:us-gov-west-1:1:secret:gitlab/runner-AbCdEf".to_string();
         let owned = vec![ours.clone(), theirs.clone()];
-        assert_eq!(writable_secret_arns(&owned, "k2-dw-"), vec![ours]);
+        assert_eq!(writable_secret_arns(&owned, "acme-dw-"), vec![ours]);
         assert_eq!(
             writable_secret_arns(&owned, ""),
             owned,
             "no prefix: nothing to check"
         );
-        assert!(writable_secret_arns(&["not-an-arn".to_string()], "k2-dw-").is_empty());
+        assert!(writable_secret_arns(&["not-an-arn".to_string()], "acme-dw-").is_empty());
     }
 
     // Referenced and owned annotations can coexist on one deployment.
@@ -3898,13 +3898,13 @@ mod tests {
     #[test]
     fn final_snapshot_identifier_is_timestamped_and_valid() {
         assert_eq!(
-            final_snapshot_identifier("ampere-db", "20261124T170503Z"),
-            "ampere-db-final-20261124-170503"
+            final_snapshot_identifier("atlas-db", "20261124T170503Z"),
+            "atlas-db-final-20261124-170503"
         );
         // Unique per deletion, so a re-created instance can be deleted again.
         assert_ne!(
-            final_snapshot_identifier("ampere-db", "20261124T170503Z"),
-            final_snapshot_identifier("ampere-db", "20261125T090000Z")
+            final_snapshot_identifier("atlas-db", "20261124T170503Z"),
+            final_snapshot_identifier("atlas-db", "20261125T090000Z")
         );
         // Never ends with a hyphen and stays within RDS's 255-char limit.
         let long = final_snapshot_identifier(&"a".repeat(300), "20261124T170503Z");
@@ -3966,12 +3966,12 @@ mod tests {
     // hardcode arn:aws:s3:::, which never matches a GovCloud bucket.
     #[test]
     fn s3_policy_uses_govcloud_partition() {
-        let doc = s3_access_policy_document("k2-ampere-artifacts", "us-gov-west-1");
+        let doc = s3_access_policy_document("acme-atlas-artifacts", "us-gov-west-1");
         assert_eq!(
             policy_resources(&doc),
             vec![
-                "arn:aws-us-gov:s3:::k2-ampere-artifacts/*",
-                "arn:aws-us-gov:s3:::k2-ampere-artifacts",
+                "arn:aws-us-gov:s3:::acme-atlas-artifacts/*",
+                "arn:aws-us-gov:s3:::acme-atlas-artifacts",
             ]
         );
         assert!(!doc.contains("arn:aws:s3:::"));
@@ -3992,32 +3992,32 @@ mod tests {
         assert_eq!(v["Statement"][1]["Action"], json!("s3:ListBucket"));
     }
 
-    /// Annotations on the zeus `ampere/backend` deployment after its RDS and S3
-    /// resources were provisioned by plugin v0.7.x (taken from the live cluster).
-    fn zeus_ampere_backend_annotations() -> Vec<(&'static str, &'static str)> {
+    /// Annotations on an `atlas/backend` deployment after its RDS and S3
+    /// resources were provisioned by plugin v0.7.x, modelled on a real one.
+    fn gov_atlas_backend_annotations() -> Vec<(&'static str, &'static str)> {
         vec![
-            ("aws.deckwatch.io/app-name", "ampere"),
-            ("aws.deckwatch.io/role-name", "ampere-ampere-rds"),
-            ("deckwatch.io/aws-rds-db-name", "ampere"),
+            ("aws.deckwatch.io/app-name", "atlas"),
+            ("aws.deckwatch.io/role-name", "atlas-atlas-rds"),
+            ("deckwatch.io/aws-rds-db-name", "atlas"),
             (
                 "deckwatch.io/aws-rds-endpoint",
-                "ampere-db.czwkxlpc6i5c.us-gov-west-1.rds.amazonaws.com",
+                "atlas-db.czwkxlpc6i5c.us-gov-west-1.rds.amazonaws.com",
             ),
             ("deckwatch.io/aws-rds-engine", "postgres"),
-            ("deckwatch.io/aws-s3-bucket", "k2-ampere-artifacts"),
+            ("deckwatch.io/aws-s3-bucket", "acme-atlas-artifacts"),
             ("deckwatch.io/aws-s3-region", "us-gov-west-1"),
-            ("rds.deckwatch.io/db-name", "ampere"),
+            ("rds.deckwatch.io/db-name", "atlas"),
             ("rds.deckwatch.io/enabled", "true"),
             ("rds.deckwatch.io/engine", "postgres"),
             ("rds.deckwatch.io/iam-auth", "true"),
-            ("rds.deckwatch.io/identifier", "ampere-db"),
+            ("rds.deckwatch.io/identifier", "atlas-db"),
             ("rds.deckwatch.io/instance-class", "db.t3.micro"),
         ]
     }
 
-    fn ampere_ctx(annotations: &[(&str, &str)]) -> PluginContext {
+    fn atlas_ctx(annotations: &[(&str, &str)]) -> PluginContext {
         PluginContext {
-            namespace: "ampere".into(),
+            namespace: "atlas".into(),
             deployment_name: "backend".into(),
             annotations: annotations
                 .iter()
@@ -4030,7 +4030,7 @@ mod tests {
         }
     }
 
-    // Regression for zeus ampere: S3 was provisioned but the workload role never
+    // Regression: S3 was provisioned for an app, but its workload role never
     // got an S3 policy.
     //
     // Before: provision("s3") stamped only informational annotations, so apply()
@@ -4038,27 +4038,27 @@ mod tests {
     // After: provision("s3") also stamps s3_apply_annotations, so apply() attaches
     // a GovCloud-correct policy for the bucket to the role the pods' SA uses.
     #[test]
-    fn zeus_ampere_s3_policy_reaches_workload_role() {
+    fn gov_atlas_s3_policy_reaches_workload_role() {
         // Before the fix: the live annotations leave S3 disabled for apply().
-        let before = AwsConfig::from_context(&ampere_ctx(&zeus_ampere_backend_annotations()));
+        let before = AwsConfig::from_context(&atlas_ctx(&gov_atlas_backend_annotations()));
         assert!(
             before.s3.is_none(),
             "pre-fix annotations must reproduce the bug: apply() sees no S3 config"
         );
 
         // After the fix: provision("s3") additionally stamps these. The provision
-        // request had bucket_name=k2-ampere-artifacts with an empty BUCKET_PREFIX.
-        let role = rds_role_name("ampere", "ampere");
-        let stamped = s3_apply_annotations("ampere", "k2-ampere-artifacts", "us-gov-west-1", &role);
-        let mut anns: HashMap<&str, &str> = zeus_ampere_backend_annotations().into_iter().collect();
+        // request had bucket_name=acme-atlas-artifacts with an empty BUCKET_PREFIX.
+        let role = rds_role_name("atlas", "atlas");
+        let stamped = s3_apply_annotations("atlas", "acme-atlas-artifacts", "us-gov-west-1", &role);
+        let mut anns: HashMap<&str, &str> = gov_atlas_backend_annotations().into_iter().collect();
         anns.extend(stamped.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         let pairs: Vec<(&str, &str)> = anns.into_iter().collect();
-        let c = ampere_ctx(&pairs);
+        let c = atlas_ctx(&pairs);
         let cfg = AwsConfig::from_context(&c);
 
         // Same role and SA the pods already use — no second identity is created.
-        assert_eq!(cfg.role_name, "ampere-ampere-rds");
-        assert_eq!(workload_sa_name(&cfg.app_name), "ampere-aws-sa");
+        assert_eq!(cfg.role_name, "atlas-atlas-rds");
+        assert_eq!(workload_sa_name(&cfg.app_name), "atlas-aws-sa");
 
         let s3 = cfg.s3.expect("apply() must now see S3 as enabled");
         assert_eq!(s3.region, "us-gov-west-1");
@@ -4066,46 +4066,46 @@ mod tests {
         // apply_with_aws calls attach_s3_policy(role, BUCKET_PREFIX + bucket, s3.region).
         let bucket_prefix = "";
         let full_bucket = format!("{bucket_prefix}{}", s3.bucket_name);
-        assert_eq!(full_bucket, "k2-ampere-artifacts");
+        assert_eq!(full_bucket, "acme-atlas-artifacts");
         assert_eq!(
             policy_resources(&s3_access_policy_document(&full_bucket, &s3.region)),
             vec![
-                "arn:aws-us-gov:s3:::k2-ampere-artifacts/*",
-                "arn:aws-us-gov:s3:::k2-ampere-artifacts",
+                "arn:aws-us-gov:s3:::acme-atlas-artifacts/*",
+                "arn:aws-us-gov:s3:::acme-atlas-artifacts",
             ]
         );
 
         let result = apply_inner(&c, bucket_prefix);
-        assert_eq!(find_env(&result, "S3_BUCKET"), Some("k2-ampere-artifacts"));
+        assert_eq!(find_env(&result, "S3_BUCKET"), Some("acme-atlas-artifacts"));
         assert_eq!(find_env(&result, "S3_REGION"), Some("us-gov-west-1"));
         // RDS config is unaffected by the merged annotations.
-        assert_eq!(find_env(&result, "POSTGRES_USER"), Some("ampere"));
+        assert_eq!(find_env(&result, "POSTGRES_USER"), Some("atlas"));
     }
 
     // provision() stamps the bucket name without BUCKET_PREFIX; apply() adds it.
     #[test]
     fn s3_apply_annotations_do_not_double_bucket_prefix() {
-        let anns = s3_apply_annotations("ampere", "ampere-artifacts", "us-gov-west-1", "r");
+        let anns = s3_apply_annotations("atlas", "atlas-artifacts", "us-gov-west-1", "r");
         let pairs: Vec<(&str, &str)> = anns.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let result = apply_inner(&ctx(&pairs), "k2-");
-        assert_eq!(find_env(&result, "S3_BUCKET"), Some("k2-ampere-artifacts"));
+        let result = apply_inner(&ctx(&pairs), "acme-");
+        assert_eq!(find_env(&result, "S3_BUCKET"), Some("acme-atlas-artifacts"));
     }
 
     // RDS and S3 provisioning stamp the same app/role annotations, so the merge
     // order deckwatch applies them in cannot point apply() at a different role.
     #[test]
     fn rds_and_s3_annotations_agree_on_role() {
-        let role = rds_role_name("ampere", "ampere");
+        let role = rds_role_name("atlas", "atlas");
         let rds = rds_apply_annotations(
-            "ampere",
-            "ampere-db",
+            "atlas",
+            "atlas-db",
             "postgres",
             "db.t3.micro",
-            "ampere",
+            "atlas",
             true,
             &role,
         );
-        let s3 = s3_apply_annotations("ampere", "k2-ampere-artifacts", "us-gov-west-1", &role);
+        let s3 = s3_apply_annotations("atlas", "acme-atlas-artifacts", "us-gov-west-1", &role);
         for key in ["aws.deckwatch.io/app-name", "aws.deckwatch.io/role-name"] {
             assert_eq!(rds.get(key), s3.get(key), "{key} must match");
         }

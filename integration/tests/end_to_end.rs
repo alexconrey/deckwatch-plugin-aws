@@ -307,7 +307,7 @@ fn policy_resources(doc: &Value) -> Vec<String> {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// Mirrors zeus `ampere`: RDS provisioning already created the app role with
+/// Mirrors a production app: RDS provisioning already created the app role with
 /// only an rds-db:connect policy, then S3 is provisioned for the app.
 ///
 /// Before the fix the role never received an S3 policy. Now provision("s3")
@@ -317,7 +317,7 @@ fn policy_resources(doc: &Value) -> Vec<String> {
 #[tokio::test]
 async fn govcloud_s3_provision_grants_existing_app_role() {
     let region = "us-gov-west-1";
-    let (ns, app, bucket) = ("ampere-it", unique("ampere-gov"), unique("k2-ampere-gov"));
+    let (ns, app, bucket) = ("atlas-it", unique("atlas-gov"), unique("acme-atlas-gov"));
     let role_name = format!("{ns}-{app}-rds");
     let iam = iam_client(region).await;
 
@@ -332,7 +332,7 @@ async fn govcloud_s3_provision_grants_existing_app_role() {
     iam.put_role_policy()
         .role_name(&role_name)
         .policy_name("deckwatch-rds-connect")
-        .policy_document(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"rds-db:connect","Resource":"arn:aws-us-gov:rds-db:us-gov-west-1:123456789012:dbuser:db-TEST/ampere"}]}"#)
+        .policy_document(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"rds-db:connect","Resource":"arn:aws-us-gov:rds-db:us-gov-west-1:123456789012:dbuser:db-TEST/atlas"}]}"#)
         .send()
         .await
         .expect("seed rds policy");
@@ -430,9 +430,9 @@ async fn govcloud_s3_provision_grants_existing_app_role() {
 async fn apply_reconcile_reasserts_s3_policy_and_service_account() {
     let region = "us-gov-west-1";
     let (ns, app, bucket) = (
-        "ampere-it",
-        unique("ampere-reconcile"),
-        unique("k2-ampere-reconcile"),
+        "atlas-it",
+        unique("atlas-reconcile"),
+        unique("acme-atlas-reconcile"),
     );
     let role_name = format!("{ns}-{app}-rds");
     let iam = iam_client(region).await;
@@ -530,12 +530,12 @@ async fn commercial_s3_provision_creates_role_when_missing() {
 #[tokio::test]
 async fn bucket_prefix_applied_once_end_to_end() {
     let region = "us-gov-west-1";
-    let (ns, app, suffix) = ("ampere-it", unique("ampere-prefix"), unique("prefixed"));
-    let full = format!("k2-{suffix}");
+    let (ns, app, suffix) = ("atlas-it", unique("atlas-prefix"), unique("prefixed"));
+    let full = format!("acme-{suffix}");
     let role_name = format!("{ns}-{app}-rds");
     let iam = iam_client(region).await;
 
-    let mut plugin = load_plugin(region, &[("BUCKET_PREFIX", "k2-")]);
+    let mut plugin = load_plugin(region, &[("BUCKET_PREFIX", "acme-")]);
     let provisioned = call_provision(&mut plugin, &s3_request(app, ns, suffix, region));
     assert!(
         provisioned.errors.is_empty(),
@@ -754,7 +754,7 @@ async fn secretsmanager_provision_grants_and_deprovision_cleans_up() {
 async fn deprovision_keeps_shared_role_until_last_resource() {
     let region = "us-gov-west-1";
     let (ns, app) = ("shop-it", unique("shop"));
-    let (bucket, queue) = (unique("k2-shop-assets"), unique("shop-orders"));
+    let (bucket, queue) = (unique("acme-shop-assets"), unique("shop-orders"));
     let role_name = format!("{ns}-{app}-rds");
     let iam = iam_client(region).await;
     let mut plugin = load_plugin(region, &[]);
@@ -890,8 +890,8 @@ async fn provisioned_rds_gets_14_day_backup_retention() {
     assert_eq!(db.deletion_protection(), Some(true));
 }
 
-/// Instances created with RDS's 1-day default (all five plugin-created
-/// instances on zeus) are raised to the configured retention on the next
+/// Instances created with RDS's 1-day default (every instance the plugin
+/// created before) are raised to the configured retention on the next
 /// reconcile, without being lowered or recreated.
 #[tokio::test]
 async fn existing_rds_backup_retention_is_raised_on_reconcile() {
@@ -990,7 +990,7 @@ async fn rds_deprovision_always_takes_a_final_snapshot() {
 #[tokio::test]
 async fn resource_name_prefix_scopes_queue_and_secret_names() {
     let region = "us-gov-west-1";
-    let prefix = format!("k2-dw-{}-", run_id());
+    let prefix = format!("acme-dw-{}-", run_id());
     let (ns, app) = ("prefix-it", unique("prefixed"));
     let mut plugin = load_plugin(region, &[("RESOURCE_NAME_PREFIX", prefix.as_str())]);
 
@@ -1063,7 +1063,7 @@ async fn resource_tags_are_applied_to_every_managed_resource() {
     let region = "us-gov-west-1";
     let (ns, app) = ("tagged-it", unique("tagged"));
     let (bucket, queue, db) = (
-        unique("k2-tagged-assets"),
+        unique("acme-tagged-assets"),
         unique("tagged-q"),
         unique("tagged-db"),
     );
