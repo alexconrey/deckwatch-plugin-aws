@@ -12,6 +12,13 @@ history.
   commit 0.8.0 was built with. No behaviour change: deckwatch receives the same
   metadata and results, because the SDK's new fields are empty and left out of
   the JSON. (#42)
+- `md-5` is now a wasm32 dependency plus a dev-dependency, which clears cargo's
+  "unused dependency" warning on host builds. (#44)
+
+### Fixed
+- The backup guidance's example snapshot name (`<id>-pre-v<version>`) isn't a
+  valid RDS identifier once the version has dots. The docs now use
+  `<id>-pre-v0-8-0-<yyyymmdd>` and show waiting for `available`. (#45)
 
 ## [0.8.0] - 2026-11-24
 
