@@ -33,12 +33,13 @@ pub fn ensure_queue(
     let name = crate::canonical_queue_name(&cfg.queue_name, cfg.fifo);
 
     if let Some(info) = get_queue_url(&name, creds)? {
-        log!(
-            LogLevel::Info,
-            "deckwatch-plugin-aws: SQS queue {name} already exists"
-        );
         // TagQueue adds or updates only these keys; other tags are kept.
-        if !tags.is_empty() {
+        // Skipped when ListQueueTags already shows every tag; if that read
+        // fails (e.g. no sqs:ListQueueTags), tag as before.
+        let already_tagged = !tags.is_empty()
+            && list_queue_tags(&info.queue_url, creds)
+                .is_ok_and(|existing| crate::tags_satisfied(&existing, tags));
+        if !tags.is_empty() && !already_tagged {
             let body = format!(
                 "Action=TagQueue&Version=2012-11-05&QueueUrl={}{}",
                 url_encode(&info.queue_url),
@@ -93,6 +94,15 @@ pub fn delete_queue(queue_url: &str, creds: &AwsCredentials) -> Result<(), Strin
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
+
+/// The queue's tags (`ListQueueTags`).
+fn list_queue_tags(queue_url: &str, creds: &AwsCredentials) -> Result<crate::Tags, String> {
+    let body = format!(
+        "Action=ListQueueTags&Version=2012-11-05&QueueUrl={}",
+        url_encode(queue_url)
+    );
+    sqs_query(&body, creds).map(|xml| crate::xml_tag_pairs(&xml, "Tag"))
+}
 
 fn get_queue_url(name: &str, creds: &AwsCredentials) -> Result<Option<SqsInfo>, String> {
     let body = format!(

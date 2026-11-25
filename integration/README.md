@@ -28,6 +28,9 @@ GovCloud regions:
 - **Naming and tags:** `RESOURCE_NAME_PREFIX` scopes queue and secret names, and
   `RESOURCE_TAGS` plus the managed tags reach every resource type.
 - **AWS Backup:** a snapshot schedule creates a tagged backup plan.
+- **No-op reconciles:** reconciling an unchanged app makes no AWS writes, which
+  moto's request recorder confirms, while a changed tag still reaches every
+  resource.
 - **Safety:** a malformed `AWS_ENDPOINT_URL` fails instead of reaching AWS.
 
 ## What moto doesn't check

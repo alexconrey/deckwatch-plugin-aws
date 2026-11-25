@@ -457,7 +457,14 @@ fn s3_tagging_xml(tags: &[(String, String)]) -> String {
 /// Tag set from an S3 GetBucketTagging response.
 #[cfg(any(target_arch = "wasm32", test))]
 fn parse_s3_tag_set(xml: &str) -> Tags {
-    xml_tag_values(xml, "Tag")
+    xml_tag_pairs(xml, "Tag")
+}
+
+/// Key/value pairs from every `<item>` element that holds a `<Key>` and a
+/// `<Value>`: S3, SQS and RDS use `<Tag>`, and IAM uses `<member>`.
+#[cfg(any(target_arch = "wasm32", test))]
+fn xml_tag_pairs(xml: &str, item: &str) -> Tags {
+    xml_tag_values(xml, item)
         .iter()
         .filter_map(|tag| {
             let key = xml_tag_values(tag, "Key").into_iter().next()?;
@@ -468,6 +475,144 @@ fn parse_s3_tag_set(xml: &str) -> Tags {
             Some((xml_unescape(&key), xml_unescape(&value)))
         })
         .collect()
+}
+
+/// Tags from an IAM `GetRole` response. Only the role's `<Tags>` list is read,
+/// so `member` elements elsewhere in the response can't be mistaken for tags.
+#[cfg(any(target_arch = "wasm32", test))]
+fn iam_role_tags(get_role_xml: &str) -> Tags {
+    xml_tag_values(get_role_xml, "Tags")
+        .first()
+        .map(|tags| xml_tag_pairs(tags, "member"))
+        .unwrap_or_default()
+}
+
+/// Tags from an RDS `DescribeDBInstances` response (`<TagList>`).
+#[cfg(any(target_arch = "wasm32", test))]
+fn rds_instance_tags(describe_xml: &str) -> Tags {
+    xml_tag_values(describe_xml, "TagList")
+        .first()
+        .map(|tags| xml_tag_pairs(tags, "Tag"))
+        .unwrap_or_default()
+}
+
+/// Tags from a Secrets Manager `DescribeSecret` response (`"Tags": [{"Key",
+/// "Value"}]`). Empty if there are none or the JSON can't be parsed.
+#[cfg(any(target_arch = "wasm32", test))]
+fn secret_tags(describe_json: &str) -> Tags {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(describe_json) else {
+        return vec![];
+    };
+    v.get("Tags")
+        .and_then(|t| t.as_array())
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|t| {
+                    let key = t.get("Key")?.as_str()?;
+                    let value = t.get("Value").and_then(|v| v.as_str()).unwrap_or("");
+                    Some((key.to_string(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether every tag the plugin wants is already present with the same value.
+/// Extra tags on the resource don't matter: the plugin never removes tags.
+#[cfg(any(target_arch = "wasm32", test))]
+fn tags_satisfied(existing: &[(String, String)], desired: &[(String, String)]) -> bool {
+    desired
+        .iter()
+        .all(|(k, v)| existing.iter().any(|(ek, ev)| ek == k && ev == v))
+}
+
+/// Decode `%XX` escapes (RFC 3986), as IAM uses for policy documents. Invalid
+/// escapes are kept as they are, and `+` stays `+`.
+#[cfg(any(target_arch = "wasm32", test))]
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(high << 4 | low);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether a policy document returned by IAM matches the one the plugin would
+/// write. IAM returns documents URL-encoded (moto too, sometimes XML-escaped),
+/// and the comparison is on parsed JSON, so whitespace and key order don't
+/// matter. Anything unparseable counts as different, so the caller writes.
+#[cfg(any(target_arch = "wasm32", test))]
+fn iam_policy_matches(returned: &str, desired: &str) -> bool {
+    let unescaped = xml_unescape(returned.trim());
+    let document = if unescaped.starts_with('{') {
+        unescaped
+    } else {
+        percent_decode(&unescaped)
+    };
+    match (
+        serde_json::from_str::<serde_json::Value>(&document),
+        serde_json::from_str::<serde_json::Value>(desired),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Whether an S3 `GetBucketVersioning` response shows versioning enabled.
+#[cfg(any(target_arch = "wasm32", test))]
+fn s3_versioning_enabled(xml: &str) -> bool {
+    xml_tag_values(xml, "Status").first().map(String::as_str) == Some("Enabled")
+}
+
+/// Whether an S3 `GetPublicAccessBlock` response blocks all public access,
+/// which is what the plugin writes.
+#[cfg(any(target_arch = "wasm32", test))]
+fn s3_public_access_fully_blocked(xml: &str) -> bool {
+    [
+        "BlockPublicAcls",
+        "IgnorePublicAcls",
+        "BlockPublicPolicy",
+        "RestrictPublicBuckets",
+    ]
+    .iter()
+    .all(|flag| xml_tag_values(xml, flag).first().map(String::as_str) == Some("true"))
+}
+
+/// Lifecycle rule ID the plugin writes for `s3.deckwatch.io/lifecycle-days`.
+#[cfg(any(target_arch = "wasm32", test))]
+const S3_LIFECYCLE_RULE_ID: &str = "deckwatch-expire";
+
+/// Whether an S3 `GetBucketLifecycleConfiguration` response already has the
+/// plugin's enabled expiry rule with this many days.
+#[cfg(any(target_arch = "wasm32", test))]
+fn s3_lifecycle_has_expiry_rule(xml: &str, days: u32) -> bool {
+    xml_tag_values(xml, "Rule").iter().any(|rule| {
+        let field = |name: &str| xml_tag_values(rule, name).into_iter().next();
+        let expiration_days = field("Expiration")
+            .and_then(|e| xml_tag_values(&e, "Days").into_iter().next())
+            .and_then(|d| d.parse::<u32>().ok());
+        field("ID").as_deref() == Some(S3_LIFECYCLE_RULE_ID)
+            && field("Status").as_deref() == Some("Enabled")
+            && expiration_days == Some(days)
+    })
 }
 
 /// Standard base64 with padding.
@@ -4448,5 +4593,180 @@ mod tests {
         let name = bootstrap_job_name(&long_app, &serde_json::json!({}));
         assert!(name.len() <= 63, "{} chars: {name}", name.len());
         assert!(!name.contains("--"));
+    }
+
+    // ── No-op write detection (#46) ───────────────────────────────────────────
+
+    fn pairs(v: &[(&str, &str)]) -> Tags {
+        v.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn tags_satisfied_needs_every_desired_key_with_the_same_value() {
+        let existing = pairs(&[
+            ("deckwatch.io/application", "atlas"),
+            ("Team", "platform"),
+            ("SetBySomeoneElse", "x"),
+        ]);
+        assert!(tags_satisfied(&existing, &pairs(&[("Team", "platform")])));
+        assert!(tags_satisfied(&existing, &[]), "nothing desired");
+        assert!(
+            !tags_satisfied(&existing, &pairs(&[("Team", "rad")])),
+            "value differs"
+        );
+        assert!(
+            !tags_satisfied(&existing, &pairs(&[("CostCenter", "1")])),
+            "key missing"
+        );
+        assert!(!tags_satisfied(&[], &pairs(&[("Team", "platform")])));
+    }
+
+    #[test]
+    fn iam_role_tags_reads_only_the_roles_tag_list() {
+        let xml = "<GetRoleResponse><GetRoleResult><Role><Path>/deckwatch-plugin/</Path>\
+            <AssumeRolePolicyDocument>%7B%7D</AssumeRolePolicyDocument>\
+            <Tags><member><Key>deckwatch.io/managed-by</Key><Value>deckwatch-plugin-aws</Value></member>\
+            <member><Key>Team</Key><Value>a &amp; b</Value></member></Tags>\
+            </Role></GetRoleResult><ResponseMetadata><member><Key>not-a-tag</Key><Value>x</Value>\
+            </member></ResponseMetadata></GetRoleResponse>";
+        assert_eq!(
+            iam_role_tags(xml),
+            pairs(&[
+                ("deckwatch.io/managed-by", "deckwatch-plugin-aws"),
+                ("Team", "a & b")
+            ])
+        );
+        assert!(iam_role_tags("<Role><RoleName>r</RoleName></Role>").is_empty());
+    }
+
+    #[test]
+    fn rds_instance_tags_reads_the_tag_list() {
+        let xml = "<DBInstance><DBInstanceIdentifier>db</DBInstanceIdentifier><TagList>\
+            <Tag><Key>deckwatch.io/application</Key><Value>shop</Value></Tag>\
+            <Tag><Key>Team</Key><Value>platform</Value></Tag></TagList></DBInstance>";
+        assert_eq!(
+            rds_instance_tags(xml),
+            pairs(&[("deckwatch.io/application", "shop"), ("Team", "platform")])
+        );
+        assert!(rds_instance_tags("<DBInstance><TagList/></DBInstance>").is_empty());
+    }
+
+    #[test]
+    fn sqs_list_queue_tags_parse_as_tag_pairs() {
+        let xml = "<ListQueueTagsResponse><ListQueueTagsResult><Tag><Key>Team</Key>\
+            <Value>platform</Value></Tag></ListQueueTagsResult></ListQueueTagsResponse>";
+        assert_eq!(xml_tag_pairs(xml, "Tag"), pairs(&[("Team", "platform")]));
+    }
+
+    #[test]
+    fn secret_tags_parse_describe_secret_json() {
+        let json = r#"{ "ARN": "arn:aws:secretsmanager:us-east-1:1:secret:x-AbCdEf", "Name": "x",
+            "Tags": [ { "Key": "Team", "Value": "platform" }, { "Key": "Empty" } ] }"#;
+        assert_eq!(
+            secret_tags(json),
+            pairs(&[("Team", "platform"), ("Empty", "")])
+        );
+        assert!(secret_tags(r#"{"ARN":"a"}"#).is_empty());
+        assert!(secret_tags("not json").is_empty());
+    }
+
+    #[test]
+    fn percent_decode_handles_iam_encoding() {
+        assert_eq!(
+            percent_decode("%7B%22a%22%3A%22b/%2A%22%7D"),
+            r#"{"a":"b/*"}"#
+        );
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        assert_eq!(percent_decode("100%"), "100%", "trailing % kept");
+        assert_eq!(percent_decode("%zz%2"), "%zz%2", "invalid escapes kept");
+        assert_eq!(percent_decode("a+b"), "a+b", "+ isn't a space in RFC 3986");
+        assert_eq!(
+            percent_decode("%é"),
+            "%é",
+            "multi-byte char after % doesn't panic"
+        );
+    }
+
+    #[test]
+    fn iam_policy_matches_compares_parsed_json() {
+        let desired = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}"#;
+        // As IAM and moto return it: URL-encoded, with `*` as %2A.
+        let encoded = "%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Action%22%3A%22s3%3AGetObject%22%2C%22Resource%22%3A%22arn%3Aaws%3As3%3A%3A%3Ab/%2A%22%7D%5D%7D";
+        assert!(iam_policy_matches(encoded, desired));
+        // Whitespace and key order don't matter, and XML escaping is undone.
+        let reordered = r#"{ "Statement": [ { "Resource": "arn:aws:s3:::b/*", "Action": "s3:GetObject", "Effect": "Allow" } ], "Version": "2012-10-17" }"#;
+        assert!(iam_policy_matches(reordered, desired));
+        assert!(iam_policy_matches(&desired.replace('"', "&quot;"), desired));
+        // A different resource, or anything unparseable, is a mismatch.
+        assert!(!iam_policy_matches(
+            &encoded.replace("b/%2A", "c/%2A"),
+            desired
+        ));
+        assert!(!iam_policy_matches("%7Bnot-json", desired));
+        assert!(!iam_policy_matches("", desired));
+    }
+
+    #[test]
+    fn s3_versioning_enabled_reads_the_status() {
+        let doc = |status: &str| {
+            format!(
+                r#"<VersioningConfiguration xmlns="x"><Status>{status}</Status></VersioningConfiguration>"#
+            )
+        };
+        assert!(s3_versioning_enabled(&doc("Enabled")));
+        assert!(!s3_versioning_enabled(&doc("Suspended")));
+        assert!(
+            !s3_versioning_enabled(r#"<VersioningConfiguration xmlns="x"/>"#),
+            "never set"
+        );
+    }
+
+    #[test]
+    fn s3_public_access_fully_blocked_needs_all_four_flags() {
+        let all = "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls>\
+            <IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy>\
+            <RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>";
+        assert!(s3_public_access_fully_blocked(all));
+        assert!(!s3_public_access_fully_blocked(
+            &all.replace("<BlockPublicPolicy>true", "<BlockPublicPolicy>false")
+        ));
+        assert!(
+            !s3_public_access_fully_blocked(
+                &all.replace("<RestrictPublicBuckets>true</RestrictPublicBuckets>", "")
+            ),
+            "flag missing"
+        );
+    }
+
+    #[test]
+    fn s3_lifecycle_has_expiry_rule_matches_only_the_plugins_rule() {
+        let rule = |id: &str, status: &str, days: u32| {
+            format!("<Rule><ID>{id}</ID><Status>{status}</Status><Filter></Filter><Expiration><Days>{days}</Days></Expiration></Rule>")
+        };
+        let doc = |rules: &str| format!("<LifecycleConfiguration>{rules}</LifecycleConfiguration>");
+        let ours = |status: &str, days: u32| rule(S3_LIFECYCLE_RULE_ID, status, days);
+        assert!(s3_lifecycle_has_expiry_rule(&doc(&ours("Enabled", 30)), 30));
+        assert!(
+            !s3_lifecycle_has_expiry_rule(&doc(&ours("Enabled", 7)), 30),
+            "days differ"
+        );
+        assert!(!s3_lifecycle_has_expiry_rule(
+            &doc(&ours("Disabled", 30)),
+            30
+        ));
+        assert!(!s3_lifecycle_has_expiry_rule(
+            &doc(&rule("other", "Enabled", 30)),
+            30
+        ));
+        let with_other_rule = format!("{}{}", rule("archive", "Enabled", 365), ours("Enabled", 30));
+        assert!(s3_lifecycle_has_expiry_rule(&doc(&with_other_rule), 30));
+        // A transition's Days must not be read as the expiration's.
+        let transition = format!(
+            "<Rule><ID>{S3_LIFECYCLE_RULE_ID}</ID><Status>Enabled</Status>\
+             <Transition><Days>30</Days></Transition><Expiration><Days>90</Days></Expiration></Rule>"
+        );
+        assert!(!s3_lifecycle_has_expiry_rule(&doc(&transition), 30));
     }
 }

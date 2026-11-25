@@ -83,6 +83,14 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
     update `docs/configuration.md#plugin-iam-permissions` and the CHANGELOG
     *Upgrade notes* in the same PR. Tagging was merged with a documented policy
     that lacked `iam:TagRole`, which blocks role creation, and no test caught it.
+15. **Reconciles read before they write.** deckwatch can call `apply()` every
+    few seconds, so re-asserting an unchanged resource must cost reads, not
+    writes. Compare first (`tags_satisfied`, `iam_policy_matches`, the S3
+    `Get*` checks) and write only what differs. If the read fails (e.g. an
+    optional read permission isn't granted), write as before; a failed read
+    must never turn into a skipped write or a lost tag. The
+    `reconcile_without_changes_makes_no_aws_writes` integration test enforces
+    this for new write paths.
 
 ## Testing
 
@@ -97,6 +105,11 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
   any crypto or dependency change; don't re-capture it to make a test pass.
 - **Integration tests** load the real `plugin.wasm` in extism, which may only reach
   moto, and verify state through the AWS SDK. Name resources with `unique(…)`.
+- **To assert which calls were made** (not just the end state), use moto's
+  request recorder through `moto_api("POST", "/moto-api/recorder/…")` and
+  `recorded_requests(recording, token)`. Tests run in parallel against one
+  moto, so filter by a token that's in every resource name. Only one test
+  should start and stop the recorder.
 - **Mutation-check new tests**: break the fix on purpose and confirm the test fails.
 - Run clippy for **both** targets: `cargo clippy --target <host> --all-targets -- -D warnings`
   and `cargo clippy --target wasm32-unknown-unknown -- -D warnings`. CI only lints
