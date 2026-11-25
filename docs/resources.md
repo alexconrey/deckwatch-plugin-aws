@@ -53,7 +53,7 @@ What gets created:
 
 | Field | Default | Notes |
 |---|---|---|
-| `bucket_name` | *(required)* | `BUCKET_PREFIX` is prepended. |
+| `bucket_name` | *(required)* | `RESOURCE_NAME_PREFIX` is prepended, or the deprecated `BUCKET_PREFIX` while it's set. An existing bucket created before the prefix keeps its name. |
 | `region` | plugin `AWS_REGION` | Bucket region. |
 
 What gets created:
@@ -148,7 +148,7 @@ RDS instances are always created in the plugin's `AWS_REGION`.
 | Annotation | Default | Notes |
 |---|---|---|
 | `s3.deckwatch.io/enabled` | `false` | Opt in. |
-| `s3.deckwatch.io/bucket-name` | *(required)* | Name **without** `BUCKET_PREFIX`; the prefix is added. |
+| `s3.deckwatch.io/bucket-name` | *(required)* | Name **without** the prefix; the plugin adds `RESOURCE_NAME_PREFIX` (or `BUCKET_PREFIX` while it's set). A name that already starts with `RESOURCE_NAME_PREFIX` isn't prefixed again. |
 | `s3.deckwatch.io/region` | `us-east-1` | Bucket region. Set it explicitly in GovCloud. |
 | `s3.deckwatch.io/versioning` | `false` | |
 | `s3.deckwatch.io/public-access-block` | `true` | Blocks all public access. |
@@ -228,10 +228,17 @@ IAM token as the password.
 | RDS identifier | `<namespace>-<app>-db` | `<namespace>-<deployment>-db` |
 | SQS queue | `<RESOURCE_NAME_PREFIX><namespace>-<app>-queue` | `<RESOURCE_NAME_PREFIX><namespace>-<deployment>-queue` |
 | Secret | `<RESOURCE_NAME_PREFIX><namespace>/<app>` | `<RESOURCE_NAME_PREFIX><namespace>/<deployment>` |
+| S3 bucket | `<RESOURCE_NAME_PREFIX><bucket_name>` | `<RESOURCE_NAME_PREFIX><bucket-name>` |
 
 `RESOURCE_NAME_PREFIX` also applies to names chosen in the UI or set in
-annotations. All resources are tagged; see
-[Resource tags](configuration.md#resource-tags).
+annotations, and it's never added twice. For S3 buckets, the deprecated
+`BUCKET_PREFIX` takes its place while it's set.
+
+**Existing resources keep their names.** A queue, secret or bucket that was
+created before the prefix was set is found under its old name on refresh and
+reconcile, and keeps it. See
+[Scoping the plugin to a prefix](configuration.md#scoping-the-plugin-to-a-prefix).
+All resources are tagged; see [Resource tags](configuration.md#resource-tags).
 
 The `-rds` role suffix is historical: RDS was the first resource to create the role.
 S3 attaches to the same role so that an application keeps a single identity.

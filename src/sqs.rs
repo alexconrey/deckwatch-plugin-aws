@@ -93,6 +93,12 @@ pub fn delete_queue(queue_url: &str, creds: &AwsCredentials) -> Result<(), Strin
     Ok(())
 }
 
+/// Whether the queue exists, for `RESOURCE_NAME_PREFIX` name resolution.
+/// `name` is the configured name; the `.fifo` suffix is added as for creation.
+pub fn queue_exists(name: &str, fifo: bool, creds: &AwsCredentials) -> Result<bool, String> {
+    get_queue_url(&crate::canonical_queue_name(name, fifo), creds).map(|info| info.is_some())
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// The queue's tags (`ListQueueTags`).

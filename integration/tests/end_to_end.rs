@@ -1547,6 +1547,200 @@ async fn reconcile_without_changes_makes_no_aws_writes() {
     want(&db_tags, "RDS instance");
 }
 
+/// RESOURCE_NAME_PREFIX names new S3 buckets too. The deprecated BUCKET_PREFIX
+/// still wins while it's set, with a deprecation warning.
+#[tokio::test]
+async fn resource_name_prefix_names_new_buckets_and_bucket_prefix_still_wins() {
+    let region = "us-gov-west-1";
+    let prefix = format!("rp{}-", run_id());
+    let s3 = s3_client(region).await;
+
+    let mut plugin = load_plugin(region, &[("RESOURCE_NAME_PREFIX", prefix.as_str())]);
+    let bucket = unique("fresh-assets");
+    let provisioned = call_provision(
+        &mut plugin,
+        &s3_request(unique("fresh"), "prefix-it", bucket, region),
+    );
+    assert!(provisioned.errors.is_empty(), "{:?}", provisioned.errors);
+    let full = format!("{prefix}{bucket}");
+    assert_eq!(provisioned.state.get("S3_BUCKET"), Some(&full));
+    s3.head_bucket()
+        .bucket(&full)
+        .send()
+        .await
+        .expect("the new bucket gets the prefix");
+    assert!(
+        s3.head_bucket().bucket(bucket).send().await.is_err(),
+        "no unprefixed bucket"
+    );
+
+    let bucket_prefix = format!("bp{}-", run_id());
+    let mut plugin = load_plugin(
+        region,
+        &[
+            ("RESOURCE_NAME_PREFIX", prefix.as_str()),
+            ("BUCKET_PREFIX", bucket_prefix.as_str()),
+        ],
+    );
+    let bucket = unique("legacy-assets");
+    let provisioned = call_provision(
+        &mut plugin,
+        &s3_request(unique("legacy"), "prefix-it", bucket, region),
+    );
+    assert!(provisioned.errors.is_empty(), "{:?}", provisioned.errors);
+    assert_eq!(
+        provisioned.state.get("S3_BUCKET"),
+        Some(&format!("{bucket_prefix}{bucket}"))
+    );
+    assert!(
+        provisioned
+            .warnings
+            .iter()
+            .any(|w| w.contains("BUCKET_PREFIX is deprecated")),
+        "warnings: {:?}",
+        provisioned.warnings
+    );
+}
+
+/// Setting RESOURCE_NAME_PREFIX after resources exist doesn't rename them. A
+/// refresh (provisioning again) and a reconcile keep the existing bucket,
+/// queue and secret, nothing is created under the prefix, and removing the
+/// secret targets the one that exists.
+#[tokio::test]
+async fn setting_the_prefix_later_keeps_existing_resources() {
+    let region = "us-gov-west-1";
+    let (ns, app) = ("keep-it", unique("keep"));
+    let bucket = format!("{app}-bucket");
+    let queue = format!("{app}-queue");
+    let secret = format!("{ns}/{app}");
+    let prefix = format!("kp{}-", run_id());
+
+    let requests = [
+        s3_request(app, ns, &bucket, region),
+        resource_request(app, ns, "sqs", &[("queue_name", queue.as_str())]),
+        resource_request(
+            app,
+            ns,
+            "secretsmanager",
+            &[("secret_name", secret.as_str())],
+        ),
+    ];
+
+    // Before the prefix is set: unprefixed names.
+    let mut before = load_plugin(region, &[]);
+    let originals: Vec<ResourceProvisionResult> = requests
+        .iter()
+        .map(|req| {
+            let provisioned = call_provision(&mut before, req);
+            assert!(provisioned.errors.is_empty(), "{:?}", provisioned.errors);
+            provisioned
+        })
+        .collect();
+
+    // The prefix is set, and every resource is refreshed.
+    let mut after = load_plugin(region, &[("RESOURCE_NAME_PREFIX", prefix.as_str())]);
+    for (req, original) in requests.iter().zip(&originals) {
+        let refreshed = call_provision(&mut after, req);
+        assert!(refreshed.errors.is_empty(), "{:?}", refreshed.errors);
+        for key in [
+            "S3_BUCKET",
+            "QUEUE_URL",
+            "QUEUE_NAME",
+            "SM_SECRET_ARN",
+            "SM_SECRET_NAME",
+        ] {
+            assert_eq!(
+                refreshed.state.get(key),
+                original.state.get(key),
+                "{} {key}",
+                req.resource_id
+            );
+        }
+        assert!(
+            refreshed
+                .warnings
+                .iter()
+                .any(|w| w.contains("Kept the existing")),
+            "{}: {:?}",
+            req.resource_id,
+            refreshed.warnings
+        );
+    }
+
+    // A reconcile from the stamped annotations keeps the names too.
+    let mut annotations: HashMap<String, String> = HashMap::new();
+    for original in &originals {
+        annotations.extend(original.deployment_annotations.clone());
+    }
+    let ctx = PluginContext {
+        namespace: ns.into(),
+        deployment_name: "api".into(),
+        annotations,
+        ..Default::default()
+    };
+    let applied = call_apply(&mut after, &ctx);
+    assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+    let env = |name: &str| {
+        applied
+            .env_vars
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.value.clone())
+    };
+    assert_eq!(env("S3_BUCKET").as_deref(), Some(bucket.as_str()));
+    assert_eq!(env("QUEUE_NAME").as_deref(), Some(queue.as_str()));
+
+    // Nothing was created under the prefix.
+    assert!(
+        s3_client(region)
+            .await
+            .head_bucket()
+            .bucket(format!("{prefix}{bucket}"))
+            .send()
+            .await
+            .is_err(),
+        "no prefixed bucket"
+    );
+    assert!(
+        sqs_client(region)
+            .await
+            .get_queue_url()
+            .queue_name(format!("{prefix}{queue}"))
+            .send()
+            .await
+            .is_err(),
+        "no prefixed queue"
+    );
+    assert!(
+        secrets_client(region)
+            .await
+            .describe_secret()
+            .secret_id(format!("{prefix}{secret}"))
+            .send()
+            .await
+            .is_err(),
+        "no prefixed secret"
+    );
+
+    // Removing the secret removes the one that exists, not a prefixed name.
+    let removed = call_deprovision(
+        &mut after,
+        &deprovision_request(&requests[2], &originals[2]),
+    );
+    assert!(removed.errors.is_empty(), "{:?}", removed.errors);
+    let described = secrets_client(region)
+        .await
+        .describe_secret()
+        .secret_id(&secret)
+        .send()
+        .await
+        .expect("still restorable during the recovery window");
+    assert!(
+        described.deleted_date().is_some(),
+        "the existing secret is scheduled for deletion"
+    );
+}
+
 /// A malformed AWS_ENDPOINT_URL must fail provisioning outright rather than
 /// fall back to real AWS endpoints.
 #[test]

@@ -65,10 +65,14 @@ helpers. The API clients are `iam.rs`, `rds.rs`, `s3.rs`, `sqs.rs`,
 10. **Parse and build JSON with `serde_json`** (`json_str_field`, `json!`), never
     with `"key":"` substring matching or `format!`. AWS doesn't promise compact
     JSON, some fields are numbers, and values must be escaped.
-11. **Every create path passes `tags` and every SQS/secret name goes through
-    `prefixed_name`.** Tags come from `configured_resource_tags(app, ns)`; the
-    name prefix from `RESOURCE_NAME_PREFIX`. Both keep the operator's IAM scoping
-    and cost allocation intact; a resource created without them escapes both.
+11. **Every create path passes `tags`, and every SQS queue, secret and S3 bucket
+    name goes through `prefixed_name` / `s3_bucket_names` and then
+    `resolve_resource_name`.** Tags come from `configured_resource_tags(app, ns)`,
+    and the name prefix from `RESOURCE_NAME_PREFIX`. Both keep the operator's IAM
+    scoping and cost allocation intact; a resource created without them escapes
+    both. `resolve_resource_name` is what keeps existing resources on their
+    names when the prefix is set later: never rename a resource that holds data.
+    Paths that know the recorded name (deprovision state) use it as is.
 12. **Match the AWS SDKs' wire format exactly**: method, path, body members and
     Content-Type. Check `aws <service> <op> --debug` against moto when adding an
     API; that's how the Backup client's POST/`BackupPlanData`/JSON-RPC

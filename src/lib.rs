@@ -237,6 +237,111 @@ fn prefixed_name(prefix: &str, name: &str) -> String {
     }
 }
 
+/// Whether `prefix` can start an S3 bucket name: lowercase letters, digits,
+/// hyphens and dots, beginning with a letter or digit. An empty prefix isn't
+/// applied.
+fn s3_prefix_is_valid(prefix: &str) -> bool {
+    let mut chars = prefix.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+}
+
+/// The name for an S3 bucket called `base`, and the name the bucket has if it
+/// was created before `RESOURCE_NAME_PREFIX` was set: `(candidate, legacy)`.
+///
+/// `BUCKET_PREFIX` is deprecated but still wins while it's set: both names are
+/// `BUCKET_PREFIX` + `base`, exactly as before 0.8.1. Otherwise new buckets
+/// get `RESOURCE_NAME_PREFIX` when it's a valid bucket-name prefix, and an
+/// existing bucket keeps its unprefixed name (see [`resolve_resource_name`]).
+fn s3_bucket_names(base: &str, bucket_prefix: &str, resource_prefix: &str) -> (String, String) {
+    if !bucket_prefix.is_empty() {
+        let name = format!("{bucket_prefix}{base}");
+        return (name.clone(), name);
+    }
+    let candidate = if s3_prefix_is_valid(resource_prefix) {
+        prefixed_name(resource_prefix, base)
+    } else {
+        base.to_string()
+    };
+    (candidate, base.to_string())
+}
+
+/// A name chosen by [`resolve_resource_name`].
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedName {
+    name: String,
+    /// An existing, unprefixed resource was kept instead of creating a
+    /// prefixed one.
+    kept_existing: bool,
+}
+
+/// Which name a queue, secret or bucket uses when `RESOURCE_NAME_PREFIX`
+/// would rename it. Existing resources keep their names:
+/// - the prefixed `candidate`, if it already exists;
+/// - otherwise the unprefixed `legacy` name, if that exists (created before
+///   the prefix was set);
+/// - otherwise the `candidate`, which the caller then creates.
+///
+/// `exists` is only called when the names differ, candidate first. A failed
+/// check counts as "doesn't exist", which is what 0.8.0 assumed: S3 answers
+/// 403 for other accounts' buckets, and a plugin role scoped to `<prefix>*`
+/// can't look up unprefixed names.
+#[cfg(any(target_arch = "wasm32", test))]
+fn resolve_resource_name(
+    candidate: &str,
+    legacy: &str,
+    mut exists: impl FnMut(&str) -> Result<bool, String>,
+) -> ResolvedName {
+    let keep_legacy = candidate != legacy
+        && !exists(candidate).unwrap_or(false)
+        && exists(legacy).unwrap_or(false);
+    ResolvedName {
+        name: if keep_legacy { legacy } else { candidate }.to_string(),
+        kept_existing: keep_legacy,
+    }
+}
+
+/// Provisioning message for a resource kept under its existing, unprefixed name.
+#[cfg(any(target_arch = "wasm32", test))]
+fn kept_existing_note(kind: &str, name: &str) -> String {
+    format!(
+        "Kept the existing {kind} '{name}' under its current name. \
+         RESOURCE_NAME_PREFIX applies only to new resources."
+    )
+}
+
+/// Provisioning warning while the deprecated `BUCKET_PREFIX` is set.
+#[cfg(any(target_arch = "wasm32", test))]
+const BUCKET_PREFIX_DEPRECATED: &str = "BUCKET_PREFIX is deprecated and will be removed \
+     in a later release. Set RESOURCE_NAME_PREFIX to the same value, then clear \
+     BUCKET_PREFIX: new buckets get the prefix and existing buckets keep their names.";
+
+/// The secret a deprovision removes: the recorded ARN, else the recorded name
+/// exactly as provisioning stored it, else the name provisioning would derive
+/// now. Re-prefixing a recorded name would target the wrong secret when the
+/// prefix was set after the secret was created.
+#[cfg(any(target_arch = "wasm32", test))]
+fn deprovision_secret_id(
+    state_arn: Option<&str>,
+    state_name: Option<&str>,
+    field_name: Option<&str>,
+    default_name: &str,
+    resource_prefix: &str,
+) -> String {
+    fn non_empty(s: Option<&str>) -> Option<&str> {
+        s.filter(|s| !s.is_empty())
+    }
+    match (non_empty(state_arn), non_empty(state_name)) {
+        (Some(arn), _) => arn.to_string(),
+        (None, Some(name)) => name.to_string(),
+        (None, None) => prefixed_name(
+            resource_prefix,
+            non_empty(field_name).unwrap_or(default_name),
+        ),
+    }
+}
+
 // ── Resource tags ─────────────────────────────────────────────────────────────
 //
 // Every AWS resource the plugin manages gets the operator's RESOURCE_TAGS plus
@@ -1831,8 +1936,10 @@ pub fn apply_inner_with_prefixes(
     }
 
     // ── S3 env vars ───────────────────────────────────────────────────────────
+    // Without AWS calls there's no existence check, so this is the name a new
+    // bucket would get. apply_with_aws replaces it with the resolved name.
     if let Some(ref s3) = cfg.s3 {
-        let full_bucket = format!("{}{}", bucket_prefix, s3.bucket_name);
+        let (full_bucket, _) = s3_bucket_names(&s3.bucket_name, bucket_prefix, resource_prefix);
         result
             .env_vars
             .push(EnvVarSpec::value("S3_BUCKET", &full_bucket));
@@ -1890,6 +1997,9 @@ fn apply_with_aws(
     if !cfg.enabled {
         return PluginResult::default();
     }
+    // The names as written in the annotations, before RESOURCE_NAME_PREFIX: an
+    // existing queue or secret with one of these names keeps it.
+    let unprefixed = AwsConfig::from_context(ctx);
 
     let (tags, tag_error) = configured_resource_tags(&cfg.app_name, &ctx.namespace);
     if let Some(e) = tag_error {
@@ -1970,7 +2080,12 @@ fn apply_with_aws(
 
     // ── 3. S3 ─────────────────────────────────────────────────────────────────
     let s3_bucket = if let Some(ref s3_cfg) = cfg.s3 {
-        let full_bucket = format!("{}{}", bucket_prefix, s3_cfg.bucket_name);
+        let (candidate, legacy) =
+            s3_bucket_names(&s3_cfg.bucket_name, bucket_prefix, resource_prefix);
+        let full_bucket = resolve_resource_name(&candidate, &legacy, |b| {
+            s3::bucket_exists(b, &s3_cfg.region, creds)
+        })
+        .name;
         match s3::ensure_bucket(s3_cfg, &full_bucket, &tags, creds) {
             Ok(()) => {
                 if let Err(e) =
@@ -1992,8 +2107,24 @@ fn apply_with_aws(
     };
 
     // ── 4. SQS ────────────────────────────────────────────────────────────────
+    let mut queue_name = String::new();
     let queue_url = if let Some(ref sqs_cfg) = cfg.sqs {
-        match sqs::ensure_queue(sqs_cfg, &tags, creds) {
+        let legacy = unprefixed
+            .sqs
+            .as_ref()
+            .map(|s| s.queue_name.clone())
+            .unwrap_or_default();
+        let resolved = resolve_resource_name(&sqs_cfg.queue_name, &legacy, |q| {
+            sqs::queue_exists(q, sqs_cfg.fifo, creds)
+        });
+        let resolved_cfg = SqsConfig {
+            queue_name: resolved.name,
+            fifo: sqs_cfg.fifo,
+            visibility_timeout: sqs_cfg.visibility_timeout,
+            retention_days: sqs_cfg.retention_days,
+        };
+        queue_name = canonical_queue_name(&resolved_cfg.queue_name, resolved_cfg.fifo);
+        match sqs::ensure_queue(&resolved_cfg, &tags, creds) {
             Ok(info) => {
                 if let Err(e) = iam::attach_sqs_policy(&cfg.role_name, &info.queue_arn, creds) {
                     log!(
@@ -2023,6 +2154,7 @@ fn apply_with_aws(
     }
 
     // ── 6. Secrets Manager ────────────────────────────────────────────────────
+    let mut secret_name = String::new();
     let sm_secret_arn = if let Some(ref sm_cfg) = cfg.secretsmanager {
         // Read: referenced, owned and created secrets. Write: only secrets the
         // plugin created for this app, and only under RESOURCE_NAME_PREFIX.
@@ -2035,7 +2167,16 @@ fn apply_with_aws(
                 "Managed by deckwatch for {}/{}",
                 ctx.namespace, ctx.deployment_name
             );
-            match secretsmanager::ensure_secret(&sm_cfg.secret_name, &desc, &tags, creds) {
+            let legacy = unprefixed
+                .secretsmanager
+                .as_ref()
+                .map(|s| s.secret_name.clone())
+                .unwrap_or_default();
+            secret_name = resolve_resource_name(&sm_cfg.secret_name, &legacy, |s| {
+                secretsmanager::secret_exists(s, creds)
+            })
+            .name;
+            match secretsmanager::ensure_secret(&secret_name, &desc, &tags, creds) {
                 Ok(arn) => {
                     all_arns.push(arn.clone());
                     owned.push(arn.clone());
@@ -2069,6 +2210,18 @@ fn apply_with_aws(
 
     // ── 7. Build result ───────────────────────────────────────────────────────
     let mut result = apply_inner_with_prefixes(ctx, bucket_prefix, resource_prefix);
+    // apply_inner derives names without AWS calls; use the resolved ones, so an
+    // existing bucket, queue or secret kept under its old name is what the
+    // workload sees. Replaced in place to keep the env var order stable.
+    if !s3_bucket.is_empty() {
+        set_env(&mut result, "S3_BUCKET", &s3_bucket);
+    }
+    if !queue_name.is_empty() {
+        set_env(&mut result, "QUEUE_NAME", &queue_name);
+    }
+    if !secret_name.is_empty() {
+        set_env(&mut result, "SM_SECRET_NAME", &secret_name);
+    }
 
     // The IAM role is confirmed to exist, so request the SA with its ARN.
     // Deckwatch will create-or-patch the SA with the IRSA annotation.
@@ -2125,6 +2278,16 @@ fn apply_with_aws(
     result
 }
 
+/// Set an env var in a result, replacing an existing one in place. Reordering
+/// env vars would change the pod template and roll the pods.
+#[cfg(any(target_arch = "wasm32", test))]
+fn set_env(result: &mut PluginResult, name: &str, value: &str) {
+    match result.env_vars.iter_mut().find(|e| e.name == name) {
+        Some(existing) => *existing = EnvVarSpec::value(name, value),
+        None => result.env_vars.push(EnvVarSpec::value(name, value)),
+    }
+}
+
 // ── WASM entry points ─────────────────────────────────────────────────────────
 
 /// Return static plugin metadata. Called once by deckwatch at load time to build
@@ -2154,8 +2317,8 @@ pub fn metadata() -> FnResult<Json<PluginMetadata>> {
             ConfigField { key: "IAM_ENDPOINT".into(), label: "IAM Endpoint".into(), description: "Override IAM hostname. Auto-detected (iam.us-gov.amazonaws.com for GovCloud).".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "IAM_SIGNING_REGION".into(), label: "IAM Signing Region".into(), description: "Override Sig V4 region for IAM. Auto-detected from region.".into(), field_type: ConfigFieldType::String, default: None, required: false, options: vec![], env_source: None },
             ConfigField { key: "ROLE_PATH".into(), label: "IAM Role Path".into(), description: "Path prefix for created roles. Must start and end with /.".into(), field_type: ConfigFieldType::String, default: Some("/deckwatch-plugin/".into()), required: false, options: vec![], env_source: None },
-            ConfigField { key: "BUCKET_PREFIX".into(), label: "S3 Bucket Prefix".into(), description: "Prepended to all S3 bucket names (e.g. myorg-).".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
-            ConfigField { key: "RESOURCE_NAME_PREFIX".into(), label: "Resource Name Prefix".into(), description: "Prepended to every SQS queue and Secrets Manager secret name (e.g. acme-dw-), so the plugin's IAM policy can be scoped to <prefix>* instead of all queues and secrets in the account.".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "BUCKET_PREFIX".into(), label: "S3 Bucket Prefix (deprecated)".into(), description: "Deprecated: use Resource Name Prefix. While set, it is still prepended to S3 bucket names instead of Resource Name Prefix. To migrate, set Resource Name Prefix to the same value, then clear this.".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
+            ConfigField { key: "RESOURCE_NAME_PREFIX".into(), label: "Resource Name Prefix".into(), description: "Prepended to the names of new SQS queues, Secrets Manager secrets and S3 buckets (e.g. acme-dw-), so the plugin's IAM policy can be scoped to <prefix>*. Existing resources keep their names.".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "RESOURCE_TAGS".into(), label: "Resource Tags".into(), description: "Tags applied to every AWS resource the plugin manages (IAM roles, RDS, S3, SQS, secrets, backup plans): Key=Value pairs separated by commas, e.g. Team=platform,CostCenter=1234. The plugin also adds deckwatch.io/managed-by, deckwatch.io/application and deckwatch.io/namespace.".into(), field_type: ConfigFieldType::String, default: Some("".into()), required: false, options: vec![], env_source: None },
             ConfigField { key: "AWS_ACCESS_KEY_ID".into(), label: "Access Key ID".into(), description: "Static AWS access key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_ACCESS_KEY_ID".into()) },
             ConfigField { key: "AWS_SECRET_ACCESS_KEY".into(), label: "Secret Access Key".into(), description: "Static AWS secret key. Leave blank when using IRSA.".into(), field_type: ConfigFieldType::Secret, default: None, required: false, options: vec![], env_source: Some("AWS_SECRET_ACCESS_KEY".into()) },
@@ -2687,7 +2850,34 @@ pub fn provision(
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            let full_bucket = format!("{}{}", bucket_prefix, bucket_name);
+            let resource_prefix = configured_resource_name_prefix();
+            if !bucket_prefix.is_empty() {
+                result.warnings.push(BUCKET_PREFIX_DEPRECATED.into());
+            } else if !resource_prefix.is_empty() && !s3_prefix_is_valid(&resource_prefix) {
+                result.warnings.push(format!(
+                    "RESOURCE_NAME_PREFIX '{resource_prefix}' isn't a valid start of an S3 \
+                     bucket name (lowercase letters, digits, hyphens and dots, starting with \
+                     a letter or digit), so it isn't applied to bucket names."
+                ));
+            }
+            let (candidate, legacy) =
+                s3_bucket_names(&bucket_name, &bucket_prefix, &resource_prefix);
+            let resolved = resolve_resource_name(&candidate, &legacy, |b| {
+                s3::bucket_exists(b, &region, &creds)
+            });
+            if resolved.kept_existing {
+                result
+                    .warnings
+                    .push(kept_existing_note("S3 bucket", &resolved.name));
+            }
+            let full_bucket = resolved.name;
+            // apply() adds BUCKET_PREFIX itself while it's set, so stamp the
+            // bare name then; otherwise stamp the resolved full name.
+            let stamped_bucket = if bucket_prefix.is_empty() {
+                full_bucket.clone()
+            } else {
+                bucket_name.clone()
+            };
 
             let cfg = S3Config {
                 bucket_name: bucket_name.clone(),
@@ -2727,7 +2917,7 @@ pub fn provision(
                     // bucket policy on the same role and binds pods to the SA.
                     result.deployment_annotations.extend(s3_apply_annotations(
                         &req.application_name,
-                        &bucket_name,
+                        &stamped_bucket,
                         &region,
                         &role_name,
                     ));
@@ -2738,18 +2928,27 @@ pub fn provision(
             }
         }
         "sqs" => {
-            let queue_name = req
+            let base_name = req
                 .fields
                 .get("queue_name")
                 .filter(|s| !s.is_empty())
                 .cloned()
                 .unwrap_or_else(|| default_sqs_queue_name(&req.namespace, &req.application_name));
-            let queue_name = prefixed_name(&configured_resource_name_prefix(), &queue_name);
             let fifo = req
                 .fields
                 .get("fifo")
                 .map(|v| matches!(v.as_str(), "true" | "yes" | "1"))
                 .unwrap_or(false);
+            let candidate = prefixed_name(&configured_resource_name_prefix(), &base_name);
+            let resolved = resolve_resource_name(&candidate, &base_name, |q| {
+                sqs::queue_exists(q, fifo, &creds)
+            });
+            if resolved.kept_existing {
+                result
+                    .warnings
+                    .push(kept_existing_note("SQS queue", &resolved.name));
+            }
+            let queue_name = resolved.name;
             let visibility_timeout = req
                 .fields
                 .get("visibility_timeout")
@@ -2804,13 +3003,22 @@ pub fn provision(
             }
         }
         "secretsmanager" => {
-            let secret_name = req
+            let base_name = req
                 .fields
                 .get("secret_name")
                 .filter(|s| !s.is_empty())
                 .cloned()
                 .unwrap_or_else(|| default_secret_name(&req.namespace, &req.application_name));
-            let secret_name = prefixed_name(&configured_resource_name_prefix(), &secret_name);
+            let candidate = prefixed_name(&configured_resource_name_prefix(), &base_name);
+            let resolved = resolve_resource_name(&candidate, &base_name, |s| {
+                secretsmanager::secret_exists(s, &creds)
+            });
+            if resolved.kept_existing {
+                result
+                    .warnings
+                    .push(kept_existing_note("secret", &resolved.name));
+            }
+            let secret_name = resolved.name;
             let desc = format!(
                 "Managed by deckwatch for {}/{}",
                 req.namespace, req.application_name
@@ -2989,13 +3197,13 @@ pub fn deprovision(
             }
         }
         "secretsmanager" => {
-            let secret_name = req
-                .state
-                .get("SM_SECRET_NAME")
-                .or_else(|| req.fields.get("secret_name"))
-                .cloned()
-                .unwrap_or_else(|| default_secret_name(&req.namespace, &req.application_name));
-            let secret_name = prefixed_name(&configured_resource_name_prefix(), &secret_name);
+            let secret_name = deprovision_secret_id(
+                req.state.get("SM_SECRET_ARN").map(String::as_str),
+                req.state.get("SM_SECRET_NAME").map(String::as_str),
+                req.fields.get("secret_name").map(String::as_str),
+                &default_secret_name(&req.namespace, &req.application_name),
+                &configured_resource_name_prefix(),
+            );
             match secretsmanager::schedule_delete_secret(&secret_name, 30, &creds) {
                 Ok(deletion_date) => {
                     notes.push(format!(
@@ -4768,5 +4976,182 @@ mod tests {
              <Transition><Days>30</Days></Transition><Expiration><Days>90</Days></Expiration></Rule>"
         );
         assert!(!s3_lifecycle_has_expiry_rule(&doc(&transition), 30));
+    }
+
+    // ── One resource prefix (#43) ─────────────────────────────────────────────
+
+    #[test]
+    fn s3_prefix_is_valid_follows_bucket_naming_rules() {
+        for ok in ["acme-dw-", "myorg.", "dw", "1st-"] {
+            assert!(s3_prefix_is_valid(ok), "{ok}");
+        }
+        for bad in ["", "K2-", "k2_dw-", "-k2", ".k2", "k2 dw"] {
+            assert!(!s3_prefix_is_valid(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn s3_bucket_names_prefer_bucket_prefix_then_resource_prefix() {
+        let names = |a: &str, b: &str| (a.to_string(), b.to_string());
+        // BUCKET_PREFIX (deprecated) still wins, exactly as before 0.8.1.
+        assert_eq!(
+            s3_bucket_names("assets", "myorg-", "acme-dw-"),
+            names("myorg-assets", "myorg-assets")
+        );
+        // Otherwise new buckets get RESOURCE_NAME_PREFIX, and an existing
+        // bucket keeps its bare name.
+        assert_eq!(
+            s3_bucket_names("assets", "", "acme-dw-"),
+            names("acme-dw-assets", "assets")
+        );
+        assert_eq!(
+            s3_bucket_names("acme-dw-assets", "", "acme-dw-"),
+            names("acme-dw-assets", "acme-dw-assets"),
+            "already prefixed"
+        );
+        assert_eq!(
+            s3_bucket_names("assets", "", "K2_DW_"),
+            names("assets", "assets"),
+            "a prefix S3 can't use isn't applied to buckets"
+        );
+        assert_eq!(s3_bucket_names("assets", "", ""), names("assets", "assets"));
+    }
+
+    fn resolved(name: &str, kept_existing: bool) -> ResolvedName {
+        ResolvedName {
+            name: name.into(),
+            kept_existing,
+        }
+    }
+
+    #[test]
+    fn resolve_resource_name_keeps_existing_resources() {
+        // Same name: nothing to check.
+        let mut calls = Vec::new();
+        let r = resolve_resource_name("acme-dw-q", "acme-dw-q", |n| {
+            calls.push(n.to_string());
+            Ok(true)
+        });
+        assert_eq!(r, resolved("acme-dw-q", false));
+        assert!(calls.is_empty());
+
+        // The prefixed name exists: use it, without looking up the old one.
+        let mut calls = Vec::new();
+        let r = resolve_resource_name("acme-dw-q", "q", |n| {
+            calls.push(n.to_string());
+            Ok(true)
+        });
+        assert_eq!(r, resolved("acme-dw-q", false));
+        assert_eq!(calls, ["acme-dw-q"]);
+
+        // Only the old, unprefixed name exists: keep it.
+        let r = resolve_resource_name("acme-dw-q", "q", |n| Ok(n == "q"));
+        assert_eq!(r, resolved("q", true));
+
+        // Nothing exists yet: the new resource gets the prefix.
+        let r = resolve_resource_name("acme-dw-q", "q", |_| Ok(false));
+        assert_eq!(r, resolved("acme-dw-q", false));
+    }
+
+    #[test]
+    fn resolve_resource_name_treats_failed_checks_as_missing() {
+        // e.g. S3's 403 for another account's bucket, or a role scoped to the prefix.
+        let denied = |_: &str| Err::<bool, String>("AccessDenied".into());
+        assert_eq!(
+            resolve_resource_name("p-b", "b", denied),
+            resolved("p-b", false)
+        );
+        let r = resolve_resource_name("p-b", "b", |n| {
+            if n == "p-b" {
+                Err("AccessDenied".into())
+            } else {
+                Ok(true)
+            }
+        });
+        assert_eq!(
+            r,
+            resolved("b", true),
+            "a failed candidate check still finds the old one"
+        );
+    }
+
+    #[test]
+    fn deprovision_secret_id_uses_the_recorded_secret() {
+        let id = deprovision_secret_id;
+        assert_eq!(
+            id(
+                Some("arn:aws:secretsmanager:us-east-1:1:secret:ns/app-AbCdEf"),
+                Some("ns/app"),
+                None,
+                "ns/app",
+                "acme-dw-"
+            ),
+            "arn:aws:secretsmanager:us-east-1:1:secret:ns/app-AbCdEf"
+        );
+        // A secret created before the prefix was set: its recorded name is
+        // used as is, not re-prefixed.
+        assert_eq!(
+            id(None, Some("ns/app"), None, "ns/app", "acme-dw-"),
+            "ns/app"
+        );
+        // Nothing recorded: derive the name provisioning would use now.
+        assert_eq!(
+            id(None, None, Some("custom"), "ns/app", "acme-dw-"),
+            "acme-dw-custom"
+        );
+        assert_eq!(id(None, None, None, "ns/app", "acme-dw-"), "acme-dw-ns/app");
+        assert_eq!(
+            id(Some(""), Some(""), Some(""), "ns/app", ""),
+            "ns/app",
+            "empty means unset"
+        );
+    }
+
+    #[test]
+    fn provisioning_messages_name_what_to_do() {
+        let note = kept_existing_note("S3 bucket", "assets");
+        assert!(
+            note.contains("'assets'") && note.contains("RESOURCE_NAME_PREFIX"),
+            "{note}"
+        );
+        assert!(BUCKET_PREFIX_DEPRECATED.contains("RESOURCE_NAME_PREFIX"));
+    }
+
+    #[test]
+    fn set_env_replaces_in_place() {
+        let mut result = PluginResult {
+            env_vars: vec![
+                EnvVarSpec::value("A", "1"),
+                EnvVarSpec::value("S3_BUCKET", "acme-dw-assets"),
+                EnvVarSpec::value("C", "3"),
+            ],
+            ..Default::default()
+        };
+        set_env(&mut result, "S3_BUCKET", "assets");
+        set_env(&mut result, "D", "4");
+        let got: Vec<(&str, &str)> = result
+            .env_vars
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [("A", "1"), ("S3_BUCKET", "assets"), ("C", "3"), ("D", "4")]
+        );
+    }
+
+    #[test]
+    fn apply_inner_names_buckets_with_the_resource_prefix_unless_bucket_prefix_is_set() {
+        let anns = [
+            ("s3.deckwatch.io/enabled", "true"),
+            ("s3.deckwatch.io/bucket-name", "assets"),
+        ];
+        let with = |bucket_prefix: &str, resource_prefix: &str| {
+            let result = apply_inner_with_prefixes(&ctx(&anns), bucket_prefix, resource_prefix);
+            find_env(&result, "S3_BUCKET").map(str::to_string)
+        };
+        assert_eq!(with("", "acme-dw-").as_deref(), Some("acme-dw-assets"));
+        assert_eq!(with("myorg-", "acme-dw-").as_deref(), Some("myorg-assets"));
+        assert_eq!(with("", "").as_deref(), Some("assets"));
     }
 }

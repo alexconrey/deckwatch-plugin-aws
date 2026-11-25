@@ -12,6 +12,14 @@ history.
   `s3:GetBucketPublicAccessBlock`, `s3:GetLifecycleConfiguration` and
   `sqs:ListQueueTags`, so reconciles can skip writes when nothing changed.
   Without them, the plugin writes exactly as 0.8.0 did.
+- **`BUCKET_PREFIX` is deprecated.** Set `RESOURCE_NAME_PREFIX` to the same
+  value, then clear `BUCKET_PREFIX`. While it's set, it still names buckets,
+  and provisioning warns.
+- **Setting `RESOURCE_NAME_PREFIX` no longer renames existing queues, secrets
+  or buckets.** The plugin finds them under their old names, which takes read
+  access to them (`sqs:GetQueueUrl`, `secretsmanager:DescribeSecret`,
+  `s3:GetBucketTagging`). Grant those explicitly before scoping the plugin's
+  permissions to `<prefix>*`.
 
 ### Changed
 - `deckwatch-plugin-sdk` v0.10.0, the tagged release, replaces the pre-release
@@ -26,6 +34,17 @@ history.
   policies; RDS tags; S3 bucket existence, public access block, versioning,
   lifecycle and tags; SQS tags; and secret tags. Most reconciles are now reads
   only. (#46)
+- **`RESOURCE_NAME_PREFIX` also names new S3 buckets**, when `BUCKET_PREFIX` is
+  empty and the prefix is a valid start of a bucket name. One prefix now covers
+  queues, secrets and buckets, and the plugin's S3 permissions can be scoped to
+  `<prefix>*` too. (#43)
+- **Existing resources keep their names when the prefix is set later.** Refresh
+  and reconcile find a queue, secret or bucket under its old, unprefixed name
+  and keep using it, and provisioning reports that. 0.8.0 created new,
+  prefixed resources instead. (#43)
+
+### Deprecated
+- `BUCKET_PREFIX`; use `RESOURCE_NAME_PREFIX`. (#43)
 
 ### Fixed
 - The backup guidance's example snapshot name (`<id>-pre-v<version>`) isn't a
@@ -36,6 +55,9 @@ history.
   (#46)
 - Secrets Manager `DescribeSecret` and `DeleteSecret` requests are built with
   `serde_json`, so secret names are JSON-escaped. (#46)
+- Removing a secret created before `RESOURCE_NAME_PREFIX` was set targeted a
+  prefixed name that didn't exist. Deprovisioning now removes the recorded
+  secret. (#43)
 
 ## [0.8.0] - 2026-11-24
 

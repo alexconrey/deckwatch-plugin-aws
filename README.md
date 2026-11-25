@@ -22,9 +22,10 @@ secrets keep a 30-day recovery window. Only that resource's IAM access is revoke
 and the workload role is deleted once nothing is left on it.
 
 Every resource is tagged with `deckwatch.io/managed-by`, `deckwatch.io/application`
-and `deckwatch.io/namespace`, plus any tags you set in `RESOURCE_TAGS`. SQS queues
-and secrets are named with `RESOURCE_NAME_PREFIX`, so the plugin's own IAM policy
-can be scoped to the queues and secrets it created.
+and `deckwatch.io/namespace`, plus any tags you set in `RESOURCE_TAGS`. New SQS
+queues, secrets and S3 buckets are named with `RESOURCE_NAME_PREFIX`, so the
+plugin's own IAM policy can be scoped to the resources it created. Existing
+resources keep their names.
 
 Connection details reach the application as environment variables (`DB_HOST`,
 `S3_BUCKET`, `QUEUE_URL`, …), and the pods run as the application's ServiceAccount,
@@ -57,8 +58,8 @@ flowchart LR
    take `plugin.wasm` from a [GitHub release](https://github.com/alexconrey/deckwatch-plugin-aws/releases).
 2. **Register it in deckwatch**, configure `AWS_REGION`, `OIDC_PROVIDER_ARN` and
    `RESOURCE_NAME_PREFIX` (and optionally `RESOURCE_TAGS`), and give the plugin AWS
-   credentials (IRSA recommended). Set the prefix before you create the first queue
-   or secret. See [Configuration](docs/configuration.md).
+   credentials (IRSA recommended). The prefix applies to queues, secrets and buckets
+   created from then on. See [Configuration](docs/configuration.md).
 3. **Grant the plugin's own IAM role** the permissions in
    [Configuration → Plugin IAM permissions](docs/configuration.md#plugin-iam-permissions).
    The tagging permissions are required: every create call carries tags.
@@ -86,8 +87,9 @@ flowchart LR
 - Rust stable with the `wasm32-unknown-unknown` target, to build from source.
 
 **Upgrading from 0.7.x?** Read the 0.8.0 *Upgrade notes* in the
-[CHANGELOG](CHANGELOG.md) first. The plugin needs new IAM permissions, and
-`RESOURCE_NAME_PREFIX` affects existing queues and secrets.
+[CHANGELOG](CHANGELOG.md) first. The plugin needs new IAM permissions. Upgrade
+straight to 0.8.1 or later, where setting `RESOURCE_NAME_PREFIX` doesn't rename
+existing queues, secrets or buckets.
 
 ## License
 
